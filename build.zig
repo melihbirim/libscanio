@@ -78,6 +78,23 @@ pub fn build(b: *std.Build) void {
     const mem_check_step = b.step("mem-check", "Run the format-aware Query scan (for memory/throughput comparison)");
     mem_check_step.dependOn(&run_mem_check.step);
 
+    const filter_bench = b.addExecutable(.{
+        .name = "filter_bench",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/filter_bench.zig"),
+        }),
+    });
+    filter_bench.root_module.addImport("scanio", scanio_mod);
+    filter_bench.linkLibC();
+    b.installArtifact(filter_bench);
+    const run_filter_bench = b.addRunArtifact(filter_bench);
+    run_filter_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_filter_bench.addArgs(args);
+    const filter_bench_step = b.step("filter-bench", "Run a WHERE-filtered scan, counting matches (for grep comparison)");
+    filter_bench_step.dependOn(&run_filter_bench.step);
+
     const json_parser_mod = b.addModule("json_parser", .{
         .root_source_file = b.path("src/json_parser.zig"),
         .target = target,

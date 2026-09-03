@@ -68,6 +68,7 @@ Not a database, not a dataframe, not a SQL engine, no query optimizer, no distri
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md) — chunked-read architecture, measured memory/speed tradeoffs, allocator notes
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — measured against `cat`, `grep`, xan, qsv, DuckDB, and a third-party Zig CSV library
 - [ROADMAP.md](ROADMAP.md) — milestone history, what's next
 - [include/libscanio.h](include/libscanio.h) — C ABI reference
 
