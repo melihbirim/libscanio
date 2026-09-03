@@ -2,7 +2,7 @@
 
 Scan and filter structured data without loading it. Your family's RAM-friendly data scanner.
 
-**open → scan → process, regardless of file size.** Measured, not assumed: ~2.2MB peak RSS on a 417MB file, and still ~2.2MB on an 8.5GB one (20x the size, same memory) — see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+**open → scan → process, regardless of file size.** Measured, not assumed: a filtered scan on a 417MB file takes 0.43s using ~2.2MB of RAM ("RAM" here means [peak RSS](docs/DESIGN.md#what-is-rss) — the most physical memory the process ever actually holds at once, not the file size or a rough guess). Scan a file 20x bigger (8.5GB) and it's still ~2.2MB of RAM, ~9.6s — time grows with the data, memory doesn't. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project, limit, count, aggregates, top-K. Chunked reads, not mmap: peak memory tracks a fixed buffer size (~2MB), not the file size. See [docs/DESIGN.md](docs/DESIGN.md) for the numbers.
 

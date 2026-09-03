@@ -1,5 +1,24 @@
 # Design
 
+## What is RSS?
+
+RSS (Resident Set Size) is how much physical RAM a process actually holds
+at a given moment — not how much it's allowed to use, not the size of the
+file it's reading, and not virtual memory (address space the OS has
+reserved but hasn't necessarily backed with real memory yet). "Peak RSS"
+(what `/usr/bin/time -l` reports as `maximum resident set size`, and what
+every number in this doc and [BENCHMARKS.md](BENCHMARKS.md) means by
+"memory") is the highest that number ever got during the whole run — the
+worst moment, not an average.
+
+Why it's the right thing to measure here: a program can *claim* to stream
+a file without loading it, but RSS is what proves it. If a tool says "we
+never load the whole file into memory" but its peak RSS still equals the
+file size, something is being held in RAM regardless of what the code
+looks like it's doing (memory-mapping a file and then reading straight
+through it is exactly this trap — see below). RSS doesn't care about
+intent, only about what actually happened.
+
 ## Chunked reads, not mmap
 
 CSV, NDJSON, and JSON arrays all read the source file through one fixed-size
