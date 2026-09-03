@@ -7,9 +7,10 @@
 //! - limit/first stop pulling from the source the instant enough rows
 //!   are found — no over-read, no discarding extra rows after the fact.
 //! - count() with no WHERE clause never splits a single row into fields;
-//!   it counts newlines directly on the mapped bytes. This is true for
-//!   both formats — CSV and NDJSON are both one-record-per-line, so
-//!   counting records is exactly counting newlines either way.
+//!   it counts newlines/objects directly against the chunked read buffer.
+//!   This is true for both formats — CSV and NDJSON are both
+//!   one-record-per-line (or, for JSON arrays, one-object-per-boundary),
+//!   so counting records never needs a full field parse either way.
 //! - projection narrows the field slice handed back per row; it does not
 //!   avoid splitting/parsing (the raw scan already has to find every
 //!   field to find the *requested* columns), but it does avoid copying
@@ -48,7 +49,9 @@ pub const QueryOptions = struct {
     format: ?Format = null,
     /// CSV read-buffer size in bytes. Null = Scanner's default (256KB —
     /// see CHUNK_SIZE in root.zig for the measurements behind that
-    /// default). Ignored for NDJSON, which is still fully mmap'd/loaded.
+    /// default). NDJSON/JSON-array files use that same default chunk
+    /// size directly (NdjsonScanner.open()) — not yet exposed through
+    /// this option; add if a real caller needs to tune it separately.
     csv_chunk_size: ?usize = null,
 };
 
@@ -100,8 +103,8 @@ const Source = union(Format) {
     }
 
     /// Fast path for count() with no WHERE clause — never splits/parses a
-    /// field. Both CSV and NDJSON now count through their chunked read
-    /// buffers rather than one large mapped/loaded slice.
+    /// field. Both CSV and NDJSON count through their chunked read
+    /// buffers, bounded memory either way.
     fn countFastPath(self: *Source) !usize {
         return switch (self.*) {
             .csv => |*s| s.countRemaining(),
@@ -166,9 +169,9 @@ pub const Query = struct {
     }
 
     /// Row count. With no WHERE clause, this never parses a single field:
-    /// it counts '\n' bytes directly in the already-mapped data. With a
-    /// WHERE clause, rows still have to be split and matched, but never
-    /// projected or returned.
+    /// it counts record boundaries directly against the chunked read
+    /// buffer. With a WHERE clause, rows still have to be split and
+    /// matched, but never projected or returned.
     pub fn count(self: *Query) !usize {
         if (self.where.len == 0) {
             return self.source.countFastPath();
