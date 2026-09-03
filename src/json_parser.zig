@@ -172,6 +172,86 @@ pub fn parseObject(line: []const u8, allocator: Allocator) ParseError!JsonObject
     };
 }
 
+/// Same as parseObject, but the fields/owned_strings arrays are supplied
+/// by the caller instead of allocated fresh — cleared and refilled, not
+/// reallocated, on every call. Added for libscanio's NdjsonScanner: at
+/// 500K rows/file, parseObject()'s own internal `std.ArrayList(){}` +
+/// `.toOwnedSlice()` per call was still a malloc/free pair per row even
+/// after the caller switched to an arena allocator, since the array
+/// itself was still being freshly requested and detached every time.
+/// Two allocators, not one: `list_allocator` grows `fields`/
+/// `owned_strings` themselves and should be a real, persistent allocator
+/// (grows once, then stays put across the whole file) — `value_allocator`
+/// is for the actual decoded-string bytes and is expected to be a
+/// per-row arena the caller resets between calls, since those bytes
+/// genuinely are only needed until the next row.
+pub fn parseObjectReuse(
+    line: []const u8,
+    list_allocator: Allocator,
+    value_allocator: Allocator,
+    fields: *std.ArrayList(JsonObject.Field),
+    owned_strings: *std.ArrayList([]u8),
+) ParseError!JsonObject {
+    fields.clearRetainingCapacity();
+    owned_strings.clearRetainingCapacity();
+
+    var tokens: [4096]simd.Token = undefined;
+    const token_count = simd.findJsonStructure(line, &tokens);
+
+    if (token_count == 0 or tokens[0].type != .open_brace) {
+        return error.InvalidJSON;
+    }
+
+    var i: usize = 1; // Skip opening {
+    while (i < token_count) {
+        const token = tokens[i];
+
+        if (token.type == .close_brace) {
+            break;
+        }
+
+        if (token.type != .quote) {
+            if (token.type == .comma) {
+                i += 1;
+                continue;
+            }
+            return error.ExpectedQuote;
+        }
+
+        const key_start = token.pos + 1;
+        const key_end = findStringEndFromTokens(line, tokens[0..token_count], i + 1, key_start) orelse return error.MalformedKey;
+        const raw_key = line[key_start..key_end];
+        const key_has_escape = hasJsonEscape(raw_key);
+        const key = if (key_has_escape) try decodeOwnedJsonString(raw_key, value_allocator) else raw_key;
+        advanceTokenIndex(tokens[0..token_count], &i, key_end + 1);
+
+        if (i >= token_count or tokens[i].type != .colon) {
+            return error.ExpectedColon;
+        }
+        const colon_pos = tokens[i].pos;
+        i += 1; // Skip colon
+
+        const value = try parseValueAfterColon(line, tokens[0..token_count], &i, colon_pos, value_allocator, owned_strings);
+
+        try fields.append(list_allocator, JsonObject.Field{
+            .key = key,
+            .value = value,
+            .key_owned = key_has_escape,
+        });
+    }
+
+    // fields.items / owned_strings.items are views into caller-owned,
+    // caller-persisted buffers — not detached via toOwnedSlice(), and not
+    // this JsonObject's to free. The caller must not call .deinit() on
+    // the result; clearRetainingCapacity() on the next call (or the
+    // caller's own cleanup) is what reclaims this memory.
+    return JsonObject{
+        .fields = fields.items,
+        .allocator = list_allocator,
+        .owned_strings = null,
+    };
+}
+
 pub const ParseError = error{
     InvalidJSON,
     ExpectedQuote,

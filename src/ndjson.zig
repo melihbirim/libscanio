@@ -59,7 +59,32 @@ pub const NdjsonScanner = struct {
     pos: usize,
     header: [][]const u8,
     field_buf: [][]const u8 = &.{},
-    current: ?json_parser.JsonObject = null,
+    /// Backs each row's decoded-string bytes (escaped-string copies from
+    /// parseObjectReuse). Reset (not deinit'd) at the start of every
+    /// next(), retaining its capacity, matching the previous
+    /// JsonObject.deinit() timing exactly — the previous row's data
+    /// (already handed to the caller via field_buf) stays valid until then.
+    row_arena: std.heap.ArenaAllocator,
+    /// The JSON fields array for the CURRENT row, reused across next()
+    /// calls via clearRetainingCapacity() rather than reallocated —
+    /// parseObject()'s own internal array allocation was still a
+    /// malloc/free pair per row even after row_arena existed, since the
+    /// array itself was freshly requested and detached (toOwnedSlice())
+    /// every call. Grown via self.allocator (persists for the scanner's
+    /// whole lifetime), not row_arena (which resets every row and would
+    /// defeat the reuse).
+    ///
+    /// owned_strings is NOT a persisted field alongside it, on purpose:
+    /// json_parser's parseValueAfterColon() grows that list using
+    /// whatever single allocator it's handed, which for parseObjectReuse
+    /// is row_arena — so owned_strings' own backing array ends up
+    /// arena-scoped too, and freeing it later via self.allocator (a
+    /// different allocator than whatever actually backed it) segfaults.
+    /// Caught by this file's own test suite. It's declared fresh,
+    /// arena-backed, inside next() instead — cheap, since arena
+    /// allocation is a bump pointer, and its whole lifetime is one row
+    /// anyway.
+    parse_fields: std.ArrayList(json_parser.JsonObject.Field) = .{},
 
     pub fn open(allocator: Allocator, path: []const u8) !NdjsonScanner {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -83,7 +108,9 @@ pub const NdjsonScanner = struct {
             .mapped = mapped,
             .pos = 0,
             .header = &[_][]const u8{},
+            .row_arena = std.heap.ArenaAllocator.init(allocator),
         };
+        errdefer scanner.row_arena.deinit();
 
         // Peek the first row to derive the header, then rewind — the
         // first data row is re-read normally by the first next() call.
@@ -101,7 +128,8 @@ pub const NdjsonScanner = struct {
     }
 
     pub fn deinit(self: *NdjsonScanner) void {
-        if (self.current) |*c| c.deinit();
+        self.row_arena.deinit();
+        self.parse_fields.deinit(self.allocator);
         for (self.header) |k| self.allocator.free(k);
         self.allocator.free(self.header);
         if (self.field_buf.len > 0) self.allocator.free(self.field_buf);
@@ -122,9 +150,18 @@ pub const NdjsonScanner = struct {
 
     pub fn next(self: *NdjsonScanner) !?Row {
         const line = self.nextLine() orelse return null;
-        if (self.current) |*c| c.deinit();
-        self.current = json_parser.parseObject(line, self.allocator) catch return NdjsonError.InvalidJson;
-        const obj = self.current.?;
+        _ = self.row_arena.reset(.retain_capacity);
+        // Arena-backed and local, not a persisted field — see parse_fields'
+        // doc comment for why owned_strings can't safely be reused the
+        // same way.
+        var owned_strings: std.ArrayList([]u8) = .{};
+        const obj = json_parser.parseObjectReuse(
+            line,
+            self.allocator,
+            self.row_arena.allocator(),
+            &self.parse_fields,
+            &owned_strings,
+        ) catch return NdjsonError.InvalidJson;
 
         self.ensureCapacity(self.header.len);
         for (self.header, 0..) |key, i| {
