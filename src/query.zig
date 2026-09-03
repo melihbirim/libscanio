@@ -46,6 +46,10 @@ pub const QueryOptions = struct {
     /// Null = infer from the path's extension (.ndjson/.jsonl -> ndjson,
     /// anything else -> csv).
     format: ?Format = null,
+    /// CSV read-buffer size in bytes. Null = Scanner's default (256KB —
+    /// see CHUNK_SIZE in root.zig for the measurements behind that
+    /// default). Ignored for NDJSON, which is still fully mmap'd/loaded.
+    csv_chunk_size: ?usize = null,
 };
 
 fn inferFormat(path: []const u8) Format {
@@ -95,13 +99,24 @@ const Source = union(Format) {
         };
     }
 
-    /// (mapped data, current read position) — both formats are line-
-    /// oriented and expose these identically, which is what lets count()'s
-    /// newline-only fast path work the same way for either.
-    fn dataAndPos(self: *Source) struct { data: []const u8, pos: *usize } {
+    /// Newline-only fast path for count() with no WHERE clause — never
+    /// splits a field. CSV counts through its chunked read buffer;
+    /// NDJSON (still fully mmap'd/loaded, see ndjson.zig) counts directly
+    /// on its mapped bytes. Both are one-record-per-line, so counting
+    /// records is exactly counting newlines either way.
+    fn countFastPath(self: *Source) !usize {
         return switch (self.*) {
-            .csv => |*s| .{ .data = s.data, .pos = &s.pos },
-            .ndjson => |*s| .{ .data = s.data, .pos = &s.pos },
+            .csv => |*s| s.countRemaining(),
+            .ndjson => |*s| blk: {
+                var n: usize = 0;
+                const start = s.pos;
+                for (s.data[start..]) |c| {
+                    if (c == '\n') n += 1;
+                }
+                if (s.data.len > start and s.data[s.data.len - 1] != '\n') n += 1;
+                s.pos = s.data.len;
+                break :blk n;
+            },
         };
     }
 };
@@ -119,7 +134,9 @@ pub const Query = struct {
     pub fn open(allocator: Allocator, path: []const u8, options: QueryOptions) !Query {
         const format = options.format orelse inferFormat(path);
         const source: Source = switch (format) {
-            .csv => .{ .csv = try Scanner.open(allocator, path) },
+            .csv => .{ .csv = try Scanner.openWithOptions(allocator, path, .{
+                .chunk_size = options.csv_chunk_size orelse scan.default_chunk_size,
+            }) },
             .ndjson => .{ .ndjson = try NdjsonScanner.open(allocator, path) },
         };
         return .{ .source = source, .columns = options.columns, .where = options.where, .limit = options.limit };
@@ -165,16 +182,7 @@ pub const Query = struct {
     /// projected or returned.
     pub fn count(self: *Query) !usize {
         if (self.where.len == 0) {
-            const dp = self.source.dataAndPos();
-            var n: usize = 0;
-            const start = dp.pos.*;
-            for (dp.data[start..]) |c| {
-                if (c == '\n') n += 1;
-            }
-            // A final row with no trailing newline still counts.
-            if (dp.data.len > start and dp.data[dp.data.len - 1] != '\n') n += 1;
-            dp.pos.* = dp.data.len;
-            return n;
+            return self.source.countFastPath();
         }
         var n: usize = 0;
         while (try self.source.next()) |row| {

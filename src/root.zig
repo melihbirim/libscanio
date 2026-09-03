@@ -1,14 +1,44 @@
 //! libscanio M1: file source + CSV parser + next() + row streaming.
 //!
-//! Constant-memory by construction: the file is memory-mapped (POSIX) or
-//! read once into a single allocated buffer (Windows, no mmap fallback
-//! here), and every Row's fields are zero-copy slices into that one
-//! buffer — no per-row allocation. The only allocation on the hot path is
-//! the reusable field-offset scratch array, grown (not reallocated per
-//! row) only if a row has more fields than any row seen so far.
+//! Bounded-memory by construction, not just "no per-row allocation": the
+//! file is read in fixed-size chunks (CHUNK_SIZE, currently 1MB), reused
+//! across the whole scan, not memory-mapped. Peak RSS tracks the chunk
+//! size, not the file size — a 10GB file costs the same ~1MB working set
+//! as a 10MB one. This replaced an earlier mmap-based design: mmap gave
+//! zero-copy rows for free, but touching every byte to scan it faults in
+//! (and keeps resident) every page of the file, so peak RSS == file size
+//! by construction — measured directly (`/usr/bin/time -l`) on a 417MB
+//! fixture: 426MB peak either way you scan it. `cat`, by contrast, reads
+//! and discards fixed 64KB-ish chunks and holds ~1.4MB regardless of file
+//! size. Chunked reads get libscanio into that same bounded regime.
+//!
+//! Almost every Row's fields are still zero-copy slices into the current
+//! chunk buffer — the fast path costs nothing extra. Only a line that
+//! straddles a chunk boundary (rare, only near each chunk edge) gets
+//! assembled into a small reused scratch buffer (line_scratch) instead;
+//! same "valid until the next next() call" contract either way, so this
+//! doesn't change the API.
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+
+/// Default read-buffer size, overridable per-Scanner via ScannerOptions
+/// (and per-Query via QueryOptions.csv_chunk_size). Bigger = fewer read()
+/// syscalls, higher peak RSS; smaller = more syscalls, lower peak RSS.
+/// Measured on a 417MB/1M-row/51-col file, 10 runs each: time is flat
+/// (0.56-0.58s) from 64KB through 4MB — syscall count isn't the
+/// bottleneck anywhere in that range — while RSS scales roughly linearly
+/// with chunk size (64KB: 2.0MB, 256KB: 2.2MB, 1MB: 3.0MB, 4MB: 6.1MB).
+/// 16MB was a strict loss on both axes (0.60s, 18.7MB) — the buffer
+/// itself gets big enough to cost first-touch time. 256KB is the default:
+/// same time as 1MB, 26% less RSS, with enough margin above 64KB to avoid
+/// its run-to-run variance.
+const CHUNK_SIZE = 256 * 1024;
+pub const default_chunk_size = CHUNK_SIZE;
+
+pub const ScannerOptions = struct {
+    delimiter: u8 = ',',
+    chunk_size: usize = CHUNK_SIZE,
+};
 
 const query_mod = @import("query.zig");
 pub const Query = query_mod.Query;
@@ -63,64 +93,65 @@ pub const ScanError = error{
 pub const Scanner = struct {
     allocator: Allocator,
     file: std.fs.File,
-    data: []const u8,
-    mapped: bool,
-    pos: usize,
+    buf: []u8,
+    buf_len: usize,
+    buf_pos: usize,
+    eof: bool,
+    /// Carries the tail of a line that didn't fit in one chunk. Cleared
+    /// at the start of every nextLine() call — see nextLine()'s comment
+    /// for why that timing matters.
+    line_scratch: std.ArrayListUnmanaged(u8),
     delimiter: u8,
+    /// Owned copy — unlike per-row fields, the header must outlive chunk
+    /// reuse for the scanner's whole lifetime (columnIndex, C ABI header
+    /// listing, etc.), so it can't be a slice into the reused buf.
+    header_line: []u8,
     header: [][]const u8,
     field_buf: [][]const u8,
 
     pub fn open(allocator: Allocator, path: []const u8) !Scanner {
-        return openWithDelimiter(allocator, path, ',');
+        return openWithOptions(allocator, path, .{});
     }
 
     pub fn openWithDelimiter(allocator: Allocator, path: []const u8, delimiter: u8) !Scanner {
+        return openWithOptions(allocator, path, .{ .delimiter = delimiter });
+    }
+
+    pub fn openWithOptions(allocator: Allocator, path: []const u8, options: ScannerOptions) !Scanner {
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
         const size = (try file.stat()).size;
         if (size == 0) return ScanError.EmptyFile;
 
-        var data: []const u8 = undefined;
-        var mapped = false;
-        if (builtin.os.tag == .windows) {
-            data = try file.readToEndAlloc(allocator, size);
-        } else {
-            const mem = try std.posix.mmap(
-                null,
-                size,
-                std.posix.PROT.READ,
-                .{ .TYPE = .PRIVATE },
-                file.handle,
-                0,
-            );
-            data = mem;
-            mapped = true;
-        }
+        const buf = try allocator.alloc(u8, options.chunk_size);
+        errdefer allocator.free(buf);
 
         var scanner = Scanner{
             .allocator = allocator,
             .file = file,
-            .data = data,
-            .mapped = mapped,
-            .pos = 0,
-            .delimiter = delimiter,
+            .buf = buf,
+            .buf_len = 0,
+            .buf_pos = 0,
+            .eof = false,
+            .line_scratch = .{},
+            .delimiter = options.delimiter,
+            .header_line = &[_]u8{},
             .header = &[_][]const u8{},
             .field_buf = &[_][]const u8{},
         };
 
-        const header_line = scanner.nextLine() orelse return ScanError.EmptyFile;
-        scanner.header = try scanner.splitOwned(header_line);
+        const header_line = (try scanner.nextLine()) orelse return ScanError.EmptyFile;
+        scanner.header_line = try allocator.dupe(u8, header_line);
+        scanner.header = try scanner.splitOwned(scanner.header_line);
         return scanner;
     }
 
     pub fn deinit(self: *Scanner) void {
         self.allocator.free(self.header);
+        self.allocator.free(self.header_line);
         if (self.field_buf.len > 0) self.allocator.free(self.field_buf);
-        if (self.mapped) {
-            std.posix.munmap(@alignCast(@constCast(self.data)));
-        } else {
-            self.allocator.free(@constCast(self.data));
-        }
+        self.line_scratch.deinit(self.allocator);
+        self.allocator.free(self.buf);
         self.file.close();
     }
 
@@ -135,27 +166,93 @@ pub const Scanner = struct {
     /// slice is only valid until the next call to next() — it's a reused
     /// scratch buffer, not a fresh allocation per row.
     pub fn next(self: *Scanner) !?Row {
-        const line = self.nextLine() orelse return null;
+        const line = (try self.nextLine()) orelse return null;
         const n = self.splitInto(line);
         return Row{ .fields = self.field_buf[0..n] };
     }
 
-    fn nextLine(self: *Scanner) ?[]const u8 {
-        if (self.pos >= self.data.len) return null;
-        const start = self.pos;
-        const rel = std.mem.indexOfScalar(u8, self.data[start..], '\n');
-        if (rel) |r| {
-            self.pos = start + r + 1;
-            var end = start + r;
-            if (end > start and self.data[end - 1] == '\r') end -= 1;
-            return self.data[start..end];
+    /// Newline-only fast path for count() with no WHERE clause: reads
+    /// through the rest of the file in chunks, counting '\n' without
+    /// splitting a single field. Same bounded-memory property as next().
+    pub fn countRemaining(self: *Scanner) !usize {
+        var n: usize = 0;
+        var saw_any_after_last_nl = false;
+        while (true) {
+            if (self.buf_pos >= self.buf_len) {
+                if (self.eof) break;
+                try self.fillBuffer();
+                if (self.buf_len == 0) break;
+            }
+            const chunk = self.buf[self.buf_pos..self.buf_len];
+            for (chunk) |c| {
+                if (c == '\n') {
+                    n += 1;
+                    saw_any_after_last_nl = false;
+                } else {
+                    saw_any_after_last_nl = true;
+                }
+            }
+            self.buf_pos = self.buf_len;
         }
-        self.pos = self.data.len;
-        return self.data[start..];
+        // A final row with no trailing newline still counts.
+        if (saw_any_after_last_nl) n += 1;
+        return n;
+    }
+
+    fn fillBuffer(self: *Scanner) !void {
+        const n = try self.file.read(self.buf);
+        self.buf_len = n;
+        self.buf_pos = 0;
+        if (n == 0) self.eof = true;
+    }
+
+    fn trimCR(line: []const u8) []const u8 {
+        if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+        return line;
+    }
+
+    /// Returns the next line (without its terminator), or null at EOF.
+    /// The fast path (line doesn't cross a chunk boundary) is a zero-copy
+    /// slice into buf. The slow path (line spans a chunk boundary)
+    /// assembles it into line_scratch instead. Either way, the returned
+    /// slice is only valid until the next call — line_scratch is cleared
+    /// at the *start* of this function, not before returning, so a line
+    /// built up across several fillBuffer() calls within one invocation
+    /// stays intact for the caller.
+    fn nextLine(self: *Scanner) !?[]const u8 {
+        self.line_scratch.clearRetainingCapacity();
+        while (true) {
+            if (self.buf_pos < self.buf_len) {
+                if (std.mem.indexOfScalar(u8, self.buf[self.buf_pos..self.buf_len], '\n')) |rel| {
+                    const abs_end = self.buf_pos + rel;
+                    const chunk_part = self.buf[self.buf_pos..abs_end];
+                    self.buf_pos = abs_end + 1;
+                    if (self.line_scratch.items.len == 0) {
+                        return trimCR(chunk_part);
+                    }
+                    try self.line_scratch.appendSlice(self.allocator, chunk_part);
+                    return trimCR(self.line_scratch.items);
+                }
+                try self.line_scratch.appendSlice(self.allocator, self.buf[self.buf_pos..self.buf_len]);
+                self.buf_pos = self.buf_len;
+            }
+            if (self.eof) {
+                if (self.line_scratch.items.len > 0) return trimCR(self.line_scratch.items);
+                return null;
+            }
+            try self.fillBuffer();
+        }
     }
 
     /// Split a line into the reusable field_buf, growing it if this row
     /// has more fields than any row seen so far. Returns the field count.
+    ///
+    /// Measured: a std.mem.indexOfScalarPos-per-field version (SIMD, same
+    /// approach nextLine() uses for '\n') was tried and made this *slower*
+    /// (0.42s -> 0.58s on a 1M-row/51-col file) — fields here average ~8
+    /// bytes, and indexOfScalarPos's per-call setup cost dominates at that
+    /// length. The plain scalar scan wins for short, narrow fields; only
+    /// worth revisiting for schemas with long text fields.
     fn splitInto(self: *Scanner, line: []const u8) usize {
         var count: usize = 0;
         var start: usize = 0;

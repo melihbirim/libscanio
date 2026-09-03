@@ -95,8 +95,8 @@ Measured on a 500K-row CSV (`zig build bench -Doptimize=ReleaseFast -- file.csv`
 
 ## Design
 
-- **Memory-mapped on POSIX** (Linux/macOS), read-once-into-a-buffer on Windows (no native mmap fallback yet). Either way, the whole file is read from disk exactly once.
-- **Zero-copy rows** — every field is a slice into that one buffer, never a fresh allocation per row.
+- **Chunked reads, not mmap** — CSV `Scanner` reads a fixed-size buffer (256KB by default) at a time, reused for the whole scan. Peak memory tracks the chunk size, not the file size: measured 2.2MB peak RSS scanning a 417MB/1M-row file, versus 426MB for an earlier mmap-based version of the same scanner (mmap has to fault in, and keeps resident, every page it touches — peak RSS == file size by construction for a full scan). `cat` on the same file holds ~1.4MB; chunked `Scanner` is in that regime now, not file-size territory. Cost: ~30% slower than the mmap version (read() syscalls vs lazy page faults) — a real tradeoff, made explicitly for the memory win. The chunk size was swept, not guessed (64KB/256KB/1MB/4MB/16MB, 10 runs each) — see [ROADMAP.md](ROADMAP.md)'s M1 entry for the full table; time is flat from 64KB to 4MB while RSS scales with chunk size, so smaller wins with no speed cost until syscall overhead would start to bite. It's configurable per-call, not fixed: `Scanner.openWithOptions(allocator, path, .{ .chunk_size = N })` or `Query.open(allocator, path, .{ .csv_chunk_size = N })`.
+- **Zero-copy rows** — almost every field is a slice into the current chunk, never a fresh allocation. Only a line that straddles a chunk boundary gets copied into a small reused scratch buffer instead of the chunk directly — same "valid until the next `next()` call" contract either way.
 - **One reusable scratch buffer** for field offsets, grown (not reallocated) only when a row has more fields than any row seen so far — not a per-row cost.
 
 ## Non-goals
