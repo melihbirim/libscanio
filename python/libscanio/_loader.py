@@ -66,6 +66,8 @@ class CPredicate(ctypes.Structure):
         ("column", ctypes.c_size_t),
         ("op", ctypes.c_int),
         ("value", ctypes.c_char_p),
+        ("values", ctypes.POINTER(ctypes.c_char_p)),
+        ("n_values", ctypes.c_size_t),
     ]
 
 

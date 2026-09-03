@@ -38,8 +38,9 @@ def scan(
     materializes the result list to return it over MCP, so pass `limit`
     for a large file rather than pulling every row into one response.
 
-    where: e.g. "revenue > 1000" or "city = Austin AND revenue > 1000".
-    Operators: = != > >= < <=. Only AND is supported.
+    where: e.g. "revenue > 1000", "city = Austin AND revenue > 1000", or
+    "color IN (yellow, green)". Operators: = != > >= < <= IN. Only AND
+    joins clauses — no OR (IN covers "any of these values" without it).
     """
     return list(libscanio.scan(path, columns=columns, where=where, limit=limit))
 

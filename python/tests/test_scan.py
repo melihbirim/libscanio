@@ -67,6 +67,11 @@ try:
         {"customer_id": "2", "name": "Bob", "revenue": "1500"},
     ])
 
+    check("IN in where", [r["customer_id"] for r in libscanio.scan(P, where="name IN (Alice, Carol)")], ["1", "3"])
+    check("IN composes with AND", [r["customer_id"] for r in libscanio.scan(P, where="name IN (Alice, Carol) AND revenue > 1000")], ["3"])
+    check("IN with no matches", list(libscanio.scan(P, where="name IN (Zed, Yolanda)")), [])
+    check_raises("IN with no values raises", lambda: list(libscanio.scan(P, where="name IN ()")))
+
     check_raises("unknown column in columns raises", lambda: list(libscanio.scan(P, columns=["nope"])))
     check_raises("unknown column in where raises", lambda: list(libscanio.scan(P, where="nope > 5")))
     check_raises("missing file raises", lambda: list(libscanio.scan("/tmp/libscanio_test_does_not_exist.csv")))

@@ -22,19 +22,30 @@ const Scanner = scan.Scanner;
 const NdjsonScanner = scan.NdjsonScanner;
 const Row = scan.Row;
 
-pub const Op = enum { eq, neq, gt, gte, lt, lte };
+pub const Op = enum { eq, neq, gt, gte, lt, lte, in_list };
 
 pub const Format = enum { csv, ndjson };
 
 pub const Predicate = struct {
     column: usize,
     op: Op,
-    value: []const u8,
+    value: []const u8 = "",
+    /// Only used when op == .in_list — the set of values to match
+    /// against. Empty/unused for every other op.
+    values: []const []const u8 = &.{},
     /// Precomputed once at Query.open() time, not re-parsed per row.
     numeric_value: ?f64 = null,
 
     pub fn init(column: usize, op: Op, value: []const u8) Predicate {
         return .{ .column = column, .op = op, .value = value, .numeric_value = std.fmt.parseFloat(f64, value) catch null };
+    }
+
+    /// col IN (a, b, c) — matches if the field equals ANY of `values`.
+    /// Each value is compared numerically first (if both the field and
+    /// that value parse as numbers) then falls back to a string compare,
+    /// same per-value logic .eq already uses.
+    pub fn initIn(column: usize, values: []const []const u8) Predicate {
+        return .{ .column = column, .op = .in_list, .values = values };
     }
 };
 
@@ -204,6 +215,18 @@ fn matches(row: Row, predicates: []const Predicate) bool {
 }
 
 fn evalOne(field: []const u8, p: Predicate) bool {
+    if (p.op == .in_list) {
+        for (p.values) |v| {
+            if (std.fmt.parseFloat(f64, v) catch null) |pv| {
+                if (std.fmt.parseFloat(f64, field) catch null) |fv| {
+                    if (fv == pv) return true;
+                    continue;
+                }
+            }
+            if (std.mem.eql(u8, field, v)) return true;
+        }
+        return false;
+    }
     if (p.numeric_value) |pv| {
         if (std.fmt.parseFloat(f64, field) catch null) |fv| {
             return switch (p.op) {
@@ -213,6 +236,7 @@ fn evalOne(field: []const u8, p: Predicate) bool {
                 .gte => fv >= pv,
                 .lt => fv < pv,
                 .lte => fv <= pv,
+                .in_list => unreachable, // handled above, before this branch
             };
         }
     }
@@ -225,6 +249,7 @@ fn evalOne(field: []const u8, p: Predicate) bool {
         .gte => std.mem.order(u8, field, p.value) != .lt,
         .lt => std.mem.order(u8, field, p.value) == .lt,
         .lte => std.mem.order(u8, field, p.value) != .gt,
+        .in_list => unreachable, // handled above, before this branch
     };
 }
 
@@ -239,6 +264,61 @@ test "filter: single numeric predicate" {
 
     const row = (try q.next()).?;
     try std.testing.expectEqualStrings("2", row.get(0).?);
+    try std.testing.expectEqual(@as(?Row, null), try q.next());
+}
+
+test "filter: IN matches any of several values" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_in.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,color\n1,red\n2,yellow\n3,blue\n4,green\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{ .where = &.{
+        Predicate.initIn(1, &.{ "yellow", "green" }),
+    } });
+    defer q.deinit();
+
+    const row1 = (try q.next()).?;
+    try std.testing.expectEqualStrings("2", row1.get(0).?);
+    const row2 = (try q.next()).?;
+    try std.testing.expectEqualStrings("4", row2.get(0).?);
+    try std.testing.expectEqual(@as(?Row, null), try q.next());
+}
+
+test "filter: IN composes with AND" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_in_and.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,color,amount\n1,yellow,50\n2,yellow,1500\n3,green,1500\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{ .where = &.{
+        Predicate.initIn(1, &.{ "yellow", "green" }),
+        Predicate.init(2, .gt, "1000"),
+    } });
+    defer q.deinit();
+
+    const row1 = (try q.next()).?;
+    try std.testing.expectEqualStrings("2", row1.get(0).?);
+    const row2 = (try q.next()).?;
+    try std.testing.expectEqualStrings("3", row2.get(0).?);
+    try std.testing.expectEqual(@as(?Row, null), try q.next());
+}
+
+test "filter: IN matches numerically too" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_in_numeric.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,rank\n1,1\n2,2\n3,3\n4,4\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{ .where = &.{
+        Predicate.initIn(1, &.{ "1", "3" }),
+    } });
+    defer q.deinit();
+
+    const row1 = (try q.next()).?;
+    try std.testing.expectEqualStrings("1", row1.get(0).?);
+    const row2 = (try q.next()).?;
+    try std.testing.expectEqualStrings("3", row2.get(0).?);
     try std.testing.expectEqual(@as(?Row, null), try q.next());
 }
 

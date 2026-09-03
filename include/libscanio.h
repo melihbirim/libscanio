@@ -16,12 +16,15 @@ typedef enum {
     SCANIO_GTE = 3,
     SCANIO_LT = 4,
     SCANIO_LTE = 5,
+    SCANIO_IN = 6,
 } scanio_op_t;
 
 typedef struct {
     size_t column;
     scanio_op_t op;
-    const char *value; /* null-terminated */
+    const char *value;   /* null-terminated; used for every op except IN — pass "" for IN */
+    const char **values; /* only used when op == SCANIO_IN: matches if the field equals ANY of these */
+    size_t n_values;
 } scanio_predicate_t;
 
 typedef struct {

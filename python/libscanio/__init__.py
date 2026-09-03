@@ -25,7 +25,9 @@ from ._loader import CAgg, COptions, CPredicate, load
 __all__ = ["scan", "schema", "count", "aggregate", "topk", "profile", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
+_OP_IN = 6
 _COND_RE = re.compile(r"^(\w+)\s*(>=|<=|!=|>|<|=)\s*(.+)$")
+_IN_RE = re.compile(r"^(\w+)\s+IN\s*\((.*)\)$")
 
 
 class ScanError(RuntimeError):
@@ -44,16 +46,50 @@ def _resolve_column(lib: ctypes.CDLL, ctx: ctypes.c_void_p, name: str) -> int:
     return idx
 
 
-def _parse_where(lib: ctypes.CDLL, ctx: ctypes.c_void_p, where: str) -> list[CPredicate]:
+def _parse_where(
+    lib: ctypes.CDLL, ctx: ctypes.c_void_p, where: str
+) -> tuple[list[CPredicate], list]:
     """Translate a simple "col OP val [AND col OP val ...]" string into
     typed predicates. Only AND is supported — OR would need the C ABI to
     represent more than a flat, implicitly-ANDed predicate list, which is
-    more machinery than libscanio's core has needed to earn yet."""
+    more machinery than libscanio's core has needed to earn yet.
+
+    "col IN (a, b, c)" is also supported as one AND-clause (matches if
+    the field equals any of the listed values) — the one case a flat
+    AND-list still needed some form of "or" for, common enough (an
+    allow-list of categories) to be worth a dedicated op rather than
+    requiring N separate scans unioned in Python.
+
+    Returns (predicates, keepalive): `keepalive` holds the ctypes arrays
+    backing each IN predicate's `values` pointer. ctypes doesn't keep
+    nested pointers alive on its own — the caller must hold `keepalive`
+    in scope until after the scanio_open() call that reads it.
+    """
     predicates = []
+    keepalive = []
     for part in where.split(" AND "):
-        m = _COND_RE.match(part.strip())
+        part = part.strip()
+        m_in = _IN_RE.match(part)
+        if m_in:
+            col, vals_str = m_in.group(1), m_in.group(2)
+            vals = [v.strip() for v in vals_str.split(",") if v.strip()]
+            if not vals:
+                raise ScanError(f'invalid IN condition (no values): "{part}"')
+            arr = (ctypes.c_char_p * len(vals))(*[v.encode() for v in vals])
+            keepalive.append(arr)
+            predicates.append(
+                CPredicate(
+                    column=_resolve_column(lib, ctx, col),
+                    op=_OP_IN,
+                    value=b"",
+                    values=ctypes.cast(arr, ctypes.POINTER(ctypes.c_char_p)),
+                    n_values=len(vals),
+                )
+            )
+            continue
+        m = _COND_RE.match(part)
         if not m:
-            raise ScanError(f'invalid WHERE condition: "{part.strip()}"')
+            raise ScanError(f'invalid WHERE condition: "{part}"')
         col, op, val = m.group(1), m.group(2), m.group(3).strip()
         predicates.append(
             CPredicate(
@@ -62,7 +98,7 @@ def _parse_where(lib: ctypes.CDLL, ctx: ctypes.c_void_p, where: str) -> list[CPr
                 value=val.encode(),
             )
         )
-    return predicates
+    return predicates, keepalive
 
 
 def scan(
@@ -77,8 +113,10 @@ def scan(
         path: Path to the CSV file.
         columns: Column names to return, in order. Default: all columns.
         where: Simple filter, e.g. "revenue > 1000" or
-               "city = Austin AND revenue > 1000". Operators: = != > >= < <=.
-               Only AND is supported.
+               "city = Austin AND revenue > 1000" or
+               "color IN (yellow, green)". Operators: = != > >= < <= IN.
+               Only AND joins clauses — no OR (IN covers the common
+               "any of these values" case without it).
         limit: Maximum rows to return. Default: no limit.
 
     Raises:
@@ -98,7 +136,7 @@ def scan(
         _raise_last_error(lib, f"failed to open {path!r}")
     try:
         col_indices = [_resolve_column(lib, probe_ctx, c) for c in columns] if columns else None
-        predicates = _parse_where(lib, probe_ctx, where) if where else None
+        predicates, _keepalive = _parse_where(lib, probe_ctx, where) if where else (None, [])
     finally:
         lib.scanio_close(probe_ctx)
 
@@ -148,7 +186,7 @@ def _open_filtered(lib: ctypes.CDLL, path: str, where: Optional[str]) -> ctypes.
     if not probe_ctx:
         _raise_last_error(lib, f"failed to open {path!r}")
     try:
-        predicates = _parse_where(lib, probe_ctx, where)
+        predicates, _keepalive = _parse_where(lib, probe_ctx, where)
     finally:
         lib.scanio_close(probe_ctx)
 

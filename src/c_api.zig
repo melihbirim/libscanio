@@ -43,7 +43,13 @@ export fn scanio_last_error() ?[*:0]const u8 {
 const CPredicate = extern struct {
     column: usize,
     op: c_int,
+    /// Used for every op except IN (op == 6) — IN uses `values`/`n_values`
+    /// instead. Still required to be a valid NUL-terminated string even
+    /// for IN predicates (it's simply not read); pass "" from the caller.
     value: [*:0]const u8,
+    /// Only used when op == 6 (IN). Nullable/0 otherwise.
+    values: ?[*]const [*:0]const u8 = null,
+    n_values: usize = 0,
 };
 
 const COptions = extern struct {
@@ -61,6 +67,11 @@ const COptions = extern struct {
 const Ctx = struct {
     query: Query,
     predicates: []Predicate,
+    /// Parallel to `predicates` — each entry is that predicate's owned IN
+    /// value set (empty slice for every non-IN predicate). Owns both the
+    /// per-value string copies and the slice holding them; freed in
+    /// scanio_close().
+    in_values: [][]const []const u8 = &.{},
     /// One owned NUL-terminated copy per field, reused/grown across next()
     /// calls. Plain []u8, not [:0]u8 — the NUL byte is placed manually at
     /// field.len and the pointer handed to C is cast at the call site;
@@ -92,6 +103,7 @@ export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
     };
 
     var predicates: []Predicate = &.{};
+    var in_values: [][]const []const u8 = &.{};
     var columns: ?[]const usize = null;
     var limit: ?usize = null;
 
@@ -102,7 +114,29 @@ export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
                 setError("out of memory allocating predicates", .{});
                 return null;
             };
+            in_values = c_allocator.alloc([]const []const u8, cpreds.len) catch {
+                setError("out of memory allocating predicates", .{});
+                c_allocator.free(predicates);
+                return null;
+            };
+            @memset(in_values, &.{});
             for (cpreds, 0..) |cp, i| {
+                if (cp.op == 6) {
+                    const cvals = cp.values.?[0..cp.n_values];
+                    const owned = c_allocator.alloc([]const u8, cvals.len) catch {
+                        setError("out of memory allocating IN values", .{});
+                        return null;
+                    };
+                    for (cvals, 0..) |cv, j| {
+                        owned[j] = c_allocator.dupe(u8, std.mem.span(cv)) catch {
+                            setError("out of memory allocating IN values", .{});
+                            return null;
+                        };
+                    }
+                    in_values[i] = owned;
+                    predicates[i] = Predicate.initIn(cp.column, owned);
+                    continue;
+                }
                 const op: Op = switch (cp.op) {
                     0 => .eq,
                     1 => .neq,
@@ -135,6 +169,7 @@ export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
             return null;
         },
         .predicates = predicates,
+        .in_values = in_values,
     };
 
     const header = ctx.query.header();
@@ -357,6 +392,11 @@ export fn scanio_close(ctx: ?*Ctx) void {
     if (c.field_cstrs.len > 0) c_allocator.free(c.field_cstrs);
     if (c.field_ptrs.len > 0) c_allocator.free(c.field_ptrs);
     if (c.predicates.len > 0) c_allocator.free(c.predicates);
+    for (c.in_values) |vals| {
+        for (vals) |v| c_allocator.free(@constCast(v));
+        if (vals.len > 0) c_allocator.free(@constCast(vals));
+    }
+    if (c.in_values.len > 0) c_allocator.free(c.in_values);
     for (c.header_cstrs) |buf| c_allocator.free(buf);
     if (c.header_cstrs.len > 0) c_allocator.free(c.header_cstrs);
     c_allocator.destroy(c);
@@ -409,6 +449,27 @@ test "C ABI: open with a filter predicate and a limit" {
     try std.testing.expectEqual(@as(c_int, 1), scanio_next(ctx, &fields, &n));
     try std.testing.expectEqualStrings("2", std.mem.span(fields[0]));
     // limit=1: no second row even though row 3 also matches the filter.
+    try std.testing.expectEqual(@as(c_int, 0), scanio_next(ctx, &fields, &n));
+}
+
+test "C ABI: open with an IN predicate" {
+    const path = "test_c_api_in.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,color\n1,red\n2,yellow\n3,blue\n4,green\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const values = [_][*:0]const u8{ "yellow", "green" };
+    const preds = [_]CPredicate{.{ .column = 1, .op = 6, .value = "", .values = &values, .n_values = 2 }};
+    const opts = COptions{ .columns = null, .n_columns = 0, .where = &preds, .n_where = 1, .limit = -1 };
+    const ctx = scanio_open(path, &opts);
+    try std.testing.expect(ctx != null);
+    defer scanio_close(ctx);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next(ctx, &fields, &n));
+    try std.testing.expectEqualStrings("2", std.mem.span(fields[0]));
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next(ctx, &fields, &n));
+    try std.testing.expectEqualStrings("4", std.mem.span(fields[0]));
     try std.testing.expectEqual(@as(c_int, 0), scanio_next(ctx, &fields, &n));
 }
 
