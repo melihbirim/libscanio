@@ -84,6 +84,39 @@ try:
     check("scan_array: no matches returns empty list", libscanio.scan_array(P, where="revenue > 99999"), [])
     check("scan_array: no filter returns every row", len(libscanio.scan_array(P)), 3)
 
+    # Regression test for a real use-after-free: scan()'s open logic used
+    # to let the ctypes objects backing WHERE predicates (the encoded
+    # value bytes, the predicate array, the options struct) go out of
+    # scope and get freed the instant the open helper returned, since
+    # nothing kept them referenced for the rest of the generator's life.
+    # Zig's Predicate.value is a slice VIEW into that memory, not a copy
+    # — reading it after it's freed is undefined behavior. This was
+    # invisible on tiny fixtures (freed bytes often aren't overwritten
+    # before the next read, by luck) and only showed up reliably at
+    # real-file scale, where enough intervening allocator churn corrupts
+    # the freed memory before it's read again. Deliberately forcing that
+    # same churn here (bytes objects allocated and discarded between
+    # every next() call) makes the bug reproduce on a tiny fixture too,
+    # instead of depending on scanning a 417MB file to catch it.
+    big = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
+    big.write("id,category\n")
+    for i in range(500):
+        big.write(f"{i},{'even' if i % 2 == 0 else 'odd'}\n")
+    big.close()
+    try:
+        it = libscanio.scan(big.name, where="category = even")
+        results = []
+        for _ in range(300):
+            churn = [bytes(64) for _ in range(500)]  # force allocator reuse of freed memory
+            del churn
+            try:
+                results.append(next(it))
+            except StopIteration:
+                break
+        check("scan() survives allocator churn between rows (UAF regression)", len(results), 250)
+    finally:
+        os.unlink(big.name)
+
     check_raises("unknown column in columns raises", lambda: list(libscanio.scan(P, columns=["nope"])))
     check_raises("unknown column in where raises", lambda: list(libscanio.scan(P, where="nope > 5")))
     check_raises("missing file raises", lambda: list(libscanio.scan("/tmp/libscanio_test_does_not_exist.csv")))

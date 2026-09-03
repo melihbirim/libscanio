@@ -123,7 +123,11 @@ def scan(
         ScanError: file not found, malformed WHERE, or unknown column name.
     """
     lib = load()
-    ctx, names, _keepalive = _open_full(lib, path, columns, where, limit)
+    # keepalive isn't otherwise referenced below, but MUST stay bound in
+    # this generator's frame for as long as ctx is in use — see
+    # _open_full()'s doc comment for why (a real use-after-free bug, not
+    # a hypothetical one, lived here until this was fixed).
+    ctx, names, keepalive = _open_full(lib, path, columns, where, limit)  # noqa: F841
     try:
         fields = ctypes.POINTER(ctypes.c_char_p)()
         n = ctypes.c_size_t()
@@ -148,9 +152,26 @@ def _open_full(
     """Shared open logic for scan() and scan_array(): resolve column
     names + WHERE to indices/predicates (via a throwaway probe open,
     same reasoning as _open_filtered()), then open for real with the
-    resolved options. Returns (ctx, column names in output order,
-    keepalive) — `keepalive` must stay in scope until the caller is done
-    with `ctx` (it backs any IN predicates' values arrays)."""
+    resolved options.
+
+    Returns (ctx, column names in output order, keepalive). `keepalive`
+    MUST stay referenced by the caller for as long as `ctx` is used, not
+    just through this function — real bug found (not hypothetical) when
+    it didn't: Zig's Predicate.value is a slice VIEW into the raw bytes
+    behind CPredicate.value, not a copy. Once this function returns, if
+    nothing still references `where_arr`/`opts`/`predicates`/the encoded
+    value bytes, CPython's refcounting frees them immediately (not
+    "eventually" — the instant refcount hits zero) — and the next
+    scanio_next() call on `ctx` then reads freed memory. Manifested as
+    scan() silently returning far fewer rows than actually matched (1
+    instead of ~1000+) once Python bytecode ran between scanio_open()
+    and the following scanio_next() calls, which never happened for
+    count()/aggregate()/topk() (one C call does their whole WHERE-drain,
+    so nothing got a chance to free the backing memory mid-scan) — this
+    is why the bug went unnoticed until an actual multi-row scan() call
+    was checked against its true expected count, not just "does this
+    call run without erroring."
+    """
     probe_ctx = lib.scanio_open(path.encode(), None)
     if not probe_ctx:
         _raise_last_error(lib, f"failed to open {path!r}")
@@ -169,6 +190,7 @@ def _open_full(
         n_where=len(predicates) if predicates else 0,
         limit=limit if limit is not None else -1,
     )
+    keepalive = keepalive + [predicates, where_arr, columns_arr, opts]
 
     ctx = lib.scanio_open(path.encode(), ctypes.byref(opts))
     if not ctx:
@@ -241,31 +263,36 @@ def scan_array(
         lib.scanio_close(ctx)
 
 
-def _open_filtered(lib: ctypes.CDLL, path: str, where: Optional[str]) -> ctypes.c_void_p:
+def _open_filtered(lib: ctypes.CDLL, path: str, where: Optional[str]) -> tuple[ctypes.c_void_p, list]:
     """Open with WHERE resolved to predicates — the shared setup schema(),
     count(), aggregate(), and topk() all need before doing their own
     thing. Same two-open pattern scan() uses: one throwaway open to
-    resolve column names, one real open with the resolved options."""
+    resolve column names, one real open with the resolved options.
+
+    Returns (ctx, keepalive) — see _open_full()'s doc comment for why
+    `keepalive` must stay referenced by the caller until `ctx` is closed,
+    not just through this function. Same bug class, same fix."""
     if not where:
         ctx = lib.scanio_open(path.encode(), None)
         if not ctx:
             _raise_last_error(lib, f"failed to open {path!r}")
-        return ctx
+        return ctx, []
 
     probe_ctx = lib.scanio_open(path.encode(), None)
     if not probe_ctx:
         _raise_last_error(lib, f"failed to open {path!r}")
     try:
-        predicates, _keepalive = _parse_where(lib, probe_ctx, where)
+        predicates, keepalive = _parse_where(lib, probe_ctx, where)
     finally:
         lib.scanio_close(probe_ctx)
 
     where_arr = (CPredicate * len(predicates))(*predicates)
     opts = COptions(columns=None, n_columns=0, where=where_arr, n_where=len(predicates), limit=-1)
+    keepalive = keepalive + [predicates, where_arr, opts]
     ctx = lib.scanio_open(path.encode(), ctypes.byref(opts))
     if not ctx:
         _raise_last_error(lib, f"failed to open {path!r}")
-    return ctx
+    return ctx, keepalive
 
 
 def schema(path: str) -> list[str]:
@@ -283,7 +310,7 @@ def schema(path: str) -> list[str]:
 def count(path: str, where: Optional[str] = None) -> int:
     """Row count. With no `where`, never parses a single field."""
     lib = load()
-    ctx = _open_filtered(lib, path, where)
+    ctx, _keepalive = _open_filtered(lib, path, where)
     try:
         n = lib.scanio_count(ctx)
         if n < 0:
@@ -298,7 +325,7 @@ def aggregate(path: str, column: str, where: Optional[str] = None) -> dict[str, 
     missing values are skipped, not errors. min/max/avg are None if no
     numeric value was ever seen (count == 0)."""
     lib = load()
-    ctx = _open_filtered(lib, path, where)
+    ctx, _keepalive = _open_filtered(lib, path, where)
     try:
         col_idx = _resolve_column(lib, ctx, column)
         out = CAgg()
@@ -328,7 +355,7 @@ def topk(
     scan()-shaped dict plus a "_key" entry with that row's numeric value
     for the sorted column."""
     lib = load()
-    ctx = _open_filtered(lib, path, where)
+    ctx, _keepalive = _open_filtered(lib, path, where)
     try:
         col_idx = _resolve_column(lib, ctx, column)
         names = [lib.scanio_column_name(ctx, i).decode() for i in range(lib.scanio_n_columns(ctx))]
