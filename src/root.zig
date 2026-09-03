@@ -10,6 +10,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+const query_mod = @import("query.zig");
+pub const Query = query_mod.Query;
+pub const QueryOptions = query_mod.QueryOptions;
+pub const Predicate = query_mod.Predicate;
+pub const Op = query_mod.Op;
+
+test {
+    _ = query_mod;
+}
+
 pub const Row = struct {
     fields: []const []const u8,
 

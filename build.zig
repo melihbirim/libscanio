@@ -36,4 +36,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_example.addArgs(args);
     const example_step = b.step("scan", "Run the scan_file example");
     example_step.dependOn(&run_example.step);
+
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/bench.zig"),
+        }),
+    });
+    bench.root_module.addImport("scanio", scanio_mod);
+    b.installArtifact(bench);
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run the work-not-done benchmark");
+    bench_step.dependOn(&run_bench.step);
 }
