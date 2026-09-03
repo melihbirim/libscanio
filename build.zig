@@ -53,12 +53,72 @@ pub fn build(b: *std.Build) void {
         }),
     });
     example.root_module.addImport("scanio", scanio_mod);
+    example.linkLibC();
     b.installArtifact(example);
     const run_example = b.addRunArtifact(example);
     run_example.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_example.addArgs(args);
     const example_step = b.step("scan", "Run the scan_file example");
     example_step.dependOn(&run_example.step);
+
+    const mem_check = b.addExecutable(.{
+        .name = "mem_check",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/mem_check.zig"),
+        }),
+    });
+    mem_check.root_module.addImport("scanio", scanio_mod);
+    mem_check.linkLibC();
+    b.installArtifact(mem_check);
+    const run_mem_check = b.addRunArtifact(mem_check);
+    run_mem_check.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_mem_check.addArgs(args);
+    const mem_check_step = b.step("mem-check", "Run the format-aware Query scan (for memory/throughput comparison)");
+    mem_check_step.dependOn(&run_mem_check.step);
+
+    const json_parser_mod = b.addModule("json_parser", .{
+        .root_source_file = b.path("src/json_parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const parser_bench = b.addExecutable(.{
+        .name = "parser_bench",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/parser_bench.zig"),
+        }),
+    });
+    parser_bench.root_module.addImport("json_parser", json_parser_mod);
+    parser_bench.linkLibC();
+    b.installArtifact(parser_bench);
+    const run_parser_bench = b.addRunArtifact(parser_bench);
+    run_parser_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_parser_bench.addArgs(args);
+    const parser_bench_step = b.step("parser-bench", "Isolated json_parser.zig throughput (no Query/NdjsonScanner layer)");
+    parser_bench_step.dependOn(&run_parser_bench.step);
+
+    const json_simd_mod = b.addModule("json_simd", .{
+        .root_source_file = b.path("src/json_simd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tok_bench = b.addExecutable(.{
+        .name = "tokenizer_bench",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/tokenizer_bench.zig"),
+        }),
+    });
+    tok_bench.root_module.addImport("json_simd", json_simd_mod);
+    b.installArtifact(tok_bench);
+    const run_tok_bench = b.addRunArtifact(tok_bench);
+    run_tok_bench.step.dependOn(b.getInstallStep());
+    const tok_bench_step = b.step("tok-bench", "Isolated SIMD tokenizer throughput (no allocation, no field parsing)");
+    tok_bench_step.dependOn(&run_tok_bench.step);
 
     const bench = b.addExecutable(.{
         .name = "bench",
@@ -69,6 +129,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     bench.root_module.addImport("scanio", scanio_mod);
+    bench.linkLibC();
     b.installArtifact(bench);
     const run_bench = b.addRunArtifact(bench);
     run_bench.step.dependOn(b.getInstallStep());

@@ -14,9 +14,9 @@ fn timeIt(comptime label: []const u8, comptime f: anytype, args: anytype) !void 
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // c_allocator, not GeneralPurposeAllocator — see ndjson.zig's doc
+    // comment for why that choice alone was a 66x difference for NDJSON.
+    const allocator = std.heap.c_allocator;
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);

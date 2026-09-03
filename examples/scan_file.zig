@@ -2,9 +2,12 @@ const std = @import("std");
 const scanio = @import("scanio");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // c_allocator, not GeneralPurposeAllocator: GPA's per-allocation
+    // tracking overhead is large enough to be the dominant cost for
+    // NDJSON's many-small-allocations pattern — see ndjson.zig's doc
+    // comment. Benchmark with the allocator you'd actually ship, or the
+    // number you get isn't the number a real caller sees.
+    const allocator = std.heap.c_allocator;
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);

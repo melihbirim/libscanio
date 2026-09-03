@@ -20,6 +20,13 @@ const ndjson_mod = @import("ndjson.zig");
 pub const NdjsonScanner = ndjson_mod.NdjsonScanner;
 pub const NdjsonError = ndjson_mod.NdjsonError;
 
+// Vendored from zson (github.com/melihbirim/zson, MIT, same author) —
+// a SIMD-tokenized, zero-copy JSON line parser. Adopted after the
+// first NDJSON attempt (std.json.parseFromSlice per line) measured
+// 400x slower than CSV; see ndjson.zig's own doc comment.
+const json_parser_mod = @import("json_parser.zig");
+const json_simd_mod = @import("json_simd.zig");
+
 const aggregate_mod = @import("aggregate.zig");
 pub const AggResult = aggregate_mod.AggResult;
 pub const aggregate = aggregate_mod.aggregate;
@@ -34,6 +41,8 @@ test {
     _ = ndjson_mod;
     _ = aggregate_mod;
     _ = topk_mod;
+    _ = json_parser_mod;
+    _ = json_simd_mod;
 }
 
 pub const Row = struct {

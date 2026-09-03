@@ -8,29 +8,46 @@
 //! reads back as an empty string, same as CSV's own null/empty-field
 //! convention.
 //!
-//! Deliberate scope cut, stated rather than hidden: this uses
-//! std.json.parseFromSlice per line, not a hand-rolled zero-copy
-//! tokenizer. CSV's Row.fields are slices directly into the mapped file
-//! with zero per-row allocation; NDJSON's are not — each line gets parsed
-//! into an owned std.json.Value tree, freed and replaced every next()
-//! call. A true zero-copy JSON scanner (slicing unescaped string values
-//! straight out of the buffer, only allocating when an escape sequence
-//! forces it) is real, separate engineering — worth doing if a benchmark
-//! ever shows this path matters, not before.
+//! Parsing is json_parser.zig — a SIMD-tokenized, zero-copy JSON parser
+//! (string/number values are slices directly into the mapped line; only
+//! escaped strings allocate) pulled in from zson, a prior project doing
+//! exactly this job for exactly this reason. The first attempt here used
+//! std.json.parseFromSlice per line and measured 400x slower than CSV
+//! (42K rows/sec vs 17M) — building a tree per row, every row, is real
+//! cost, not a rounding error. Reusing a parser that already solved this
+//! beat re-deriving the solution from scratch.
 //!
-//! Nested objects/arrays are out of scope (see the project's own
+//! Second finding, worth stating since it's easy to reintroduce: swapping
+//! in json_parser.zig alone did NOT fix the 42K rows/sec number — the
+//! actual bottleneck was std.heap.GeneralPurposeAllocator, not the parsing
+//! algorithm. GPA's per-allocation safety/tracking overhead dominates for
+//! this workload (several small, short-lived allocations per row, 500K
+//! rows) — swapping the *allocator* the caller passes to Query.open() from
+//! GPA to std.heap.c_allocator took NDJSON from 42K to 2.78M rows/sec on
+//! the same file with the same parser, a 66x difference from allocator
+//! choice alone (CSV's own zero-copy path barely notices, since it barely
+//! allocates either way). The C ABI (c_api.zig) already uses c_allocator
+//! for an unrelated reason (GPA also faults when dlopen()'d — see #149 in
+//! csvql's history), so Python/consumers of the C ABI get the fast path
+//! automatically; a Zig caller building on Query directly does not unless
+//! they choose the allocator themselves. Measure with whatever allocator
+//! you intend to actually ship with, not whichever one is easiest to
+//! write in a test.
+//!
+//! Nested objects/arrays are still out of scope (see the project's own
 //! non-goals) and fail loudly with NestedValueNotSupported rather than
-//! silently stringifying or dropping data.
+//! silently stringifying — json_parser.zig can parse them, libscanio
+//! chooses not to expose them as flat row fields.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const scan = @import("root.zig");
 const Row = scan.Row;
+const json_parser = @import("json_parser.zig");
 
 pub const NdjsonError = error{
     EmptyFile,
     InvalidJson,
-    NotAnObject,
     NestedValueNotSupported,
 };
 
@@ -41,12 +58,8 @@ pub const NdjsonScanner = struct {
     mapped: bool,
     pos: usize,
     header: [][]const u8,
-    /// Rendered value per header column for the current row, reused/grown
-    /// across next() calls for the non-string (number/bool/null) case —
-    /// string values instead point directly at the current parse tree.
-    render_buf: [][]u8 = &.{},
     field_buf: [][]const u8 = &.{},
-    current: ?std.json.Parsed(std.json.Value) = null,
+    current: ?json_parser.JsonObject = null,
 
     pub fn open(allocator: Allocator, path: []const u8) !NdjsonScanner {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -76,17 +89,12 @@ pub const NdjsonScanner = struct {
         // first data row is re-read normally by the first next() call.
         const first_line = scanner.nextLine() orelse return NdjsonError.EmptyFile;
         scanner.pos = 0;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, first_line, .{}) catch return NdjsonError.InvalidJson;
-        defer parsed.deinit();
-        const obj = switch (parsed.value) {
-            .object => |o| o,
-            else => return NdjsonError.NotAnObject,
-        };
-        var keys = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, obj.count());
+        var obj = json_parser.parseObject(first_line, allocator) catch return NdjsonError.InvalidJson;
+        defer obj.deinit();
+        var keys = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, obj.fields.len);
         errdefer keys.deinit(allocator);
-        var it = obj.iterator();
-        while (it.next()) |entry| {
-            try keys.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
+        for (obj.fields) |field| {
+            try keys.append(allocator, try allocator.dupe(u8, field.key));
         }
         scanner.header = try keys.toOwnedSlice(allocator);
         return scanner;
@@ -96,8 +104,6 @@ pub const NdjsonScanner = struct {
         if (self.current) |*c| c.deinit();
         for (self.header) |k| self.allocator.free(k);
         self.allocator.free(self.header);
-        for (self.render_buf) |b| if (b.len > 0) self.allocator.free(b);
-        if (self.render_buf.len > 0) self.allocator.free(self.render_buf);
         if (self.field_buf.len > 0) self.allocator.free(self.field_buf);
         if (self.mapped) {
             std.posix.munmap(@alignCast(@constCast(self.data)));
@@ -117,11 +123,8 @@ pub const NdjsonScanner = struct {
     pub fn next(self: *NdjsonScanner) !?Row {
         const line = self.nextLine() orelse return null;
         if (self.current) |*c| c.deinit();
-        self.current = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch return NdjsonError.InvalidJson;
-        const obj = switch (self.current.?.value) {
-            .object => |o| o,
-            else => return NdjsonError.NotAnObject,
-        };
+        self.current = json_parser.parseObject(line, self.allocator) catch return NdjsonError.InvalidJson;
+        const obj = self.current.?;
 
         self.ensureCapacity(self.header.len);
         for (self.header, 0..) |key, i| {
@@ -129,31 +132,17 @@ pub const NdjsonScanner = struct {
                 self.field_buf[i] = "";
                 continue;
             };
-            self.field_buf[i] = try self.render(i, val);
+            self.field_buf[i] = try render(val);
         }
         return Row{ .fields = self.field_buf[0..self.header.len] };
     }
 
-    fn render(self: *NdjsonScanner, i: usize, val: std.json.Value) ![]const u8 {
+    fn render(val: json_parser.JsonValue) ![]const u8 {
         return switch (val) {
             .string => |s| s,
-            .null => "",
-            .bool => |b| if (b) "true" else "false",
-            .integer => |n| blk: {
-                const s = std.fmt.bufPrint(self.render_buf[i], "{d}", .{n}) catch b: {
-                    self.growRenderBuf(i, 32);
-                    break :b std.fmt.bufPrint(self.render_buf[i], "{d}", .{n}) catch unreachable;
-                };
-                break :blk s;
-            },
-            .float => |f| blk: {
-                const s = std.fmt.bufPrint(self.render_buf[i], "{d}", .{f}) catch b: {
-                    self.growRenderBuf(i, 64);
-                    break :b std.fmt.bufPrint(self.render_buf[i], "{d}", .{f}) catch unreachable;
-                };
-                break :blk s;
-            },
-            .number_string => |s| s,
+            .number => |s| s, // already a zero-copy text slice — no formatting needed
+            .null_value => "",
+            .bool_value => |b| if (b) "true" else "false",
             .array, .object => NdjsonError.NestedValueNotSupported,
         };
     }
@@ -161,17 +150,6 @@ pub const NdjsonScanner = struct {
     fn ensureCapacity(self: *NdjsonScanner, n: usize) void {
         if (n <= self.field_buf.len) return;
         self.field_buf = self.allocator.realloc(self.field_buf, n) catch return;
-        const old_len = self.render_buf.len;
-        self.render_buf = self.allocator.realloc(self.render_buf, n) catch return;
-        for (self.render_buf[old_len..]) |*b| b.* = &.{};
-        for (self.render_buf[old_len..]) |*b| {
-            b.* = self.allocator.alloc(u8, 32) catch &.{};
-        }
-    }
-
-    fn growRenderBuf(self: *NdjsonScanner, i: usize, min: usize) void {
-        const grown = self.allocator.realloc(self.render_buf[i], min) catch return;
-        self.render_buf[i] = grown;
     }
 
     fn nextLine(self: *NdjsonScanner) ?[]const u8 {
@@ -262,4 +240,20 @@ test "ndjson: float and negative numbers render correctly" {
     const row = (try s.next()).?;
     try std.testing.expectEqualStrings("19.99", row.get(0).?);
     try std.testing.expectEqualStrings("-5", row.get(1).?);
+}
+
+test "ndjson: escaped strings decode correctly" {
+    const allocator = std.testing.allocator;
+    const path = "test_ndjson_escape.ndjson";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+        \\{"note":"line1\nline2","quote":"she said \"hi\""}
+        \\
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var s = try NdjsonScanner.open(allocator, path);
+    defer s.deinit();
+    const row = (try s.next()).?;
+    try std.testing.expectEqualStrings("line1\nline2", row.get(0).?);
+    try std.testing.expectEqualStrings("she said \"hi\"", row.get(1).?);
 }

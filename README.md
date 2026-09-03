@@ -10,6 +10,8 @@ Scan huge CSV (and later NDJSON) files without loading them into memory.
 
 CSV and NDJSON scanning behind one `Query` API, filter/projection/limit/first/count, count/sum/min/max/avg aggregates in one pass, O(N log K) top-K, a stable C ABI (`include/libscanio.h`), and a Python binding. No Node binding, group-by, or Rust binding yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
 
+**Allocator matters, measured, not assumed**: pass `std.heap.c_allocator` to `Query.open()`, not `GeneralPurposeAllocator` — on a 500K-row NDJSON file this was the difference between 42K and 2.78M rows/sec (66x), independent of the parser used. The C ABI already does this for you; a Zig caller building directly on `Query` needs to choose it explicitly. See `ndjson.zig`'s doc comment and [ROADMAP.md](ROADMAP.md)'s M4 entry for the full story.
+
 ```zig
 // Aggregates and top-K compose with WHERE, same as everything else.
 var q = try scanio.Query.open(allocator, "sales.csv", .{ .where = &.{scanio.Predicate.init(1, .eq, "Austin")} });
