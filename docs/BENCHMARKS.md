@@ -18,23 +18,30 @@ data generated to make a number look good.
 ## Filtered scan: `WHERE cab_type = 'yellow'`
 
 967,553 matching rows — confirmed identical across every tool below before
-any timing ran.
+any timing ran. **Correction**: an earlier version of this table compared
+libscanio *counting* matches (no output produced) against xan/qsv *writing
+every matched row to stdout* — not the same operation, and it made
+libscanio look faster than it actually is at this job. Numbers below are
+the corrected, fair comparison: libscanio via `scan_array()` actually
+collecting every matched row (both projected columns) into Python objects,
+same as what xan/qsv's output represents.
 
-| tool | time avg | RSS avg | vs libscanio |
-|---|---|---|---|
-| **libscanio** (single-thread, WHERE eq on one column) | **0.434s** | **2.21MB** | 1x |
-| xan `search -s cab_type -e yellow` | 0.874s | 12.98MB | 2.0x slower, 5.9x more RSS |
-| qsv `search --select cab_type ^yellow$` | 1.260s | 21.72MB | 2.9x slower, 9.8x more RSS |
-| DuckDB, default (multi-thread, ~3-4 cores) | 0.774s | 203.77MB | 1.8x slower *despite* threads, 92x more RSS |
-| DuckDB, `--threads=1` | 2.459s | 92.80MB | 5.7x slower, 42x more RSS |
-| `grep -c ",yellow,"` (substring, not column-aware) | 3.069s | 1.49MB | 7.1x slower, RSS comparable |
+| tool | time avg | RSS avg |
+|---|---|---|
+| libscanio `scan_array()` (collects every match) | 0.687s | ~24MB |
+| xan `search -s cab_type -e yellow` (→ /dev/null) | 0.89s | 12.98MB |
+| qsv `search --select cab_type ^yellow$` | 1.260s | 21.72MB |
+| DuckDB, default (multi-thread, ~3-4 cores) | 0.774s | 203.77MB |
+| DuckDB, `--threads=1` | 2.459s | 92.80MB |
+| `grep -c ",yellow,"` (substring, count only — genuinely not comparable to the row-materializing tools above) | 3.069s | 1.49MB |
+
+At this selectivity (97% of the file matches), libscanio wins — but see
+the **selectivity crossover** section below: this result flips at low
+selectivity, and that's the more important finding, not this one number.
 
 xan and qsv are the fairest comparison — same weight class as libscanio
 (narrow-purpose CSV tools, no SQL layer, no optimizer), real and actively
-used, not strawmen. libscanio still wins outright on both axes. One
-asterisk: xan/qsv write full matched rows to stdout, libscanio's bench only
-counts — a real difference in work done, though not enough on its own to
-explain a 2-3x gap.
+used, not strawmen.
 
 DuckDB is a different weight class entirely (full SQL engine, optimizer,
 joins, spilling, dozens of formats) — losing to it on wall-clock even while
@@ -43,9 +50,47 @@ as a general claim, it's confirmation that a purpose-built scanner doesn't
 need to pay for machinery a single filtered scan never uses.
 
 `grep`'s comparison isn't fully apples-to-apples either: it's a substring
-match against the raw line, libscanio's WHERE is an exact match against one
-pre-split column — real structural leverage, not a trick, but also exactly
-why it wins.
+match against the raw line and only counts (doesn't materialize rows),
+libscanio's WHERE is an exact match against one pre-split column.
+
+## Selectivity crossover: libscanio vs xan
+
+The single most useful thing this session's benchmarking found: libscanio
+and xan trade wins depending on how selective the query is, and the
+crossover is consistent across file size and column position (verified —
+filtering on an early column, column 5 of 51, and a late column, column 47
+of 51, at matched selectivity gave the same result within noise, so this
+isn't a "which column" artifact).
+
+| selectivity | file | libscanio `scan_array()` | xan | winner |
+|---|---|---|---|---|
+| low (26 / 1,000,000) | 417MB | 0.45-0.48s | 0.29-0.33s | xan, ~1.5x |
+| low (13,711 / 20,000,000) | 8.5GB | 9.76s | 7.26s | xan, ~1.35x |
+| high (967,553 / 1,000,000) | 417MB | 0.687s | 0.89s | libscanio, ~1.3x |
+
+As match count grows, xan's time roughly triples (0.3s -> 0.89s) while
+libscanio's barely moves (0.45s -> 0.69s). That split points at two
+different costs:
+
+- **Per-row scan cost** (dominant at low selectivity — almost every row
+  gets checked and discarded): xan is consistently faster here, at any
+  file size or column position tested. libscanio's `splitInto()` (the
+  per-row field-delimiter scan, `src/root.zig`) is a scalar byte-by-byte
+  loop — a SIMD version was tried and measured *slower* for the short
+  fields this schema has, so it was reverted (see the M9 roadmap entry).
+  xan's Rust CSV parsing is doing something faster at this stage, most
+  likely genuine SIMD delimiter-finding paying off where libscanio's
+  attempt didn't. This is real, unresolved, and the next thing to dig
+  into (see ROADMAP.md).
+- **Per-match collection cost** (dominant at high selectivity): libscanio
+  wins here — `scan_array()`'s bulk NUL-separated buffer append is cheap
+  per matched row; xan's per-row cost while writing appears higher, likely
+  CSV-output formatting/quoting on its write path rather than its scan
+  path.
+
+Practical read: for a highly selective filter (the common real case — find
+a needle in a haystack), xan currently wins. For an unselective one (keep
+most of the file), libscanio wins. Neither tool wins everywhere.
 
 ## Full scan (every row, every column)
 
@@ -95,9 +140,35 @@ csvql, same NYC taxi schema): 8.5GB, 20,000,000 rows.
 | trips.csv | 8.5GB | ~2.16-2.21MB (3 runs) |
 
 20x the file size, same peak RSS. Throughput held steady too (~2.1M
-rows/sec) — this file has a narrower/different column set than the 51-col
-sample, so its rows/sec isn't directly comparable to the filtered-scan
-numbers above, but the flat RSS is the actual point being checked here.
+rows/sec, raw unfiltered scan) — this file has a narrower/different column
+set than the 51-col sample, so its raw rows/sec isn't directly comparable
+to the filtered-scan numbers elsewhere in this doc, but the flat RSS is
+the actual point being checked here.
+
+## Full comparison at 8.5GB scale
+
+Same schema as sample.csv, `trips.csv`, `WHERE payment_type = 'DIS'`,
+13,711 matching rows out of 20,000,000 — confirmed identical across every
+tool below.
+
+| tool | time | peak RSS |
+|---|---|---|
+| naive Python (`csv.reader`, projected) | 103.983s | 15.6MB |
+| xan `search -s payment_type -e DIS` | 7.26s | 12.8MB |
+| **libscanio `scan_array()`** | 9.761s | 20.1MB |
+| qsv `search --select payment_type ^DIS$` | 13.08s | 21.5MB |
+| DuckDB, `--threads=1` | 40.43s | 86.1MB |
+| DuckDB, default (multi-thread, ~8 cores) | 5.23s | 357.9MB |
+
+Consistent with the selectivity crossover above (this is a low-selectivity
+query, 0.07% of rows match) — xan wins here, same ~1.35x margin as the
+417MB low-selectivity case. libscanio still beats naive Python by ~10.6x
+and single-thread DuckDB by ~4.1x, and stays within 1.9x of DuckDB's
+8-core result using one core and 17.8x less memory. Naive Python's lower
+RSS here isn't a libscanio weakness — this is a selective query, so
+neither approach ever holds the file in memory; the "bounded regardless
+of file size" property is about the internal scan loop, proven separately
+above, not about beating an already-small Python footprint.
 
 ## Memory: chunked reads vs mmap/full-load
 
