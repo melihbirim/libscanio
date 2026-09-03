@@ -136,7 +136,7 @@ export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
         .predicates = predicates,
     };
 
-    const header = ctx.query.scanner.header;
+    const header = ctx.query.header();
     ctx.header_cstrs = c_allocator.alloc([:0]u8, header.len) catch {
         setError("out of memory allocating header", .{});
         ctx.query.deinit();

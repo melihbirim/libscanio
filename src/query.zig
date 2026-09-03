@@ -1,25 +1,29 @@
-//! libscanio M2: filter, projection, limit, first, count — composed on top
-//! of M1's Scanner rather than added to it, so the tested scan primitive
-//! stays untouched.
+//! libscanio M2 + M4: filter, projection, limit, first, count — composed
+//! on top of either Scanner (CSV) or NdjsonScanner, so callers see nearly
+//! the same shape regardless of format. Neither underlying scanner is
+//! touched by this file; format-specific logic stays in root.zig/ndjson.zig.
 //!
 //! The guiding rule here is work not done, not work done faster:
-//! - limit/first stop pulling from the Scanner the instant enough rows
+//! - limit/first stop pulling from the source the instant enough rows
 //!   are found — no over-read, no discarding extra rows after the fact.
 //! - count() with no WHERE clause never splits a single row into fields;
-//!   it counts newlines directly on the mapped bytes. Counting rows and
-//!   parsing rows are different amounts of work, and this is the one case
-//!   where nothing about the row's contents needs to be known at all.
+//!   it counts newlines directly on the mapped bytes. This is true for
+//!   both formats — CSV and NDJSON are both one-record-per-line, so
+//!   counting records is exactly counting newlines either way.
 //! - projection narrows the field slice handed back per row; it does not
-//!   avoid splitting (the raw scan already has to find every delimiter to
-//!   find the *requested* columns' boundaries), but it does avoid copying
-//!   or allocating anything beyond that existing split.
+//!   avoid splitting/parsing (the raw scan already has to find every
+//!   field to find the *requested* columns), but it does avoid copying
+//!   or allocating anything beyond that existing work.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const scan = @import("root.zig");
 const Scanner = scan.Scanner;
+const NdjsonScanner = scan.NdjsonScanner;
 const Row = scan.Row;
 
 pub const Op = enum { eq, neq, gt, gte, lt, lte };
+
+pub const Format = enum { csv, ndjson };
 
 pub const Predicate = struct {
     column: usize,
@@ -39,30 +43,96 @@ pub const QueryOptions = struct {
     /// Implicitly AND-ed together. Empty = no filter.
     where: []const Predicate = &.{},
     limit: ?usize = null,
+    /// Null = infer from the path's extension (.ndjson/.jsonl -> ndjson,
+    /// anything else -> csv).
+    format: ?Format = null,
+};
+
+fn inferFormat(path: []const u8) Format {
+    if (std.mem.endsWith(u8, path, ".ndjson") or std.mem.endsWith(u8, path, ".jsonl")) return .ndjson;
+    return .csv;
+}
+
+const Source = union(Format) {
+    csv: Scanner,
+    ndjson: NdjsonScanner,
+
+    fn deinit(self: *Source) void {
+        switch (self.*) {
+            .csv => |*s| s.deinit(),
+            .ndjson => |*s| s.deinit(),
+        }
+    }
+
+    fn next(self: *Source) !?Row {
+        return switch (self.*) {
+            .csv => |*s| s.next(),
+            .ndjson => |*s| s.next(),
+        };
+    }
+
+    fn columnIndex(self: Source, name: []const u8) ?usize {
+        return switch (self) {
+            .csv => |s| s.columnIndex(name),
+            .ndjson => |s| s.columnIndex(name),
+        };
+    }
+
+    fn header(self: Source) [][]const u8 {
+        return switch (self) {
+            .csv => |s| s.header,
+            .ndjson => |s| s.header,
+        };
+    }
+
+    fn allocator(self: Source) Allocator {
+        return switch (self) {
+            .csv => |s| s.allocator,
+            .ndjson => |s| s.allocator,
+        };
+    }
+
+    /// (mapped data, current read position) — both formats are line-
+    /// oriented and expose these identically, which is what lets count()'s
+    /// newline-only fast path work the same way for either.
+    fn dataAndPos(self: *Source) struct { data: []const u8, pos: *usize } {
+        return switch (self.*) {
+            .csv => |*s| .{ .data = s.data, .pos = &s.pos },
+            .ndjson => |*s| .{ .data = s.data, .pos = &s.pos },
+        };
+    }
 };
 
 pub const Query = struct {
-    scanner: Scanner,
+    source: Source,
     columns: ?[]const usize,
     where: []const Predicate,
     limit: ?usize,
     returned: usize = 0,
     /// Reused across next() calls when columns != null, same
-    /// grow-not-reallocate discipline as Scanner's own field_buf.
+    /// grow-not-reallocate discipline as the scanners' own buffers.
     proj_buf: []const []const u8 = &.{},
 
     pub fn open(allocator: Allocator, path: []const u8, options: QueryOptions) !Query {
-        const scanner = try Scanner.open(allocator, path);
-        return .{ .scanner = scanner, .columns = options.columns, .where = options.where, .limit = options.limit };
+        const format = options.format orelse inferFormat(path);
+        const source: Source = switch (format) {
+            .csv => .{ .csv = try Scanner.open(allocator, path) },
+            .ndjson => .{ .ndjson = try NdjsonScanner.open(allocator, path) },
+        };
+        return .{ .source = source, .columns = options.columns, .where = options.where, .limit = options.limit };
     }
 
     pub fn deinit(self: *Query) void {
-        if (self.proj_buf.len > 0) self.scanner.allocator.free(@constCast(self.proj_buf));
-        self.scanner.deinit();
+        if (self.proj_buf.len > 0) self.source.allocator().free(@constCast(self.proj_buf));
+        self.source.deinit();
     }
 
     pub fn columnIndex(self: Query, name: []const u8) ?usize {
-        return self.scanner.columnIndex(name);
+        return self.source.columnIndex(name);
+    }
+
+    pub fn header(self: Query) [][]const u8 {
+        return self.source.header();
     }
 
     /// Next matching, projected row — or null once the limit is reached
@@ -71,7 +141,7 @@ pub const Query = struct {
         if (self.limit) |lim| {
             if (self.returned >= lim) return null;
         }
-        while (try self.scanner.next()) |row| {
+        while (try self.source.next()) |row| {
             if (!matches(row, self.where)) continue;
             self.returned += 1;
             return self.project(row);
@@ -92,19 +162,19 @@ pub const Query = struct {
     /// projected or returned.
     pub fn count(self: *Query) !usize {
         if (self.where.len == 0) {
+            const dp = self.source.dataAndPos();
             var n: usize = 0;
-            var start: usize = self.scanner.pos;
-            for (self.scanner.data[start..]) |c| {
+            const start = dp.pos.*;
+            for (dp.data[start..]) |c| {
                 if (c == '\n') n += 1;
             }
             // A final row with no trailing newline still counts.
-            if (self.scanner.data.len > start and self.scanner.data[self.scanner.data.len - 1] != '\n') n += 1;
-            self.scanner.pos = self.scanner.data.len;
-            _ = &start;
+            if (dp.data.len > start and dp.data[dp.data.len - 1] != '\n') n += 1;
+            dp.pos.* = dp.data.len;
             return n;
         }
         var n: usize = 0;
-        while (try self.scanner.next()) |row| {
+        while (try self.source.next()) |row| {
             if (matches(row, self.where)) n += 1;
         }
         return n;
@@ -113,7 +183,7 @@ pub const Query = struct {
     fn project(self: *Query, row: Row) Row {
         const cols = self.columns orelse return row;
         if (self.proj_buf.len < cols.len) {
-            const grown = self.scanner.allocator.realloc(@constCast(self.proj_buf), cols.len) catch return row;
+            const grown = self.source.allocator().realloc(@constCast(self.proj_buf), cols.len) catch return row;
             self.proj_buf = grown;
         }
         const buf = @constCast(self.proj_buf[0..cols.len]);
@@ -262,4 +332,56 @@ test "count: no trailing newline still counts the last row" {
     defer q.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), try q.count());
+}
+
+test "ndjson: format inferred from .ndjson extension, filter+project+limit work identically to csv" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_ndjson.ndjson";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+        \\{"id":1,"city":"Austin","amount":50}
+        \\{"id":2,"city":"Austin","amount":1500}
+        \\{"id":3,"city":"Denver","amount":2500}
+        \\
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{
+        .columns = &.{ 0, 2 },
+        .where = &.{Predicate.init(2, .gt, "1000")},
+        .limit = 1,
+    });
+    defer q.deinit();
+
+    const row = (try q.next()).?;
+    try std.testing.expectEqualStrings("2", row.get(0).?);
+    try std.testing.expectEqualStrings("1500", row.get(1).?);
+    try std.testing.expectEqual(@as(?Row, null), try q.next());
+}
+
+test "ndjson: count() fast path works the same as csv" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_ndjson_count.ndjson";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+        \\{"id":1}
+        \\{"id":2}
+        \\{"id":3}
+        \\
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{});
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 3), try q.count());
+}
+
+test "format override: .jsonl content opened with a non-matching extension via explicit format" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_format_override.txt";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "{\"id\":1}\n{\"id\":2}\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{ .format = .ndjson });
+    defer q.deinit();
+    const row = (try q.next()).?;
+    try std.testing.expectEqualStrings("1", row.get(0).?);
 }

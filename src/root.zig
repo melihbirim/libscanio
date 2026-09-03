@@ -16,8 +16,13 @@ pub const QueryOptions = query_mod.QueryOptions;
 pub const Predicate = query_mod.Predicate;
 pub const Op = query_mod.Op;
 
+const ndjson_mod = @import("ndjson.zig");
+pub const NdjsonScanner = ndjson_mod.NdjsonScanner;
+pub const NdjsonError = ndjson_mod.NdjsonError;
+
 test {
     _ = query_mod;
+    _ = ndjson_mod;
 }
 
 pub const Row = struct {
