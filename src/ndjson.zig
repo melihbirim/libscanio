@@ -44,6 +44,7 @@ const Allocator = std.mem.Allocator;
 const scan = @import("root.zig");
 const Row = scan.Row;
 const json_parser = @import("json_parser.zig");
+const json_array = @import("json_array.zig");
 
 pub const NdjsonError = error{
     EmptyFile,
@@ -99,6 +100,23 @@ pub const NdjsonScanner = struct {
         } else {
             data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
             mapped = true;
+        }
+
+        // JSON array ([{...},{...}]) vs NDJSON, sniffed from content, not
+        // extension — a .json file could legitimately be either. Arrays
+        // are converted to NDJSON text once, up front; everything below
+        // this point (header derivation, next(), row_arena) is unaware
+        // the source was ever an array at all. See json_array.zig.
+        if (json_array.detectFormat(data) == .json_array) {
+            const converted = try json_array.jsonArrayToNdjson(data, allocator);
+            if (mapped) {
+                std.posix.munmap(@alignCast(@constCast(data)));
+            } else {
+                allocator.free(@constCast(data));
+            }
+            data = converted;
+            mapped = false;
+            if (data.len == 0) return NdjsonError.EmptyFile;
         }
 
         var scanner = NdjsonScanner{

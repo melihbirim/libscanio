@@ -49,7 +49,10 @@ pub const QueryOptions = struct {
 };
 
 fn inferFormat(path: []const u8) Format {
-    if (std.mem.endsWith(u8, path, ".ndjson") or std.mem.endsWith(u8, path, ".jsonl")) return .ndjson;
+    // .json routes here too, not just .ndjson/.jsonl: NdjsonScanner
+    // sniffs array-vs-line-delimited from content, since a .json file
+    // could legitimately be either.
+    if (std.mem.endsWith(u8, path, ".ndjson") or std.mem.endsWith(u8, path, ".jsonl") or std.mem.endsWith(u8, path, ".json")) return .ndjson;
     return .csv;
 }
 
@@ -384,4 +387,41 @@ test "format override: .jsonl content opened with a non-matching extension via e
     defer q.deinit();
     const row = (try q.next()).?;
     try std.testing.expectEqualStrings("1", row.get(0).?);
+}
+
+test "json array: .json file sniffed and read via the same NDJSON pipeline, filter+project+limit work" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_json_array.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+        \\[
+        \\  {"id": 1, "city": "Austin", "amount": 50},
+        \\  {"id": 2, "city": "Austin", "amount": 1500},
+        \\  {"id": 3, "city": "Denver", "amount": 2500}
+        \\]
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{
+        .columns = &.{ 0, 2 },
+        .where = &.{Predicate.init(1, .eq, "Austin")},
+    });
+    defer q.deinit();
+
+    const row1 = (try q.next()).?;
+    try std.testing.expectEqualStrings("1", row1.get(0).?);
+    try std.testing.expectEqualStrings("50", row1.get(1).?);
+    const row2 = (try q.next()).?;
+    try std.testing.expectEqualStrings("2", row2.get(0).?);
+    try std.testing.expectEqual(@as(?Row, null), try q.next());
+}
+
+test "json array: count() fast path still applies (each element becomes one line)" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_json_array_count.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "[{\"id\":1},{\"id\":2},{\"id\":3}]" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{});
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 3), try q.count());
 }

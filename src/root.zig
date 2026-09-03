@@ -26,6 +26,7 @@ pub const NdjsonError = ndjson_mod.NdjsonError;
 // 400x slower than CSV; see ndjson.zig's own doc comment.
 const json_parser_mod = @import("json_parser.zig");
 const json_simd_mod = @import("json_simd.zig");
+const json_array_mod = @import("json_array.zig");
 
 const aggregate_mod = @import("aggregate.zig");
 pub const AggResult = aggregate_mod.AggResult;
@@ -43,6 +44,7 @@ test {
     _ = topk_mod;
     _ = json_parser_mod;
     _ = json_simd_mod;
+    _ = json_array_mod;
 }
 
 pub const Row = struct {

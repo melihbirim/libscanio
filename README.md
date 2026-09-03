@@ -8,7 +8,7 @@ Scan huge CSV (and later NDJSON) files without loading them into memory.
 
 ## Status: M7a (CSV + NDJSON, filter/project/limit/count, aggregates, top-K, C ABI, Python)
 
-CSV and NDJSON scanning behind one `Query` API, filter/projection/limit/first/count, count/sum/min/max/avg aggregates in one pass, O(N log K) top-K, a stable C ABI (`include/libscanio.h`), and a Python binding. No Node binding, group-by, or Rust binding yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
+CSV, NDJSON, and JSON arrays behind one `Query` API (format sniffed from content for `.json`, from extension otherwise), filter/projection/limit/first/count, count/sum/min/max/avg aggregates in one pass, O(N log K) top-K, a stable C ABI (`include/libscanio.h`), and a Python binding. No Node binding, group-by, or Rust binding yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
 
 **Allocator matters, measured, not assumed**: pass `std.heap.c_allocator` to `Query.open()`, not `GeneralPurposeAllocator` — on a 500K-row NDJSON file this was the difference between 42K and 2.78M rows/sec (66x), independent of the parser used. The C ABI already does this for you; a Zig caller building directly on `Query` needs to choose it explicitly. NDJSON now runs 4.7M rows/sec cold (single-process) or a steady ~6.0M rows/sec warm (repeated calls in the same process) after also reusing the per-row fields array instead of reallocating it — see `ndjson.zig`'s doc comment and [ROADMAP.md](ROADMAP.md)'s M4 entry for the full story, including a real segfault the reuse work surfaced and how it was fixed.
 
