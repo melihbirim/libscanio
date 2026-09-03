@@ -1,9 +1,14 @@
 # Benchmarks
 
-All numbers below: 10 runs each, `/usr/bin/time -l` (macOS, wall time + peak
-RSS), min/avg/max reported. Same machine, same file, same query, same
-result count verified across every tool before timing — never trust a
-number the correctness check didn't back up first.
+Machine: Apple M2 Pro, 16GB RAM, macOS. Single-threaded unless noted
+(DuckDB's default run is explicitly multi-threaded; everything else here
+is one core). All numbers below: 10 runs each, `/usr/bin/time -l` (macOS,
+wall time + peak RSS), min/avg/max reported. Same machine, same file, same
+query, same result count verified across every tool before timing — never
+trust a number the correctness check didn't back up first. Numbers here
+are relative, not absolute — a different CPU, disk, or OS page cache state
+will shift the raw seconds; the *ratios* between tools on the same machine
+are the part worth trusting.
 
 Primary fixture: `bench/.taxi-data/sample.csv` from the
 [csvql](https://github.com/melihbirim/csvql) repo — 417MB, 1,000,000 rows,
