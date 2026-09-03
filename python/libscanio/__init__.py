@@ -20,9 +20,9 @@ import ctypes
 import re
 from typing import Iterator, Optional, Sequence, Union
 
-from ._loader import COptions, CPredicate, load
+from ._loader import CAgg, COptions, CPredicate, load
 
-__all__ = ["scan", "ScanError"]
+__all__ = ["scan", "schema", "count", "aggregate", "topk", "profile", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _COND_RE = re.compile(r"^(\w+)\s*(>=|<=|!=|>|<|=)\s*(.+)$")
@@ -131,3 +131,156 @@ def scan(
             yield {names[i]: fields[i].decode() for i in range(n.value)}
     finally:
         lib.scanio_close(ctx)
+
+
+def _open_filtered(lib: ctypes.CDLL, path: str, where: Optional[str]) -> ctypes.c_void_p:
+    """Open with WHERE resolved to predicates — the shared setup schema(),
+    count(), aggregate(), and topk() all need before doing their own
+    thing. Same two-open pattern scan() uses: one throwaway open to
+    resolve column names, one real open with the resolved options."""
+    if not where:
+        ctx = lib.scanio_open(path.encode(), None)
+        if not ctx:
+            _raise_last_error(lib, f"failed to open {path!r}")
+        return ctx
+
+    probe_ctx = lib.scanio_open(path.encode(), None)
+    if not probe_ctx:
+        _raise_last_error(lib, f"failed to open {path!r}")
+    try:
+        predicates = _parse_where(lib, probe_ctx, where)
+    finally:
+        lib.scanio_close(probe_ctx)
+
+    where_arr = (CPredicate * len(predicates))(*predicates)
+    opts = COptions(columns=None, n_columns=0, where=where_arr, n_where=len(predicates), limit=-1)
+    ctx = lib.scanio_open(path.encode(), ctypes.byref(opts))
+    if not ctx:
+        _raise_last_error(lib, f"failed to open {path!r}")
+    return ctx
+
+
+def schema(path: str) -> list[str]:
+    """Column names, in header order. Doesn't scan any rows."""
+    lib = load()
+    ctx = lib.scanio_open(path.encode(), None)
+    if not ctx:
+        _raise_last_error(lib, f"failed to open {path!r}")
+    try:
+        return [lib.scanio_column_name(ctx, i).decode() for i in range(lib.scanio_n_columns(ctx))]
+    finally:
+        lib.scanio_close(ctx)
+
+
+def count(path: str, where: Optional[str] = None) -> int:
+    """Row count. With no `where`, never parses a single field."""
+    lib = load()
+    ctx = _open_filtered(lib, path, where)
+    try:
+        n = lib.scanio_count(ctx)
+        if n < 0:
+            _raise_last_error(lib, "count failed")
+        return n
+    finally:
+        lib.scanio_close(ctx)
+
+
+def aggregate(path: str, column: str, where: Optional[str] = None) -> dict[str, Optional[float]]:
+    """count/sum/min/max/avg over `column`, in one pass. Non-numeric or
+    missing values are skipped, not errors. min/max/avg are None if no
+    numeric value was ever seen (count == 0)."""
+    lib = load()
+    ctx = _open_filtered(lib, path, where)
+    try:
+        col_idx = _resolve_column(lib, ctx, column)
+        out = CAgg()
+        if lib.scanio_aggregate(ctx, col_idx, ctypes.byref(out)) != 0:
+            _raise_last_error(lib, "aggregate failed")
+        has_values = bool(out.has_values)
+        return {
+            "count": out.count,
+            "sum": out.sum,
+            "min": out.min if has_values else None,
+            "max": out.max if has_values else None,
+            "avg": out.avg if has_values else None,
+        }
+    finally:
+        lib.scanio_close(ctx)
+
+
+def topk(
+    path: str,
+    column: str,
+    k: int,
+    where: Optional[str] = None,
+    descending: bool = True,
+) -> list[dict[str, str]]:
+    """Top K rows by `column` (parsed as a number), best-to-worst — one
+    pass, O(N log K), not a full sort. Each returned row is a normal
+    scan()-shaped dict plus a "_key" entry with that row's numeric value
+    for the sorted column."""
+    lib = load()
+    ctx = _open_filtered(lib, path, where)
+    try:
+        col_idx = _resolve_column(lib, ctx, column)
+        names = [lib.scanio_column_name(ctx, i).decode() for i in range(lib.scanio_n_columns(ctx))]
+        tctx = lib.scanio_topk(ctx, col_idx, k, 1 if descending else 0)
+        if not tctx:
+            _raise_last_error(lib, "topk failed")
+        try:
+            results = []
+            fields = ctypes.POINTER(ctypes.c_char_p)()
+            n = ctypes.c_size_t()
+            key = ctypes.c_double()
+            while True:
+                rc = lib.scanio_topk_next(tctx, ctypes.byref(fields), ctypes.byref(n), ctypes.byref(key))
+                if rc == 0:
+                    return results
+                if rc < 0:
+                    _raise_last_error(lib, "topk failed")
+                row = {names[i]: fields[i].decode() for i in range(n.value)}
+                row["_key"] = key.value
+                results.append(row)
+        finally:
+            lib.scanio_topk_close(tctx)
+    finally:
+        lib.scanio_close(ctx)
+
+
+def profile(path: str, sample_limit: int = 1) -> dict:
+    """A cheap overview for an agent deciding how to query a file it
+    hasn't seen before: column names, total row count, and best-effort
+    aggregates for columns that look numeric.
+
+    "Looks numeric" is a heuristic, not a schema: it checks whether the
+    first non-empty value in each column (from the first `sample_limit`
+    rows) parses as a float. A column that's numeric in its first rows
+    but has stray text further down still gets aggregated — aggregate()
+    already skips non-numeric values rather than failing on them — but a
+    column that's genuinely mixed from row one won't be flagged here.
+    Each numeric column costs its own full scan (aggregate() is one pass
+    per column, not one pass total) — fine for an occasional profile
+    call, not something to run in a hot loop over a wide file.
+    """
+    cols = schema(path)
+    total_rows = count(path)
+
+    sample_rows = list(scan(path, limit=sample_limit))
+    numeric_cols = []
+    for col in cols:
+        for row in sample_rows:
+            val = row.get(col, "")
+            if val == "":
+                continue
+            try:
+                float(val)
+                numeric_cols.append(col)
+            except ValueError:
+                pass
+            break
+
+    return {
+        "columns": cols,
+        "row_count": total_rows,
+        "numeric_columns": {col: aggregate(path, col) for col in numeric_cols},
+    }

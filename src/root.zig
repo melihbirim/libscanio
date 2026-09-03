@@ -65,6 +65,7 @@ pub const aggregate = aggregate_mod.aggregate;
 const topk_mod = @import("topk.zig");
 pub const TopK = topk_mod.TopK;
 pub const OwnedRow = topk_mod.OwnedRow;
+pub const Entry = topk_mod.Entry;
 pub const topK = topk_mod.topK;
 
 test {

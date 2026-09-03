@@ -1,0 +1,6 @@
+[project]
+name = "libscanio-mcp"
+version = "0.1.0"
+description = "MCP server exposing libscanio's scan/schema/profile/count/aggregate/topk as agent-callable tools"
+requires-python = ">=3.10"
+dependencies = ["mcp>=2.0"]

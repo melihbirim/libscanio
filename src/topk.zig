@@ -46,7 +46,7 @@ fn copyRow(allocator: Allocator, row: Row) !OwnedRow {
     return .{ .fields = fields, .allocator = allocator };
 }
 
-const Entry = struct { key: f64, row: OwnedRow };
+pub const Entry = struct { key: f64, row: OwnedRow };
 
 pub const TopK = struct {
     allocator: Allocator,

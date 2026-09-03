@@ -56,6 +56,38 @@ int scanio_next(scanio_t *scanner, const char ***out_fields, size_t *out_n);
  * with, this is a fast path that never parses a single field. */
 long long scanio_count(scanio_t *scanner);
 
+typedef struct {
+    unsigned long long count;
+    double sum;
+    double min;
+    double max;
+    double avg;
+    /* 0 if no numeric values were seen (count == 0) — min/max/avg above
+     * are meaningless in that case, check this first. */
+    int has_values;
+} scanio_agg_t;
+
+/* Aggregates count/sum/min/max/avg over `column` for the REST of this
+ * scanner's rows — same "drains the scanner" semantics as scanio_count().
+ * Composes with whatever WHERE/columns/limit the scanner was opened with.
+ * Returns 0 on success (out filled in), -1 on error. */
+int scanio_aggregate(scanio_t *scanner, size_t column, scanio_agg_t *out);
+
+typedef struct scanio_topk_result scanio_topk_t;
+
+/* Runs top-K over the REST of this scanner's rows (drains it, same as
+ * scanio_aggregate()/scanio_count()) and returns a handle to walk the K
+ * results via scanio_topk_next(). `descending` is a boolean (0 or 1).
+ * Returns NULL on error — call scanio_last_error(). */
+scanio_topk_t *scanio_topk(scanio_t *scanner, size_t column, size_t k, int descending);
+
+/* Walks the sorted top-K results, best-to-worst, one at a time — same
+ * call shape as scanio_next(). out_key receives that row's sort key (the
+ * numeric value of the column top-K was run on). */
+int scanio_topk_next(scanio_topk_t *tk, const char ***out_fields, size_t *out_n, double *out_key);
+
+void scanio_topk_close(scanio_topk_t *tk);
+
 void scanio_close(scanio_t *scanner);
 
 /* Human-readable reason for the most recent NULL/-1 return on this

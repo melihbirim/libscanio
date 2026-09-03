@@ -1,0 +1,90 @@
+"""
+libscanio MCP server — exposes scan/schema/profile/count/aggregate/topk
+as agent-callable tools over CSV files, without ever loading a file into
+memory (see ../docs/DESIGN.md).
+
+This file is deliberately thin: every tool is a direct pass-through to
+the libscanio Python binding (../python/libscanio). No filtering,
+formatting, or AI-specific logic lives here or in libscanio itself — per
+ROADMAP.md's M8 entry, that's the whole point of keeping this a separate
+consumer package instead of baking MCP support into the library.
+
+Run:
+    python3 -m venv .venv && .venv/bin/pip install -e .
+    .venv/bin/python server.py
+"""
+
+import sys
+from pathlib import Path
+from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "python"))
+
+import libscanio
+from mcp.server.mcpserver import MCPServer
+
+server = MCPServer("libscanio")
+
+
+@server.tool()
+def scan(
+    path: str,
+    columns: Optional[list[str]] = None,
+    where: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[dict[str, str]]:
+    """Scan a CSV file and return matching rows. Streams under the hood —
+    memory stays bounded regardless of file size — but this tool
+    materializes the result list to return it over MCP, so pass `limit`
+    for a large file rather than pulling every row into one response.
+
+    where: e.g. "revenue > 1000" or "city = Austin AND revenue > 1000".
+    Operators: = != > >= < <=. Only AND is supported.
+    """
+    return list(libscanio.scan(path, columns=columns, where=where, limit=limit))
+
+
+@server.tool()
+def schema(path: str) -> list[str]:
+    """Column names, in header order. Doesn't scan any rows — cheap to
+    call before deciding what to filter or aggregate on."""
+    return libscanio.schema(path)
+
+
+@server.tool()
+def count(path: str, where: Optional[str] = None) -> int:
+    """Row count, optionally filtered. With no `where`, never parses a
+    single field — fast regardless of file size."""
+    return libscanio.count(path, where=where)
+
+
+@server.tool()
+def aggregate(path: str, column: str, where: Optional[str] = None) -> dict:
+    """count/sum/min/max/avg over a numeric column, in one pass."""
+    return libscanio.aggregate(path, column, where=where)
+
+
+@server.tool()
+def topk(
+    path: str,
+    column: str,
+    k: int,
+    where: Optional[str] = None,
+    descending: bool = True,
+) -> list[dict]:
+    """Top K rows by a numeric column, best-to-worst — one pass, not a
+    full sort. Each row includes a "_key" entry with its sort value."""
+    return libscanio.topk(path, column, k, where=where, descending=descending)
+
+
+@server.tool()
+def profile(path: str) -> dict:
+    """Cheap first look at a file an agent hasn't seen before: columns,
+    row count, and best-effort aggregates for columns that look numeric.
+    Costs one full scan per numeric column found — fine as a one-off,
+    not something to call repeatedly on a wide file."""
+    return libscanio.profile(path)
+
+
+if __name__ == "__main__":
+    server.run()

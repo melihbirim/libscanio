@@ -79,6 +79,17 @@ class COptions(ctypes.Structure):
     ]
 
 
+class CAgg(ctypes.Structure):
+    _fields_ = [
+        ("count", ctypes.c_uint64),
+        ("sum", ctypes.c_double),
+        ("min", ctypes.c_double),
+        ("max", ctypes.c_double),
+        ("avg", ctypes.c_double),
+        ("has_values", ctypes.c_int),
+    ]
+
+
 def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(COptions)]
     lib.scanio_open.restype = ctypes.c_void_p
@@ -101,6 +112,23 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
 
     lib.scanio_count.argtypes = [ctypes.c_void_p]
     lib.scanio_count.restype = ctypes.c_int64
+
+    lib.scanio_aggregate.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(CAgg)]
+    lib.scanio_aggregate.restype = ctypes.c_int
+
+    lib.scanio_topk.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
+    lib.scanio_topk.restype = ctypes.c_void_p
+
+    lib.scanio_topk_next.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.scanio_topk_next.restype = ctypes.c_int
+
+    lib.scanio_topk_close.argtypes = [ctypes.c_void_p]
+    lib.scanio_topk_close.restype = None
 
     lib.scanio_close.argtypes = [ctypes.c_void_p]
     lib.scanio_close.restype = None

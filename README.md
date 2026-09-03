@@ -8,7 +8,7 @@ CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project, limit, 
 
 ## Status
 
-CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, a C ABI, a Python binding. No Node binding, group-by, or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
+CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, a C ABI, a Python binding, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No Node binding, group-by, or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
 
 ## Quickstart
 

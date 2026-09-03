@@ -16,6 +16,7 @@ const scan = @import("scanio");
 const Query = scan.Query;
 const Predicate = scan.Predicate;
 const Op = scan.Op;
+const TopK = scan.TopK;
 
 const c_allocator = std.heap.c_allocator;
 
@@ -216,6 +217,137 @@ export fn scanio_count(ctx: ?*Ctx) i64 {
     return @intCast(n);
 }
 
+const AggC = extern struct {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    avg: f64,
+    /// count == 0 means min/max/avg above are meaningless (no numeric
+    /// values seen) — ctypes has no natural "optional f64", so this is
+    /// the caller's signal to check before trusting them, same shape as
+    /// AggResult.avg()'s ?f64 in the Zig API.
+    has_values: c_int,
+};
+
+/// Aggregate count/sum/min/max/avg over `column` for the REST of the rows
+/// this ctx has left to yield — same "drains the query" semantics as
+/// scanio_count(). Composes with whatever WHERE/columns/limit the ctx was
+/// opened with, same as the Zig aggregate() function it wraps.
+export fn scanio_aggregate(ctx: ?*Ctx, column: usize, out: ?*AggC) c_int {
+    clearError();
+    const c = ctx orelse {
+        setError("scanner is null", .{});
+        return -1;
+    };
+    const o = out orelse {
+        setError("output pointer is null", .{});
+        return -1;
+    };
+    const r = scan.aggregate(&c.query, column) catch |e| {
+        setError("aggregate failed: {s}", .{@errorName(e)});
+        return -1;
+    };
+    o.* = .{
+        .count = r.count,
+        .sum = r.sum,
+        .min = r.min orelse 0,
+        .max = r.max orelse 0,
+        .avg = r.avg() orelse 0,
+        .has_values = if (r.count > 0) 1 else 0,
+    };
+    return 0;
+}
+
+/// Owns a completed top-K result plus the reusable NUL-terminated-copy
+/// buffers scanio_topk_next() hands back, same shape as Ctx's field_cstrs.
+const TopkCtx = struct {
+    topk: TopK,
+    sorted: []scan.Entry = &.{},
+    index: usize = 0,
+    field_cstrs: [][]u8 = &.{},
+    field_ptrs: [][*:0]const u8 = &.{},
+
+    fn ensureFieldCapacity(self: *TopkCtx, n: usize) void {
+        if (n <= self.field_cstrs.len) return;
+        const old_len = self.field_cstrs.len;
+        const grown_cstrs = c_allocator.realloc(self.field_cstrs, n) catch return;
+        self.field_cstrs = grown_cstrs;
+        for (self.field_cstrs[old_len..]) |*slot| slot.* = &.{};
+        const grown_ptrs = c_allocator.realloc(self.field_ptrs, n) catch return;
+        self.field_ptrs = grown_ptrs;
+    }
+};
+
+/// Runs top-K over the REST of ctx's rows (same drains-the-query
+/// semantics as scanio_count()/scanio_aggregate()) and returns a handle
+/// to walk the K results via scanio_topk_next(). ctx itself is left
+/// exhausted but still valid to scanio_close() normally afterward.
+export fn scanio_topk(ctx: ?*Ctx, column: usize, k: usize, descending: c_int) ?*TopkCtx {
+    clearError();
+    const c = ctx orelse {
+        setError("scanner is null", .{});
+        return null;
+    };
+    var heap = scan.topK(c_allocator, &c.query, column, k, descending != 0) catch |e| {
+        setError("topk failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    const tctx = c_allocator.create(TopkCtx) catch {
+        heap.deinit();
+        setError("out of memory allocating topk context", .{});
+        return null;
+    };
+    tctx.* = .{ .topk = heap };
+    tctx.sorted = tctx.topk.getSorted();
+    return tctx;
+}
+
+/// Walks the sorted top-K results, best-to-worst, one at a time — same
+/// call shape as scanio_next(): 1 = row filled in, 0 = exhausted, -1 =
+/// error. out_key receives that row's sort key (the numeric value of the
+/// column top-K was run on).
+export fn scanio_topk_next(tctx: ?*TopkCtx, out_fields: ?*[*]const [*:0]const u8, out_n: ?*usize, out_key: ?*f64) c_int {
+    clearError();
+    const t = tctx orelse {
+        setError("topk context is null", .{});
+        return -1;
+    };
+    if (t.index >= t.sorted.len) return 0;
+    const entry = t.sorted[t.index];
+    t.index += 1;
+
+    t.ensureFieldCapacity(entry.row.fields.len);
+    for (entry.row.fields, 0..) |field, i| {
+        if (t.field_cstrs[i].len < field.len + 1) {
+            const grown = c_allocator.realloc(t.field_cstrs[i], field.len + 1) catch {
+                setError("out of memory copying row", .{});
+                return -1;
+            };
+            t.field_cstrs[i] = grown;
+        }
+        @memcpy(t.field_cstrs[i][0..field.len], field);
+        t.field_cstrs[i][field.len] = 0;
+        t.field_ptrs[i] = @ptrCast(t.field_cstrs[i].ptr);
+    }
+
+    if (out_fields) |of| of.* = t.field_ptrs.ptr;
+    if (out_n) |on| on.* = entry.row.fields.len;
+    if (out_key) |ok| ok.* = entry.key;
+    return 1;
+}
+
+export fn scanio_topk_close(tctx: ?*TopkCtx) void {
+    const t = tctx orelse return;
+    t.topk.deinit();
+    for (t.field_cstrs) |buf| {
+        if (buf.len > 0) c_allocator.free(buf);
+    }
+    if (t.field_cstrs.len > 0) c_allocator.free(t.field_cstrs);
+    if (t.field_ptrs.len > 0) c_allocator.free(t.field_ptrs);
+    c_allocator.destroy(t);
+}
+
 export fn scanio_close(ctx: ?*Ctx) void {
     const c = ctx orelse return;
     c.query.deinit();
@@ -319,4 +451,86 @@ test "C ABI: scanio_n_columns and scanio_column_name" {
     try std.testing.expectEqualStrings("name", std.mem.span(scanio_column_name(ctx, 1).?));
     try std.testing.expectEqualStrings("amount", std.mem.span(scanio_column_name(ctx, 2).?));
     try std.testing.expect(scanio_column_name(ctx, 3) == null);
+}
+
+test "C ABI: scanio_aggregate over a numeric column" {
+    const path = "test_c_api_aggregate.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,50\n2,1500\n3,900\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const ctx = scanio_open(path, null);
+    defer scanio_close(ctx);
+
+    var out: AggC = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), scanio_aggregate(ctx, 1, &out));
+    try std.testing.expectEqual(@as(u64, 3), out.count);
+    try std.testing.expectEqual(@as(f64, 2450), out.sum);
+    try std.testing.expectEqual(@as(f64, 50), out.min);
+    try std.testing.expectEqual(@as(f64, 1500), out.max);
+    try std.testing.expectApproxEqAbs(@as(f64, 2450.0 / 3.0), out.avg, 0.0001);
+    try std.testing.expectEqual(@as(c_int, 1), out.has_values);
+}
+
+test "C ABI: scanio_aggregate on an empty result sets has_values = 0" {
+    const path = "test_c_api_aggregate_empty.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,notanumber\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const ctx = scanio_open(path, null);
+    defer scanio_close(ctx);
+
+    var out: AggC = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), scanio_aggregate(ctx, 1, &out));
+    try std.testing.expectEqual(@as(c_int, 0), out.has_values);
+}
+
+test "C ABI: scanio_topk walks results best-to-worst" {
+    const path = "test_c_api_topk.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,50\n2,1500\n3,900\n4,3000\n5,200\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const ctx = scanio_open(path, null);
+    defer scanio_close(ctx);
+
+    const tctx = scanio_topk(ctx, 1, 3, 1); // descending
+    try std.testing.expect(tctx != null);
+    defer scanio_topk_close(tctx);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    var key: f64 = 0;
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_topk_next(tctx, &fields, &n, &key));
+    try std.testing.expectEqualStrings("4", std.mem.span(fields[0]));
+    try std.testing.expectEqual(@as(f64, 3000), key);
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_topk_next(tctx, &fields, &n, &key));
+    try std.testing.expectEqualStrings("2", std.mem.span(fields[0]));
+    try std.testing.expectEqual(@as(f64, 1500), key);
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_topk_next(tctx, &fields, &n, &key));
+    try std.testing.expectEqualStrings("3", std.mem.span(fields[0]));
+
+    try std.testing.expectEqual(@as(c_int, 0), scanio_topk_next(tctx, &fields, &n, &key));
+}
+
+test "C ABI: scanio_topk composes with a WHERE-filtered ctx" {
+    const path = "test_c_api_topk_filtered.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city,amount\n1,Austin,50\n2,Denver,3000\n3,Austin,1500\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]CPredicate{.{ .column = 1, .op = 0, .value = "Austin" }};
+    const opts = COptions{ .columns = null, .n_columns = 0, .where = &preds, .n_where = 1, .limit = -1 };
+    const ctx = scanio_open(path, &opts);
+    defer scanio_close(ctx);
+
+    const tctx = scanio_topk(ctx, 2, 1, 1);
+    defer scanio_topk_close(tctx);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    var key: f64 = 0;
+    try std.testing.expectEqual(@as(c_int, 1), scanio_topk_next(tctx, &fields, &n, &key));
+    try std.testing.expectEqualStrings("3", std.mem.span(fields[0]));
+    try std.testing.expectEqual(@as(c_int, 0), scanio_topk_next(tctx, &fields, &n, &key));
 }
