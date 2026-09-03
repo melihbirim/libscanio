@@ -1,0 +1,17 @@
+{
+  "name": "libscanio",
+  "version": "0.1.0",
+  "description": "Scan huge CSV/NDJSON/JSON files without loading them into memory",
+  "main": "lib/index.js",
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "keywords": ["csv", "ndjson", "scan", "streaming"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "koffi": "^3.2.0"
+  }
+}

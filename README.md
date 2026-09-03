@@ -8,7 +8,7 @@ CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project, limit, 
 
 ## Status
 
-CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, a C ABI, a Python binding, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No Node binding, group-by, or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
+CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, a C ABI, Python and [Node](node/) bindings, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No group-by or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
 
 ## Quickstart
 
@@ -30,6 +30,20 @@ for row in libscanio.scan(
 # query above as list(scan(...)) took 4.8s; scan_array() takes ~0.6s.
 # Not memory-bounded like scan() — it materializes everything at once.
 rows = libscanio.scan_array("sample.csv", columns=["trip_id", "cab_type"], where="cab_type = yellow")
+```
+
+```js
+const libscanio = require('libscanio');
+
+for await (const row of libscanio.scan("sample.csv", {
+    columns: ["trip_id", "cab_type"],
+    where: "cab_type = yellow",
+})) {
+    console.log(row); // { trip_id: '649084905', cab_type: 'yellow' }
+}
+
+// scanArray() is the same bulk-materialize tradeoff as Python's scan_array().
+const rows = libscanio.scanArray("sample.csv", { columns: ["trip_id", "cab_type"], where: "cab_type = yellow" });
 ```
 
 ```zig
@@ -66,6 +80,7 @@ zig build test                           # run the test suite
 zig build c-lib -Doptimize=ReleaseFast   # -> zig-out/lib/libscanio.{dylib,so,dll}
 zig build smoke-test                     # dlopen()s the built library via Python ctypes — the real path
 zig build python-test                    # Python binding suite against the real built library
+zig build node-test                      # Node binding suite (needs `npm install` in node/ first)
 ```
 
 ## Non-goals

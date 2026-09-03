@@ -193,4 +193,9 @@ pub fn build(b: *std.Build) void {
     python_test.step.dependOn(c_lib_step);
     const python_test_step = b.step("python-test", "Run the Python binding test suite (needs python3)");
     python_test_step.dependOn(&python_test.step);
+
+    const node_test = b.addSystemCommand(&.{ "node", "node/test/test.js" });
+    node_test.step.dependOn(c_lib_step);
+    const node_test_step = b.step("node-test", "Run the Node binding test suite (needs node + `npm install` in node/)");
+    node_test_step.dependOn(&node_test.step);
 }
