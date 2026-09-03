@@ -8,7 +8,7 @@
 
 - [x] **M1 — Scanner**: file source, CSV parser, `next()`, row streaming, constant-memory, Zig API.
 - [x] **M2 — Scan operations**: projection, filter, limit, first, count. `count()` with no WHERE clause takes a zero-field-parse fast path (raw newline counting on the mapped bytes) — measured ~10x faster than a full row scan on a 500K-row file. `limit(N)` returns in time proportional to N, not file size (measured near-instant regardless of file size).
-- [ ] **M3 — C ABI**: `scanio_open` / `scanio_next` / `scanio_close`, minimal and stable. Don't expose Zig internals.
+- [x] **M3 — C ABI**: `scanio_open` / `scanio_next` / `scanio_count` / `scanio_column_index` / `scanio_close` / `scanio_last_error`, minimal, no Zig internals exposed. Allocator is `std.heap.c_allocator`, not `GeneralPurposeAllocator` — this library gets `dlopen()`'d into a host process, and GPA's PageAllocator faults there (the exact bug csvql shipped once, #149). Verified for real: `zig build smoke-test` loads the built `.dylib`/`.so` via Python `ctypes` — the actual `dlopen()` path, not just Zig's in-process test runner — and runs 200 consecutive open/close cycles to catch allocator faults that only surface after repeated use.
 - [ ] **M4 — NDJSON**: same scanner abstraction, second format. `scan("data.csv")` and `scan("data.ndjson")` should look nearly identical to callers.
 - [ ] **M5 — Node + Python bindings**: `npm install libscanio`, `pip install libscanio`. Largest practical distribution reach, so first.
 - [ ] **M6 — Rust**: `cargo add libscanio`, C ABI first, idiomatic wrapper after.

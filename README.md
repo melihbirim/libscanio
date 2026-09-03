@@ -6,9 +6,26 @@ Scan huge CSV (and later NDJSON) files without loading them into memory.
 
 **open → scan → process, regardless of file size.**
 
-## Status: M2 (scan + filter + project + limit)
+## Status: M3 (scan + filter + project + limit + C ABI)
 
-File source, CSV parser, filter, projection, limit, first, count. No aggregates, C ABI, or language bindings yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
+File source, CSV parser, filter, projection, limit, first, count, and a stable C ABI (`include/libscanio.h`). No aggregates or language bindings yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
+
+```c
+#include <libscanio.h>
+
+scanio_t *s = scanio_open("data.csv", NULL);
+const char **fields;
+size_t n;
+while (scanio_next(s, &fields, &n) == 1) {
+    // fields[0..n)
+}
+scanio_close(s);
+```
+
+```bash
+zig build c-lib -Doptimize=ReleaseFast   # -> zig-out/lib/libscanio.{dylib,so,dll}
+zig build smoke-test                     # dlopen()s the built library via Python ctypes — the real path
+```
 
 ```zig
 const scanio = @import("scanio");
