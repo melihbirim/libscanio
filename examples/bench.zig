@@ -67,4 +67,26 @@ pub fn main() !void {
             return if (try q.first() != null) @as(usize, 1) else 0;
         }
     }.run, .{ allocator, path });
+
+    // 5. aggregate(): sum/count/min/max/avg over every row, one pass.
+    try timeIt("aggregate() (sum/count/min/max/avg, one pass)", struct {
+        fn run(a: std.mem.Allocator, p: []const u8) !usize {
+            var q = try scanio.Query.open(a, p, .{});
+            defer q.deinit();
+            const r = try scanio.aggregate(&q, 2);
+            return r.count;
+        }
+    }.run, .{ allocator, path });
+
+    // 6. topK(10): should cost roughly one scan, not a full sort of the file —
+    //    only the rows that are actual candidates get copied.
+    try timeIt("topK(10) of 500K rows", struct {
+        fn run(a: std.mem.Allocator, p: []const u8) !usize {
+            var q = try scanio.Query.open(a, p, .{});
+            defer q.deinit();
+            var heap = try scanio.topK(a, &q, 2, 10, true);
+            defer heap.deinit();
+            return heap.getSorted().len;
+        }
+    }.run, .{ allocator, path });
 }

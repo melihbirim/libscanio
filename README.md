@@ -6,9 +6,24 @@ Scan huge CSV (and later NDJSON) files without loading them into memory.
 
 **open → scan → process, regardless of file size.**
 
-## Status: M5a (scan + filter + project + limit + C ABI + Python)
+## Status: M7a (CSV + NDJSON, filter/project/limit/count, aggregates, top-K, C ABI, Python)
 
-File source, CSV parser, filter, projection, limit, first, count, a stable C ABI (`include/libscanio.h`), and a Python binding. No aggregates or Node binding yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
+CSV and NDJSON scanning behind one `Query` API, filter/projection/limit/first/count, count/sum/min/max/avg aggregates in one pass, O(N log K) top-K, a stable C ABI (`include/libscanio.h`), and a Python binding. No Node binding, group-by, or Rust binding yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
+
+```zig
+// Aggregates and top-K compose with WHERE, same as everything else.
+var q = try scanio.Query.open(allocator, "sales.csv", .{ .where = &.{scanio.Predicate.init(1, .eq, "Austin")} });
+defer q.deinit();
+const stats = try scanio.aggregate(&q, 2); // sum/count/min/max/avg of column 2
+
+var q2 = try scanio.Query.open(allocator, "sales.csv", .{});
+defer q2.deinit();
+var top10 = try scanio.topK(allocator, &q2, 2, 10, true); // top 10 by column 2, descending
+defer top10.deinit();
+for (top10.getSorted()) |entry| {
+    // entry.row.get(0), entry.key
+}
+```
 
 ```python
 import libscanio

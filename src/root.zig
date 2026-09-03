@@ -20,9 +20,20 @@ const ndjson_mod = @import("ndjson.zig");
 pub const NdjsonScanner = ndjson_mod.NdjsonScanner;
 pub const NdjsonError = ndjson_mod.NdjsonError;
 
+const aggregate_mod = @import("aggregate.zig");
+pub const AggResult = aggregate_mod.AggResult;
+pub const aggregate = aggregate_mod.aggregate;
+
+const topk_mod = @import("topk.zig");
+pub const TopK = topk_mod.TopK;
+pub const OwnedRow = topk_mod.OwnedRow;
+pub const topK = topk_mod.topK;
+
 test {
     _ = query_mod;
     _ = ndjson_mod;
+    _ = aggregate_mod;
+    _ = topk_mod;
 }
 
 pub const Row = struct {
