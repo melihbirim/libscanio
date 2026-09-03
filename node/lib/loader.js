@@ -48,6 +48,27 @@ function candidateDirs() {
   return dirs;
 }
 
+// If a native FFI call itself crashes the process (no JS exception, no
+// stack trace — the failure mode this was added to diagnose), there's
+// nothing JS-level to catch. But logging "about to call X" immediately
+// before each call, synchronously flushed, survives a crash that
+// happens after the log line — it just won't be followed by a matching
+// "returned" line. That's enough to pinpoint which specific FFI call
+// is the one that dies, without needing another guess-and-push cycle.
+function wrapWithDebugLogging(fns) {
+  const wrapped = {};
+  for (const name of Object.keys(fns)) {
+    const fn = fns[name];
+    wrapped[name] = (...args) => {
+      console.error(`[libscanio] -> ${name}`);
+      const result = fn(...args);
+      console.error(`[libscanio] <- ${name} = ${result}`);
+      return result;
+    };
+  }
+  return wrapped;
+}
+
 function load() {
   if (cached) return cached;
 
@@ -60,6 +81,7 @@ function load() {
       }
       cached = build(candidate);
       if (process.env.LIBSCANIO_DEBUG) {
+        cached = { ...cached, fns: wrapWithDebugLogging(cached.fns) };
         console.error('[libscanio] loaded successfully');
       }
       return cached;
