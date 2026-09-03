@@ -435,7 +435,7 @@ fn advanceTokenIndex(tokens: []simd.Token, i: *usize, min_pos: usize) void {
     while (i.* < tokens.len and tokens[i.*].pos < min_pos) i.* += 1;
 }
 
-fn findStringEnd(line: []const u8, start: usize) ?usize {
+pub fn findStringEnd(line: []const u8, start: usize) ?usize {
     var idx = start;
     var escaped = false;
     while (idx < line.len) : (idx += 1) {
@@ -460,7 +460,7 @@ fn findStringEndFromTokens(line: []const u8, tokens: []simd.Token, token_start: 
     return findStringEnd(line, string_start);
 }
 
-fn isEscapedAt(line: []const u8, pos: usize) bool {
+pub fn isEscapedAt(line: []const u8, pos: usize) bool {
     if (pos == 0) return false;
     var backslashes: usize = 0;
     var idx = pos;
@@ -472,7 +472,7 @@ fn isEscapedAt(line: []const u8, pos: usize) bool {
     return backslashes % 2 == 1;
 }
 
-fn hasJsonEscape(raw: []const u8) bool {
+pub fn hasJsonEscape(raw: []const u8) bool {
     return std.mem.indexOfScalar(u8, raw, '\\') != null;
 }
 
