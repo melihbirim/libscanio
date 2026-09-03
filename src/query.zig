@@ -99,24 +99,13 @@ const Source = union(Format) {
         };
     }
 
-    /// Newline-only fast path for count() with no WHERE clause — never
-    /// splits a field. CSV counts through its chunked read buffer;
-    /// NDJSON (still fully mmap'd/loaded, see ndjson.zig) counts directly
-    /// on its mapped bytes. Both are one-record-per-line, so counting
-    /// records is exactly counting newlines either way.
+    /// Fast path for count() with no WHERE clause — never splits/parses a
+    /// field. Both CSV and NDJSON now count through their chunked read
+    /// buffers rather than one large mapped/loaded slice.
     fn countFastPath(self: *Source) !usize {
         return switch (self.*) {
             .csv => |*s| s.countRemaining(),
-            .ndjson => |*s| blk: {
-                var n: usize = 0;
-                const start = s.pos;
-                for (s.data[start..]) |c| {
-                    if (c == '\n') n += 1;
-                }
-                if (s.data.len > start and s.data[s.data.len - 1] != '\n') n += 1;
-                s.pos = s.data.len;
-                break :blk n;
-            },
+            .ndjson => |*s| s.countRemaining(),
         };
     }
 };

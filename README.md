@@ -1,8 +1,10 @@
 # libscanio
 
+Scan and filter structured data without loading it. Your family's RAM-friendly data scanner.
+
 A tiny, fast streaming scan engine for structured data.
 
-Scan huge CSV (and later NDJSON) files without loading them into memory.
+Scan huge CSV, NDJSON, and JSON array files without loading them into memory. Chunked reads, not mmap, across all three formats — peak RSS tracks chunk size (~2MB by default), not file size. See [ROADMAP.md](ROADMAP.md)'s M1 and M4 entries for the measurements.
 
 **open → scan → process, regardless of file size.**
 

@@ -34,12 +34,31 @@
 //! you intend to actually ship with, not whichever one is easiest to
 //! write in a test.
 //!
+//! Third finding: like CSV (see root.zig), this used to mmap/load the
+//! whole file — measured 426MB peak RSS on a 417MB CSV file, since a full
+//! scan touches (and keeps resident) every mapped page. Now reads in
+//! fixed-size chunks instead, same CHUNK_SIZE default as CSV, same
+//! carry-over-across-chunk-boundary approach: a JSON line/object that
+//! doesn't span a chunk boundary is still a zero-copy slice into the
+//! current chunk; only a boundary-spanning one gets assembled into a
+//! reused scratch buffer. This applies to BOTH sub-formats: NDJSON lines
+//! (boundary = '\n', identical logic to CSV's nextLine()) and JSON arrays
+//! (boundary = a balanced top-level '{...}' — no newlines to rely on, so
+//! nextObject() below tracks brace depth and string/escape state across
+//! chunk refills instead). The old json_array.zig::jsonArrayToNdjson()
+//! (convert-the-whole-array-up-front) is no longer used by this file —
+//! array objects are now extracted one at a time, streaming, same as
+//! NDJSON lines. json_array.zig itself is kept only for its
+//! detectFormat() sniff and its own tests; the conversion function is
+//! dead code now (not deleted — matthewtolman/zcsv-adjacent projects may
+//! still reference it, and it's a correct, tested reference
+//! implementation of the non-chunked approach).
+//!
 //! Nested objects/arrays are still out of scope (see the project's own
 //! non-goals) and fail loudly with NestedValueNotSupported rather than
 //! silently stringifying — json_parser.zig can parse them, libscanio
 //! chooses not to expose them as flat row fields.
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const scan = @import("root.zig");
 const Row = scan.Row;
@@ -52,19 +71,27 @@ pub const NdjsonError = error{
     NestedValueNotSupported,
 };
 
+const Mode = enum { line_delimited, json_array };
+
 pub const NdjsonScanner = struct {
     allocator: Allocator,
     file: std.fs.File,
-    data: []const u8,
-    mapped: bool,
-    pos: usize,
+    mode: Mode,
+    buf: []u8,
+    buf_len: usize,
+    buf_pos: usize,
+    eof: bool,
+    /// Carries a line/object tail that didn't fit in one chunk. Cleared
+    /// at the start of every nextLine()/nextObject() call.
+    line_scratch: std.ArrayListUnmanaged(u8),
     header: [][]const u8,
+    /// The first row's raw JSON text, captured at open() time to derive
+    /// the header. Replayed as the first next() call's row instead of
+    /// re-reading it from the file (the chunked reader can't "rewind" a
+    /// stream position the way a full mmap could).
+    first_row_line: []u8,
+    used_first_row: bool = false,
     field_buf: [][]const u8 = &.{},
-    /// Backs each row's decoded-string bytes (escaped-string copies from
-    /// parseObjectReuse). Reset (not deinit'd) at the start of every
-    /// next(), retaining its capacity, matching the previous
-    /// JsonObject.deinit() timing exactly — the previous row's data
-    /// (already handed to the caller via field_buf) stays valid until then.
     row_arena: std.heap.ArenaAllocator,
     /// The JSON fields array for the CURRENT row, reused across next()
     /// calls via clearRetainingCapacity() rather than reallocated —
@@ -88,53 +115,48 @@ pub const NdjsonScanner = struct {
     parse_fields: std.ArrayList(json_parser.JsonObject.Field) = .{},
 
     pub fn open(allocator: Allocator, path: []const u8) !NdjsonScanner {
+        return openWithChunkSize(allocator, path, scan.default_chunk_size);
+    }
+
+    pub fn openWithChunkSize(allocator: Allocator, path: []const u8, chunk_size: usize) !NdjsonScanner {
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
         const size = (try file.stat()).size;
         if (size == 0) return NdjsonError.EmptyFile;
 
-        var data: []const u8 = undefined;
-        var mapped = false;
-        if (builtin.os.tag == .windows) {
-            data = try file.readToEndAlloc(allocator, size);
-        } else {
-            data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
-            mapped = true;
-        }
-
-        // JSON array ([{...},{...}]) vs NDJSON, sniffed from content, not
-        // extension — a .json file could legitimately be either. Arrays
-        // are converted to NDJSON text once, up front; everything below
-        // this point (header derivation, next(), row_arena) is unaware
-        // the source was ever an array at all. See json_array.zig.
-        if (json_array.detectFormat(data) == .json_array) {
-            const converted = try json_array.jsonArrayToNdjson(data, allocator);
-            if (mapped) {
-                std.posix.munmap(@alignCast(@constCast(data)));
-            } else {
-                allocator.free(@constCast(data));
-            }
-            data = converted;
-            mapped = false;
-            if (data.len == 0) return NdjsonError.EmptyFile;
-        }
+        const buf = try allocator.alloc(u8, chunk_size);
+        errdefer allocator.free(buf);
 
         var scanner = NdjsonScanner{
             .allocator = allocator,
             .file = file,
-            .data = data,
-            .mapped = mapped,
-            .pos = 0,
+            .mode = .line_delimited,
+            .buf = buf,
+            .buf_len = 0,
+            .buf_pos = 0,
+            .eof = false,
+            .line_scratch = .{},
             .header = &[_][]const u8{},
+            .first_row_line = &[_]u8{},
             .row_arena = std.heap.ArenaAllocator.init(allocator),
         };
         errdefer scanner.row_arena.deinit();
 
-        // Peek the first row to derive the header, then rewind — the
-        // first data row is re-read normally by the first next() call.
-        const first_line = scanner.nextLine() orelse return NdjsonError.EmptyFile;
-        scanner.pos = 0;
-        var obj = json_parser.parseObject(first_line, allocator) catch return NdjsonError.InvalidJson;
+        // Sniff NDJSON vs JSON array from the first non-whitespace byte —
+        // needs at least one chunk loaded first.
+        try scanner.fillBuffer();
+        var i: usize = 0;
+        while (i < scanner.buf_len) : (i += 1) {
+            const b = scanner.buf[i];
+            if (b == ' ' or b == '\t' or b == '\n' or b == '\r') continue;
+            if (b == '[') scanner.mode = .json_array;
+            break;
+        }
+
+        const first_line = (try (if (scanner.mode == .json_array) scanner.nextObject() else scanner.nextLine())) orelse return NdjsonError.EmptyFile;
+        scanner.first_row_line = try allocator.dupe(u8, first_line);
+
+        var obj = json_parser.parseObject(scanner.first_row_line, allocator) catch return NdjsonError.InvalidJson;
         defer obj.deinit();
         var keys = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, obj.fields.len);
         errdefer keys.deinit(allocator);
@@ -150,12 +172,10 @@ pub const NdjsonScanner = struct {
         self.parse_fields.deinit(self.allocator);
         for (self.header) |k| self.allocator.free(k);
         self.allocator.free(self.header);
+        self.allocator.free(self.first_row_line);
         if (self.field_buf.len > 0) self.allocator.free(self.field_buf);
-        if (self.mapped) {
-            std.posix.munmap(@alignCast(@constCast(self.data)));
-        } else {
-            self.allocator.free(@constCast(self.data));
-        }
+        self.line_scratch.deinit(self.allocator);
+        self.allocator.free(self.buf);
         self.file.close();
     }
 
@@ -167,7 +187,14 @@ pub const NdjsonScanner = struct {
     }
 
     pub fn next(self: *NdjsonScanner) !?Row {
-        const line = self.nextLine() orelse return null;
+        const line = blk: {
+            if (!self.used_first_row) {
+                self.used_first_row = true;
+                break :blk self.first_row_line;
+            }
+            break :blk (if (self.mode == .json_array) (try self.nextObject()) else (try self.nextLine())) orelse return null;
+        };
+
         _ = self.row_arena.reset(.retain_capacity);
         // Arena-backed and local, not a persisted field — see parse_fields'
         // doc comment for why owned_strings can't safely be reused the
@@ -192,6 +219,44 @@ pub const NdjsonScanner = struct {
         return Row{ .fields = self.field_buf[0..self.header.len] };
     }
 
+    /// Newline-only (line_delimited) or object-count-only (json_array)
+    /// fast path for count() with no WHERE clause — never parses a
+    /// field. Same bounded-memory property as next().
+    pub fn countRemaining(self: *NdjsonScanner) !usize {
+        var n: usize = 0;
+        if (!self.used_first_row) {
+            self.used_first_row = true;
+            n += 1;
+        }
+        switch (self.mode) {
+            .line_delimited => {
+                var saw_any_after_last_nl = false;
+                while (true) {
+                    if (self.buf_pos >= self.buf_len) {
+                        if (self.eof) break;
+                        try self.fillBuffer();
+                        if (self.buf_len == 0) break;
+                    }
+                    const chunk = self.buf[self.buf_pos..self.buf_len];
+                    for (chunk) |c| {
+                        if (c == '\n') {
+                            n += 1;
+                            saw_any_after_last_nl = false;
+                        } else {
+                            saw_any_after_last_nl = true;
+                        }
+                    }
+                    self.buf_pos = self.buf_len;
+                }
+                if (saw_any_after_last_nl) n += 1;
+            },
+            .json_array => {
+                while (try self.nextObject()) |_| n += 1;
+            },
+        }
+        return n;
+    }
+
     fn render(val: json_parser.JsonValue) ![]const u8 {
         return switch (val) {
             .string => |s| s,
@@ -207,25 +272,122 @@ pub const NdjsonScanner = struct {
         self.field_buf = self.allocator.realloc(self.field_buf, n) catch return;
     }
 
-    fn nextLine(self: *NdjsonScanner) ?[]const u8 {
-        if (self.pos >= self.data.len) return null;
-        const start = self.pos;
-        const rel = std.mem.indexOfScalar(u8, self.data[start..], '\n');
-        if (rel) |r| {
-            self.pos = start + r + 1;
-            var end = start + r;
-            if (end > start and self.data[end - 1] == '\r') end -= 1;
-            return self.data[start..end];
+    fn fillBuffer(self: *NdjsonScanner) !void {
+        const n = try self.file.read(self.buf);
+        self.buf_len = n;
+        self.buf_pos = 0;
+        if (n == 0) self.eof = true;
+    }
+
+    fn trimCR(line: []const u8) []const u8 {
+        if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+        return line;
+    }
+
+    /// Returns the next line (without its terminator), or null at EOF.
+    /// Identical shape to CSV Scanner's nextLine() — see root.zig.
+    fn nextLine(self: *NdjsonScanner) !?[]const u8 {
+        self.line_scratch.clearRetainingCapacity();
+        while (true) {
+            if (self.buf_pos < self.buf_len) {
+                if (std.mem.indexOfScalar(u8, self.buf[self.buf_pos..self.buf_len], '\n')) |rel| {
+                    const abs_end = self.buf_pos + rel;
+                    const chunk_part = self.buf[self.buf_pos..abs_end];
+                    self.buf_pos = abs_end + 1;
+                    if (self.line_scratch.items.len == 0) {
+                        return trimCR(chunk_part);
+                    }
+                    try self.line_scratch.appendSlice(self.allocator, chunk_part);
+                    return trimCR(self.line_scratch.items);
+                }
+                try self.line_scratch.appendSlice(self.allocator, self.buf[self.buf_pos..self.buf_len]);
+                self.buf_pos = self.buf_len;
+            }
+            if (self.eof) {
+                if (self.line_scratch.items.len > 0) return trimCR(self.line_scratch.items);
+                return null;
+            }
+            try self.fillBuffer();
         }
-        self.pos = self.data.len;
-        return self.data[start..];
+    }
+
+    /// Returns the next top-level '{...}' object's raw text (including
+    /// the braces), skipping surrounding whitespace/'['/','/']', or null
+    /// once ']' (end of array) is reached. Boundary tracking (brace
+    /// depth + in-string/escape state) survives across chunk refills the
+    /// same way nextLine() survives a '\n' search across chunk refills —
+    /// depth/in_string/escape are local to one call, obj_start marks
+    /// where the in-progress object began in the CURRENT chunk, and
+    /// anything not yet matched gets flushed into line_scratch before
+    /// refilling so it isn't lost.
+    fn nextObject(self: *NdjsonScanner) !?[]const u8 {
+        self.line_scratch.clearRetainingCapacity();
+        var started = false;
+        var depth: usize = 0;
+        var in_string = false;
+        var escape = false;
+        var obj_start: usize = self.buf_pos;
+
+        while (true) {
+            while (self.buf_pos < self.buf_len) {
+                const c = self.buf[self.buf_pos];
+                if (!started) {
+                    if (c == '{') {
+                        started = true;
+                        depth = 1;
+                        obj_start = self.buf_pos;
+                        self.buf_pos += 1;
+                        continue;
+                    }
+                    if (c == ']') {
+                        self.buf_pos += 1;
+                        return null;
+                    }
+                    self.buf_pos += 1;
+                    continue;
+                }
+                self.buf_pos += 1;
+                if (in_string) {
+                    if (escape) {
+                        escape = false;
+                    } else if (c == '\\') {
+                        escape = true;
+                    } else if (c == '"') {
+                        in_string = false;
+                    }
+                } else if (c == '"') {
+                    in_string = true;
+                } else if (c == '{') {
+                    depth += 1;
+                } else if (c == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        const chunk_part = self.buf[obj_start..self.buf_pos];
+                        if (self.line_scratch.items.len == 0) {
+                            return chunk_part;
+                        }
+                        try self.line_scratch.appendSlice(self.allocator, chunk_part);
+                        return self.line_scratch.items;
+                    }
+                }
+            }
+            if (started) {
+                try self.line_scratch.appendSlice(self.allocator, self.buf[obj_start..self.buf_len]);
+            }
+            if (self.eof) {
+                if (started) return NdjsonError.InvalidJson; // truncated object
+                return null;
+            }
+            try self.fillBuffer();
+            obj_start = 0;
+        }
     }
 };
 
 test "ndjson: header derived from first row, values read back correctly" {
     const allocator = std.testing.allocator;
     const path = "test_ndjson_basic.ndjson";
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data =
         \\{"id":1,"name":"Alice","active":true}
         \\{"id":2,"name":"Bob","active":false}
         \\
@@ -253,7 +415,7 @@ test "ndjson: header derived from first row, values read back correctly" {
 test "ndjson: missing key reads back as empty string" {
     const allocator = std.testing.allocator;
     const path = "test_ndjson_missing_key.ndjson";
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data =
         \\{"id":1,"note":"hi"}
         \\{"id":2}
         \\
@@ -270,7 +432,7 @@ test "ndjson: missing key reads back as empty string" {
 test "ndjson: nested object value fails loudly, not silently" {
     const allocator = std.testing.allocator;
     const path = "test_ndjson_nested.ndjson";
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data =
         \\{"id":1,"meta":{"a":1}}
         \\
     });
@@ -284,7 +446,7 @@ test "ndjson: nested object value fails loudly, not silently" {
 test "ndjson: float and negative numbers render correctly" {
     const allocator = std.testing.allocator;
     const path = "test_ndjson_numbers.ndjson";
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data =
         \\{"price":19.99,"delta":-5}
         \\
     });
@@ -300,7 +462,7 @@ test "ndjson: float and negative numbers render correctly" {
 test "ndjson: escaped strings decode correctly" {
     const allocator = std.testing.allocator;
     const path = "test_ndjson_escape.ndjson";
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data =
         \\{"note":"line1\nline2","quote":"she said \"hi\""}
         \\
     });
@@ -311,4 +473,64 @@ test "ndjson: escaped strings decode correctly" {
     const row = (try s.next()).?;
     try std.testing.expectEqualStrings("line1\nline2", row.get(0).?);
     try std.testing.expectEqualStrings("she said \"hi\"", row.get(1).?);
+}
+
+test "ndjson: chunked read with a small chunk size still finds rows spanning multiple chunks" {
+    const allocator = std.testing.allocator;
+    const path = "test_ndjson_small_chunks.ndjson";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data =
+        \\{"id":1,"name":"Alice"}
+        \\{"id":2,"name":"Bob"}
+        \\{"id":3,"name":"Carol"}
+        \\
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var s = try NdjsonScanner.openWithChunkSize(allocator, path, 8);
+    defer s.deinit();
+
+    const row1 = (try s.next()).?;
+    try std.testing.expectEqualStrings("1", row1.get(0).?);
+    try std.testing.expectEqualStrings("Alice", row1.get(1).?);
+    const row2 = (try s.next()).?;
+    try std.testing.expectEqualStrings("2", row2.get(0).?);
+    const row3 = (try s.next()).?;
+    try std.testing.expectEqualStrings("3", row3.get(0).?);
+    try std.testing.expectEqual(@as(?Row, null), try s.next());
+}
+
+test "json array: chunked read with a small chunk size still finds objects spanning multiple chunks" {
+    const allocator = std.testing.allocator;
+    const path = "test_json_array_small_chunks.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "[{\"id\":1,\"note\":\"a, b {c}\"},{\"id\":2,\"meta\":\"x\"},{\"id\":3}]" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var s = try NdjsonScanner.openWithChunkSize(allocator, path, 8);
+    defer s.deinit();
+
+    // Header is derived from row 1's keys only (id, note) — row 2's
+    // "meta" key isn't part of the header, same as CSV's own
+    // missing-key-reads-back-empty convention.
+    try std.testing.expectEqual(@as(usize, 2), s.header.len);
+    const row1 = (try s.next()).?;
+    try std.testing.expectEqualStrings("1", row1.get(0).?);
+    try std.testing.expectEqualStrings("a, b {c}", row1.get(1).?);
+    const row2 = (try s.next()).?;
+    try std.testing.expectEqualStrings("2", row2.get(0).?);
+    try std.testing.expectEqualStrings("", row2.get(1).?);
+    const row3 = (try s.next()).?;
+    try std.testing.expectEqualStrings("3", row3.get(0).?);
+    try std.testing.expectEqualStrings("", row3.get(1).?);
+    try std.testing.expectEqual(@as(?Row, null), try s.next());
+}
+
+test "json array: count() fast path counts objects without parsing fields" {
+    const allocator = std.testing.allocator;
+    const path = "test_json_array_count.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "[{\"a\":1},{\"a\":2},{\"a\":3}]" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var s = try NdjsonScanner.open(allocator, path);
+    defer s.deinit();
+    try std.testing.expectEqual(@as(usize, 3), try s.countRemaining());
 }
