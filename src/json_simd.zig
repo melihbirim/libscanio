@@ -61,13 +61,28 @@ pub fn findJsonStructureN(comptime chunk_size: usize, data: []const u8, tokens: 
 
         if (!@reduce(.Or, is_any)) continue;
 
-        var j: usize = 0;
-        while (j < chunk_size and count < tokens.len) : (j += 1) {
-            if (!is_any[j]) continue;
+        // simdjson-style bitmask walk, not a per-lane branchy scan: real
+        // JSON text is mostly string/number content between structural
+        // chars, so `is_any` is sparse and data-dependent per chunk — the
+        // old `if (!is_any[j]) continue` loop touched all chunk_size lanes
+        // every time and mispredicted on that sparse, content-dependent
+        // pattern. Building the mask below is branchless (shift+or per
+        // lane, no data-dependent conditional), then @ctz + clear-lowest-
+        // set-bit visits exactly popcount(mask) positions — only the real
+        // hits, never a skipped lane.
+        const MaskT = std.meta.Int(.unsigned, chunk_size);
+        var mask: MaskT = 0;
+        inline for (0..chunk_size) |j| {
+            mask |= @as(MaskT, @intFromBool(is_any[j])) << j;
+        }
+
+        while (mask != 0 and count < tokens.len) {
+            const j = @ctz(mask);
             const tok_type: TokenType =
                 if (is_open_brace[j]) .open_brace else if (is_close_brace[j]) .close_brace else if (is_open_bracket[j]) .open_bracket else if (is_close_bracket[j]) .close_bracket else if (is_quote[j]) .quote else if (is_colon[j]) .colon else .comma;
             tokens[count] = Token{ .type = tok_type, .pos = i + j };
             count += 1;
+            mask &= mask - 1;
         }
     }
 
