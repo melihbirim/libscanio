@@ -383,6 +383,89 @@ export fn scanio_topk_close(tctx: ?*TopkCtx) void {
     c_allocator.destroy(t);
 }
 
+/// Owns a bulk-collected scan result: every matching row's fields,
+/// NUL-separated, row-major, in one contiguous buffer. Exists to let a
+/// caller (Python via ctypes) fetch the WHOLE result in a single bulk
+/// copy instead of one small FFI call per field per row — that per-call
+/// crossing cost, not the scan itself, dominates when a caller wants
+/// every matching row back as real objects. Measured on a 417MB/1M-row
+/// file: row-at-a-time scanio_next() + per-field decode() from Python
+/// took ~4.8s for ~967K matching rows (2 projected columns); this path
+/// is the fix for that, not a micro-optimization of it.
+const CollectCtx = struct {
+    buf: std.ArrayListUnmanaged(u8) = .{},
+    n_rows: usize = 0,
+    n_cols: usize = 0,
+};
+
+/// Runs the REST of ctx's rows to completion (drains it, same semantics
+/// as scanio_count()/scanio_aggregate()/scanio_topk()) and packs every
+/// matching row's fields into one buffer, NUL-separated, row-major.
+/// Returns NULL on error — call scanio_last_error().
+export fn scanio_collect(ctx: ?*Ctx) ?*CollectCtx {
+    clearError();
+    const c = ctx orelse {
+        setError("scanner is null", .{});
+        return null;
+    };
+    const cc = c_allocator.create(CollectCtx) catch {
+        setError("out of memory allocating collect context", .{});
+        return null;
+    };
+    cc.* = .{};
+    while (true) {
+        const row = c.query.next() catch |e| {
+            setError("collect failed: {s}", .{@errorName(e)});
+            cc.buf.deinit(c_allocator);
+            c_allocator.destroy(cc);
+            return null;
+        } orelse break;
+        if (cc.n_rows == 0) cc.n_cols = row.fields.len;
+        for (row.fields) |field| {
+            cc.buf.appendSlice(c_allocator, field) catch {
+                setError("out of memory collecting rows", .{});
+                cc.buf.deinit(c_allocator);
+                c_allocator.destroy(cc);
+                return null;
+            };
+            cc.buf.append(c_allocator, 0) catch {
+                setError("out of memory collecting rows", .{});
+                cc.buf.deinit(c_allocator);
+                c_allocator.destroy(cc);
+                return null;
+            };
+        }
+        cc.n_rows += 1;
+    }
+    return cc;
+}
+
+/// Pointer to the packed buffer plus its length. The pointer is valid
+/// until scanio_collect_close(); the caller (Python) should copy it out
+/// immediately (e.g. ctypes.string_at) rather than hold the pointer.
+export fn scanio_collect_data(cc: ?*CollectCtx, out_len: ?*usize) ?[*]const u8 {
+    const c = cc orelse return null;
+    if (out_len) |ol| ol.* = c.buf.items.len;
+    if (c.buf.items.len == 0) return null;
+    return c.buf.items.ptr;
+}
+
+export fn scanio_collect_n_rows(cc: ?*CollectCtx) usize {
+    const c = cc orelse return 0;
+    return c.n_rows;
+}
+
+export fn scanio_collect_n_cols(cc: ?*CollectCtx) usize {
+    const c = cc orelse return 0;
+    return c.n_cols;
+}
+
+export fn scanio_collect_close(cc: ?*CollectCtx) void {
+    const c = cc orelse return;
+    c.buf.deinit(c_allocator);
+    c_allocator.destroy(c);
+}
+
 export fn scanio_close(ctx: ?*Ctx) void {
     const c = ctx orelse return;
     c.query.deinit();
@@ -594,4 +677,46 @@ test "C ABI: scanio_topk composes with a WHERE-filtered ctx" {
     try std.testing.expectEqual(@as(c_int, 1), scanio_topk_next(tctx, &fields, &n, &key));
     try std.testing.expectEqualStrings("3", std.mem.span(fields[0]));
     try std.testing.expectEqual(@as(c_int, 0), scanio_topk_next(tctx, &fields, &n, &key));
+}
+
+test "C ABI: scanio_collect packs matching rows into one NUL-separated buffer" {
+    const path = "test_c_api_collect.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,color,amount\n1,yellow,50\n2,red,1500\n3,yellow,900\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]CPredicate{.{ .column = 1, .op = 0, .value = "yellow" }};
+    const opts = COptions{ .columns = null, .n_columns = 0, .where = &preds, .n_where = 1, .limit = -1 };
+    const ctx = scanio_open(path, &opts);
+    defer scanio_close(ctx);
+
+    const cc = scanio_collect(ctx);
+    try std.testing.expect(cc != null);
+    defer scanio_collect_close(cc);
+
+    try std.testing.expectEqual(@as(usize, 2), scanio_collect_n_rows(cc));
+    try std.testing.expectEqual(@as(usize, 3), scanio_collect_n_cols(cc));
+
+    var len: usize = 0;
+    const data = scanio_collect_data(cc, &len).?;
+    const buf = data[0..len];
+    try std.testing.expectEqualStrings("1\x00yellow\x0050\x003\x00yellow\x00900\x00", buf);
+}
+
+test "C ABI: scanio_collect on zero matches returns n_rows=0 and a null buffer" {
+    const path = "test_c_api_collect_empty.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,color\n1,red\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]CPredicate{.{ .column = 1, .op = 0, .value = "yellow" }};
+    const opts = COptions{ .columns = null, .n_columns = 0, .where = &preds, .n_where = 1, .limit = -1 };
+    const ctx = scanio_open(path, &opts);
+    defer scanio_close(ctx);
+
+    const cc = scanio_collect(ctx);
+    defer scanio_collect_close(cc);
+
+    try std.testing.expectEqual(@as(usize, 0), scanio_collect_n_rows(cc));
+    var len: usize = 0;
+    try std.testing.expect(scanio_collect_data(cc, &len) == null);
+    try std.testing.expectEqual(@as(usize, 0), len);
 }

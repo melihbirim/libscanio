@@ -72,6 +72,18 @@ try:
     check("IN with no matches", list(libscanio.scan(P, where="name IN (Zed, Yolanda)")), [])
     check_raises("IN with no values raises", lambda: list(libscanio.scan(P, where="name IN ()")))
 
+    arr = libscanio.scan_array(P, columns=["customer_id", "revenue"], where="revenue > 1000")
+    check("scan_array: tuples, filtered+projected", arr, [("2", "1500"), ("3", "2500")])
+
+    arr_dict = libscanio.scan_array(P, columns=["customer_id", "revenue"], where="revenue > 1000", as_dict=True)
+    check("scan_array: as_dict", arr_dict, [
+        {"customer_id": "2", "revenue": "1500"},
+        {"customer_id": "3", "revenue": "2500"},
+    ])
+
+    check("scan_array: no matches returns empty list", libscanio.scan_array(P, where="revenue > 99999"), [])
+    check("scan_array: no filter returns every row", len(libscanio.scan_array(P)), 3)
+
     check_raises("unknown column in columns raises", lambda: list(libscanio.scan(P, columns=["nope"])))
     check_raises("unknown column in where raises", lambda: list(libscanio.scan(P, where="nope > 5")))
     check_raises("missing file raises", lambda: list(libscanio.scan("/tmp/libscanio_test_does_not_exist.csv")))

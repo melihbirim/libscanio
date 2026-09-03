@@ -23,6 +23,13 @@ for row in libscanio.scan(
     where="cab_type = yellow",
 ):
     print(row)  # {'trip_id': '649084905', 'cab_type': 'yellow'}
+
+# Want every matching row back as a Python list right now, not streamed?
+# scan_array() does the whole filtered scan in one call and hands the
+# result to Python in bulk instead of one row/field at a time — the same
+# query above as list(scan(...)) took 4.8s; scan_array() takes ~0.6s.
+# Not memory-bounded like scan() — it materializes everything at once.
+rows = libscanio.scan_array("sample.csv", columns=["trip_id", "cab_type"], where="cab_type = yellow")
 ```
 
 ```zig

@@ -132,6 +132,21 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_topk_close.argtypes = [ctypes.c_void_p]
     lib.scanio_topk_close.restype = None
 
+    lib.scanio_collect.argtypes = [ctypes.c_void_p]
+    lib.scanio_collect.restype = ctypes.c_void_p
+
+    lib.scanio_collect_data.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+    lib.scanio_collect_data.restype = ctypes.c_void_p  # not c_char_p: length is explicit, data may contain embedded NULs
+
+    lib.scanio_collect_n_rows.argtypes = [ctypes.c_void_p]
+    lib.scanio_collect_n_rows.restype = ctypes.c_size_t
+
+    lib.scanio_collect_n_cols.argtypes = [ctypes.c_void_p]
+    lib.scanio_collect_n_cols.restype = ctypes.c_size_t
+
+    lib.scanio_collect_close.argtypes = [ctypes.c_void_p]
+    lib.scanio_collect_close.restype = None
+
     lib.scanio_close.argtypes = [ctypes.c_void_p]
     lib.scanio_close.restype = None
 

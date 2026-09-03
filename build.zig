@@ -43,6 +43,15 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(c_lib);
     const c_lib_step = b.step("c-lib", "Build the C ABI shared library (zig-out/lib/libscanio.*)");
     c_lib_step.dependOn(b.getInstallStep());
+    // Real gotcha, bitten twice: c_lib and c_api_mod's optimize level comes
+    // from whatever -Doptimize this *specific* `zig build` invocation was
+    // given (default: Debug). Running `zig build test` or `python-test`
+    // WITHOUT -Doptimize=ReleaseFast after building c-lib with it silently
+    // rebuilds/overwrites zig-out/lib/libscanio.* at Debug — same binary
+    // path, ~10x slower, no error. Always rebuild `c-lib -Doptimize=ReleaseFast`
+    // as the LAST command before benchmarking or measuring anything against
+    // the .dylib/.so — don't assume a prior ReleaseFast build survived a
+    // later `zig build` of anything else.
 
     const example = b.addExecutable(.{
         .name = "scan_file",

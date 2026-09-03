@@ -91,6 +91,28 @@ int scanio_topk_next(scanio_topk_t *tk, const char ***out_fields, size_t *out_n,
 
 void scanio_topk_close(scanio_topk_t *tk);
 
+typedef struct scanio_collect_result scanio_collect_t;
+
+/* Runs the REST of this scanner's rows to completion (drains it, same as
+ * scanio_count()/scanio_aggregate()/scanio_topk()) and packs every
+ * matching row's fields into ONE contiguous NUL-separated buffer,
+ * row-major (n_rows * n_cols fields total). Exists so a caller can fetch
+ * an entire result set in a single bulk copy instead of one small call
+ * per field per row — that per-call crossing cost, not the scan itself,
+ * is what dominates when a caller (e.g. Python via ctypes) wants every
+ * matching row back as real objects. Returns NULL on error. */
+scanio_collect_t *scanio_collect(scanio_t *scanner);
+
+/* Pointer to the packed buffer plus its length in bytes. NULL/0 if there
+ * were no matching rows. Valid until scanio_collect_close() — copy it
+ * out immediately rather than holding the pointer. */
+const char *scanio_collect_data(scanio_collect_t *cr, size_t *out_len);
+
+size_t scanio_collect_n_rows(scanio_collect_t *cr);
+size_t scanio_collect_n_cols(scanio_collect_t *cr);
+
+void scanio_collect_close(scanio_collect_t *cr);
+
 void scanio_close(scanio_t *scanner);
 
 /* Human-readable reason for the most recent NULL/-1 return on this
