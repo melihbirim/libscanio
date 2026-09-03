@@ -68,6 +68,9 @@ const Ctx = struct {
     field_cstrs: [][]u8 = &.{},
     /// Pointer array handed back to the caller as `const char **`.
     field_ptrs: [][*:0]const u8 = &.{},
+    /// NUL-terminated header column names, built once at open() — small
+    /// and fixed-size, unlike row fields, so no reuse/grow logic needed.
+    header_cstrs: [][:0]u8 = &.{},
 
     fn ensureFieldCapacity(self: *Ctx, n: usize) void {
         if (n <= self.field_cstrs.len) return;
@@ -132,6 +135,22 @@ export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
         },
         .predicates = predicates,
     };
+
+    const header = ctx.query.scanner.header;
+    ctx.header_cstrs = c_allocator.alloc([:0]u8, header.len) catch {
+        setError("out of memory allocating header", .{});
+        ctx.query.deinit();
+        c_allocator.destroy(ctx);
+        if (predicates.len > 0) c_allocator.free(predicates);
+        return null;
+    };
+    for (header, 0..) |name, i| {
+        ctx.header_cstrs[i] = c_allocator.allocSentinel(u8, name.len, 0) catch {
+            setError("out of memory allocating header", .{});
+            return null; // ctx now partially initialized; leaked on this rare OOM path, not worth the extra bookkeeping.
+        };
+        @memcpy(ctx.header_cstrs[i], name);
+    }
     return ctx;
 }
 
@@ -139,6 +158,19 @@ export fn scanio_column_index(ctx: ?*Ctx, name: ?[*:0]const u8) usize {
     const c = ctx orelse return std.math.maxInt(usize);
     const n = name orelse return std.math.maxInt(usize);
     return c.query.columnIndex(std.mem.span(n)) orelse std.math.maxInt(usize);
+}
+
+/// Number of columns in the header.
+export fn scanio_n_columns(ctx: ?*Ctx) usize {
+    const c = ctx orelse return 0;
+    return c.header_cstrs.len;
+}
+
+/// Column name at `index`, or NULL if out of range.
+export fn scanio_column_name(ctx: ?*Ctx, index: usize) ?[*:0]const u8 {
+    const c = ctx orelse return null;
+    if (index >= c.header_cstrs.len) return null;
+    return c.header_cstrs[index].ptr;
 }
 
 export fn scanio_next(ctx: ?*Ctx, out_fields: ?*[*]const [*:0]const u8, out_n: ?*usize) c_int {
@@ -193,6 +225,8 @@ export fn scanio_close(ctx: ?*Ctx) void {
     if (c.field_cstrs.len > 0) c_allocator.free(c.field_cstrs);
     if (c.field_ptrs.len > 0) c_allocator.free(c.field_ptrs);
     if (c.predicates.len > 0) c_allocator.free(c.predicates);
+    for (c.header_cstrs) |buf| c_allocator.free(buf);
+    if (c.header_cstrs.len > 0) c_allocator.free(c.header_cstrs);
     c_allocator.destroy(c);
 }
 
@@ -271,4 +305,18 @@ test "C ABI: scanio_column_index" {
     defer scanio_close(ctx);
     try std.testing.expectEqual(@as(usize, 1), scanio_column_index(ctx, "name"));
     try std.testing.expectEqual(std.math.maxInt(usize), scanio_column_index(ctx, "nope"));
+}
+
+test "C ABI: scanio_n_columns and scanio_column_name" {
+    const path = "test_c_api_header.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,name,amount\n1,Alice,50\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const ctx = scanio_open(path, null);
+    defer scanio_close(ctx);
+    try std.testing.expectEqual(@as(usize, 3), scanio_n_columns(ctx));
+    try std.testing.expectEqualStrings("id", std.mem.span(scanio_column_name(ctx, 0).?));
+    try std.testing.expectEqualStrings("name", std.mem.span(scanio_column_name(ctx, 1).?));
+    try std.testing.expectEqualStrings("amount", std.mem.span(scanio_column_name(ctx, 2).?));
+    try std.testing.expect(scanio_column_name(ctx, 3) == null);
 }

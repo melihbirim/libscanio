@@ -84,4 +84,9 @@ pub fn build(b: *std.Build) void {
     smoke_test.step.dependOn(c_lib_step);
     const smoke_test_step = b.step("smoke-test", "dlopen() the built C ABI shared library and exercise it for real (needs python3)");
     smoke_test_step.dependOn(&smoke_test.step);
+
+    const python_test = b.addSystemCommand(&.{ "python3", "python/tests/test_scan.py" });
+    python_test.step.dependOn(c_lib_step);
+    const python_test_step = b.step("python-test", "Run the Python binding test suite (needs python3)");
+    python_test_step.dependOn(&python_test.step);
 }

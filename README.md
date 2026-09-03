@@ -6,9 +6,26 @@ Scan huge CSV (and later NDJSON) files without loading them into memory.
 
 **open → scan → process, regardless of file size.**
 
-## Status: M3 (scan + filter + project + limit + C ABI)
+## Status: M5a (scan + filter + project + limit + C ABI + Python)
 
-File source, CSV parser, filter, projection, limit, first, count, and a stable C ABI (`include/libscanio.h`). No aggregates or language bindings yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
+File source, CSV parser, filter, projection, limit, first, count, a stable C ABI (`include/libscanio.h`), and a Python binding. No aggregates or Node binding yet. See [ROADMAP.md](ROADMAP.md) for what's next and why it's sequenced this way.
+
+```python
+import libscanio
+
+for row in libscanio.scan(
+    "10gb.csv",
+    columns=["customer_id", "revenue"],
+    where="revenue > 1000",
+    limit=100,
+):
+    print(row)  # {'customer_id': '4821', 'revenue': '1050'}
+```
+
+```bash
+cd python && pip install -e .
+zig build python-test   # runs the Python binding suite against the real built library
+```
 
 ```c
 #include <libscanio.h>

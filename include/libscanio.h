@@ -39,6 +39,14 @@ scanio_t *scanio_open(const char *path, const scanio_options_t *options);
 /* Returns the column index for `name`, or SIZE_MAX if not found. */
 size_t scanio_column_index(scanio_t *scanner, const char *name);
 
+/* Number of columns in the header. */
+size_t scanio_n_columns(scanio_t *scanner);
+
+/* Column name at `index`, or NULL if out of range. Valid for the
+ * scanner's lifetime — unlike row fields, header names are not
+ * invalidated by the next scanio_next() call. */
+const char *scanio_column_name(scanio_t *scanner, size_t index);
+
 /* Advances to the next matching row.
  * Returns 1 with out_fields and out_n set (valid until the next call), 0
  * at EOF/limit reached, or -1 on error (call scanio_last_error()). */
