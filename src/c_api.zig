@@ -58,6 +58,17 @@ const COptions = extern struct {
     where: ?[*]const CPredicate,
     n_where: usize,
     limit: i64,
+    /// Highest column index the caller will ever read from this scan
+    /// (max of every WHERE predicate's column, every projected column,
+    /// and — for count()/aggregate()/topk() callers, which don't use
+    /// `columns` at all — whatever single column they read). -1 = don't
+    /// know / need every column, splits every field (safe default,
+    /// same behavior as before this field existed). Set this whenever
+    /// the caller genuinely knows the bound — real, measured win: up to
+    /// 3.6x faster on a low-selectivity WHERE over an early column (see
+    /// ROADMAP.md), since trailing unneeded fields are never scanned at
+    /// all rather than split-then-discarded.
+    max_column: i64 = -1,
 };
 
 /// Owns everything needed to answer scanio_next()/scanio_count() calls:
@@ -153,6 +164,8 @@ export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
         if (o.limit >= 0) limit = @intCast(o.limit);
     }
 
+    const stop_after_column: ?usize = if (options) |o| (if (o.max_column >= 0) @intCast(o.max_column) else null) else null;
+
     const ctx = c_allocator.create(Ctx) catch {
         setError("out of memory allocating scanner context", .{});
         return null;
@@ -162,6 +175,7 @@ export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
             .columns = columns,
             .where = predicates,
             .limit = limit,
+            .stop_after_column = stop_after_column,
         }) catch |e| {
             setError("open failed: {s}", .{@errorName(e)});
             c_allocator.destroy(ctx);
@@ -719,4 +733,26 @@ test "C ABI: scanio_collect on zero matches returns n_rows=0 and a null buffer" 
     var len: usize = 0;
     try std.testing.expect(scanio_collect_data(cc, &len) == null);
     try std.testing.expectEqual(@as(usize, 0), len);
+}
+
+test "C ABI: max_column bounds the row without breaking the result" {
+    const path = "test_c_api_max_column.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city,amount,notes,extra\n1,Austin,50,x,y\n2,Austin,1500,x,y\n3,Denver,1500,x,y\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const cols = [_]usize{0};
+    const preds = [_]CPredicate{
+        .{ .column = 1, .op = 0, .value = "Austin" },
+        .{ .column = 2, .op = 2, .value = "1000" },
+    };
+    const opts = COptions{ .columns = &cols, .n_columns = 1, .where = &preds, .n_where = 2, .limit = -1, .max_column = 2 };
+    const ctx = scanio_open(path, &opts);
+    try std.testing.expect(ctx != null);
+    defer scanio_close(ctx);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next(ctx, &fields, &n));
+    try std.testing.expectEqualStrings("2", std.mem.span(fields[0]));
+    try std.testing.expectEqual(@as(c_int, 0), scanio_next(ctx, &fields, &n));
 }

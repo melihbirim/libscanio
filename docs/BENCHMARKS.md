@@ -53,44 +53,41 @@ need to pay for machinery a single filtered scan never uses.
 match against the raw line and only counts (doesn't materialize rows),
 libscanio's WHERE is an exact match against one pre-split column.
 
-## Selectivity crossover: libscanio vs xan
+## Selectivity crossover vs xan — and closing it
 
-The single most useful thing this session's benchmarking found: libscanio
-and xan trade wins depending on how selective the query is, and the
-crossover is consistent across file size and column position (verified —
-filtering on an early column, column 5 of 51, and a late column, column 47
-of 51, at matched selectivity gave the same result within noise, so this
-isn't a "which column" artifact).
+Benchmarking libscanio fairly against xan (a real Rust CSV tool, same
+weight class) surfaced a real gap: at low selectivity, libscanio lost by
+~1.35-1.5x. Root cause, confirmed with a pure-Zig benchmark
+(`examples/collect_bench.zig`, no Python/ctypes layer at all, to rule that
+out first before touching anything) — `splitInto()` split every one of a
+row's 51 fields regardless of how many the query actually needed, so a
+filter on an early column paid for splitting 51 fields to answer a
+question that only needed 2-6 of them.
 
-| selectivity | file | libscanio `scan_array()` | xan | winner |
-|---|---|---|---|---|
-| low (26 / 1,000,000) | 417MB | 0.45-0.48s | 0.29-0.33s | xan, ~1.5x |
-| low (13,711 / 20,000,000) | 8.5GB | 9.76s | 7.26s | xan, ~1.35x |
-| high (967,553 / 1,000,000) | 417MB | 0.687s | 0.89s | libscanio, ~1.3x |
+Fixed with `ScannerOptions.stop_after_column` (`src/root.zig`) — the
+per-row split stops the instant it's captured the highest column index
+anything will read, never scanning the rest of the line at all. Threaded
+through the C ABI (`COptions.max_column`) and computed automatically in
+the Python binding wherever it's safe (see ROADMAP.md for the full
+design, including why `topk()` deliberately does NOT get this treatment —
+it returns full rows, bounding it would silently truncate them).
 
-As match count grows, xan's time roughly triples (0.3s -> 0.89s) while
-libscanio's barely moves (0.45s -> 0.69s). That split points at two
-different costs:
+| selectivity | file | column position | before | after | xan |
+|---|---|---|---|---|---|
+| low (26 / 1,000,000) | 417MB | early (col 5) | 0.45-0.48s | **0.13-0.18s** | 0.29-0.33s |
+| low (1,085 / 1,000,000) | 417MB | mid (col 20) | 0.45s | **0.27-0.29s** | 0.29-0.30s |
+| low (13,711 / 20,000,000) | 8.5GB | mid (col 20) | 9.76s | **6.52-6.60s** | 7.26s |
+| high (967,553 / 1,000,000) | 417MB | mid (col 24) | — | 0.687s (unchanged, already won) | 0.89s |
 
-- **Per-row scan cost** (dominant at low selectivity — almost every row
-  gets checked and discarded): xan is consistently faster here, at any
-  file size or column position tested. libscanio's `splitInto()` (the
-  per-row field-delimiter scan, `src/root.zig`) is a scalar byte-by-byte
-  loop — a SIMD version was tried and measured *slower* for the short
-  fields this schema has, so it was reverted (see the M9 roadmap entry).
-  xan's Rust CSV parsing is doing something faster at this stage, most
-  likely genuine SIMD delimiter-finding paying off where libscanio's
-  attempt didn't. This is real, unresolved, and the next thing to dig
-  into (see ROADMAP.md).
-- **Per-match collection cost** (dominant at high selectivity): libscanio
-  wins here — `scan_array()`'s bulk NUL-separated buffer append is cheap
-  per matched row; xan's per-row cost while writing appears higher, likely
-  CSV-output formatting/quoting on its write path rather than its scan
-  path.
-
-Practical read: for a highly selective filter (the common real case — find
-a needle in a haystack), xan currently wins. For an unselective one (keep
-most of the file), libscanio wins. Neither tool wins everywhere.
+Early-column result: libscanio now beats xan outright, ~2x, reversing the
+original loss. Mid-column and 8.5GB-scale results: libscanio now wins
+too, not just closes the gap. The late-column case (column 47 of 51)
+shows no improvement — expected, almost the whole row still needs
+splitting when the target column is near the end, so there's nothing to
+skip. The win is real but bounded by how early the needed columns fall in
+the schema; it's not a universal "libscanio is now always faster than
+xan" claim, and the honest crossover data above is kept rather than
+deleted now that one side of it improved.
 
 ## Full scan (every row, every column)
 
@@ -154,21 +151,22 @@ tool below.
 | tool | time | peak RSS |
 |---|---|---|
 | naive Python (`csv.reader`, projected) | 103.983s | 15.6MB |
+| **libscanio `scan_array()`** (after `stop_after_column`, see below) | 6.52-6.60s | 20.7MB |
 | xan `search -s payment_type -e DIS` | 7.26s | 12.8MB |
-| **libscanio `scan_array()`** | 9.761s | 20.1MB |
 | qsv `search --select payment_type ^DIS$` | 13.08s | 21.5MB |
 | DuckDB, `--threads=1` | 40.43s | 86.1MB |
 | DuckDB, default (multi-thread, ~8 cores) | 5.23s | 357.9MB |
 
-Consistent with the selectivity crossover above (this is a low-selectivity
-query, 0.07% of rows match) — xan wins here, same ~1.35x margin as the
-417MB low-selectivity case. libscanio still beats naive Python by ~10.6x
-and single-thread DuckDB by ~4.1x, and stays within 1.9x of DuckDB's
-8-core result using one core and 17.8x less memory. Naive Python's lower
-RSS here isn't a libscanio weakness — this is a selective query, so
-neither approach ever holds the file in memory; the "bounded regardless
-of file size" property is about the internal scan loop, proven separately
-above, not about beating an already-small Python footprint.
+Originally 9.76s here — see the **selectivity crossover** section below for
+the fix (`stop_after_column`, bounding the per-row field split) that
+brought this from behind xan to ahead of it. libscanio now beats naive
+Python by ~15.8x, xan by ~1.1x, single-thread DuckDB by ~6.2x, and stays
+within 1.26x of DuckDB's 8-core result using one core and 17.3x less
+memory. Naive Python's lower RSS here still isn't a libscanio weakness —
+this is a selective query, so neither approach ever holds the file in
+memory; the "bounded regardless of file size" property is about the
+internal scan loop, proven separately above, not about beating an
+already-small Python footprint.
 
 ## Memory: chunked reads vs mmap/full-load
 

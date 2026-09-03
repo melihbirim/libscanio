@@ -183,12 +183,23 @@ def _open_full(
 
     columns_arr = (ctypes.c_size_t * len(col_indices))(*col_indices) if col_indices else None
     where_arr = (CPredicate * len(predicates))(*predicates) if predicates else None
+    # Only safe to bound when `columns` was explicitly given — None means
+    # the caller wants every column back, so every field must still be
+    # split regardless of what WHERE touches. When columns IS given, the
+    # bound is the highest index either the projection or WHERE reads —
+    # real, measured win (up to 3.6x) since trailing fields past it are
+    # never scanned at all, not just discarded. See ROADMAP.md.
+    max_column = -1
+    if col_indices is not None:
+        needed = list(col_indices) + ([p.column for p in predicates] if predicates else [])
+        max_column = max(needed)
     opts = COptions(
         columns=columns_arr,
         n_columns=len(col_indices) if col_indices else 0,
         where=where_arr,
         n_where=len(predicates) if predicates else 0,
         limit=limit if limit is not None else -1,
+        max_column=max_column,
     )
     keepalive = keepalive + [predicates, where_arr, columns_arr, opts]
 
@@ -263,31 +274,50 @@ def scan_array(
         lib.scanio_close(ctx)
 
 
-def _open_filtered(lib: ctypes.CDLL, path: str, where: Optional[str]) -> tuple[ctypes.c_void_p, list]:
+def _open_filtered(
+    lib: ctypes.CDLL, path: str, where: Optional[str], extra_column: Optional[int] = None
+) -> tuple[ctypes.c_void_p, list]:
     """Open with WHERE resolved to predicates — the shared setup schema(),
     count(), aggregate(), and topk() all need before doing their own
     thing. Same two-open pattern scan() uses: one throwaway open to
     resolve column names, one real open with the resolved options.
 
+    `extra_column`: aggregate()/topk() read exactly one column that
+    isn't expressed via WHERE — passing its index here lets the bound
+    below include it, so their scan is bounded even without a WHERE
+    clause. count() passes None (it either uses the newline-only fast
+    path with no WHERE, which never splits a field regardless of any
+    bound, or needs exactly the WHERE columns and nothing else).
+
     Returns (ctx, keepalive) — see _open_full()'s doc comment for why
     `keepalive` must stay referenced by the caller until `ctx` is closed,
     not just through this function. Same bug class, same fix."""
-    if not where:
+    if not where and extra_column is None:
         ctx = lib.scanio_open(path.encode(), None)
         if not ctx:
             _raise_last_error(lib, f"failed to open {path!r}")
         return ctx, []
 
-    probe_ctx = lib.scanio_open(path.encode(), None)
-    if not probe_ctx:
-        _raise_last_error(lib, f"failed to open {path!r}")
-    try:
-        predicates, keepalive = _parse_where(lib, probe_ctx, where)
-    finally:
-        lib.scanio_close(probe_ctx)
+    predicates: list = []
+    keepalive: list = []
+    if where:
+        probe_ctx = lib.scanio_open(path.encode(), None)
+        if not probe_ctx:
+            _raise_last_error(lib, f"failed to open {path!r}")
+        try:
+            predicates, keepalive = _parse_where(lib, probe_ctx, where)
+        finally:
+            lib.scanio_close(probe_ctx)
 
-    where_arr = (CPredicate * len(predicates))(*predicates)
-    opts = COptions(columns=None, n_columns=0, where=where_arr, n_where=len(predicates), limit=-1)
+    where_arr = (CPredicate * len(predicates))(*predicates) if predicates else None
+    # Always safe to bound here — unlike scan()/scan_array(), nothing
+    # calling _open_filtered() ever needs "every column" back; count()
+    # discards rows entirely and aggregate()/topk() read exactly one.
+    needed = [p.column for p in predicates] + ([extra_column] if extra_column is not None else [])
+    max_column = max(needed) if needed else -1
+    opts = COptions(
+        columns=None, n_columns=0, where=where_arr, n_where=len(predicates), limit=-1, max_column=max_column
+    )
     keepalive = keepalive + [predicates, where_arr, opts]
     ctx = lib.scanio_open(path.encode(), ctypes.byref(opts))
     if not ctx:
@@ -325,9 +355,19 @@ def aggregate(path: str, column: str, where: Optional[str] = None) -> dict[str, 
     missing values are skipped, not errors. min/max/avg are None if no
     numeric value was ever seen (count == 0)."""
     lib = load()
-    ctx, _keepalive = _open_filtered(lib, path, where)
+    # Resolve the target column before opening for real so _open_filtered
+    # can bound the scan to it (plus any WHERE columns) — real, measured
+    # speedup, see _open_filtered()'s doc comment.
+    probe = lib.scanio_open(path.encode(), None)
+    if not probe:
+        _raise_last_error(lib, f"failed to open {path!r}")
     try:
-        col_idx = _resolve_column(lib, ctx, column)
+        col_idx = _resolve_column(lib, probe, column)
+    finally:
+        lib.scanio_close(probe)
+
+    ctx, _keepalive = _open_filtered(lib, path, where, extra_column=col_idx)
+    try:
         out = CAgg()
         if lib.scanio_aggregate(ctx, col_idx, ctypes.byref(out)) != 0:
             _raise_last_error(lib, "aggregate failed")

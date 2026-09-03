@@ -78,6 +78,7 @@ class COptions(ctypes.Structure):
         ("where", ctypes.POINTER(CPredicate)),
         ("n_where", ctypes.c_size_t),
         ("limit", ctypes.c_int64),
+        ("max_column", ctypes.c_int64),
     ]
 
 

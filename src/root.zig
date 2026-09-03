@@ -38,6 +38,18 @@ pub const default_chunk_size = CHUNK_SIZE;
 pub const ScannerOptions = struct {
     delimiter: u8 = ',',
     chunk_size: usize = CHUNK_SIZE,
+    /// If set, splitInto() stops once it has captured field index
+    /// `stop_after_column` (inclusive) — fields past that index are
+    /// never scanned for this row at all, not just discarded. Null
+    /// (default) splits every field, same as before this existed. Set
+    /// this to the highest column index a caller will actually read
+    /// (the max of every WHERE predicate's column and every projected
+    /// column) — anything past it is provably never read, so skipping
+    /// it is always safe, never a behavior change from the caller's
+    /// perspective. Rows with FEWER fields than this still return
+    /// correctly (the line-end check still applies); this only lets a
+    /// WIDE row's unneeded tail go unscanned.
+    stop_after_column: ?usize = null,
 };
 
 const query_mod = @import("query.zig");
@@ -109,6 +121,7 @@ pub const Scanner = struct {
     header_line: []u8,
     header: [][]const u8,
     field_buf: [][]const u8,
+    stop_after_column: ?usize,
 
     pub fn open(allocator: Allocator, path: []const u8) !Scanner {
         return openWithOptions(allocator, path, .{});
@@ -136,6 +149,7 @@ pub const Scanner = struct {
             .eof = false,
             .line_scratch = .{},
             .delimiter = options.delimiter,
+            .stop_after_column = options.stop_after_column,
             .header_line = &[_]u8{},
             .header = &[_][]const u8{},
             .field_buf = &[_][]const u8{},
@@ -263,6 +277,13 @@ pub const Scanner = struct {
                 self.ensureFieldCapacity(count + 1);
                 self.field_buf[count] = line[start..i];
                 count += 1;
+                // Everything past stop_after_column is provably never
+                // read by this Query (see ScannerOptions' doc comment) —
+                // stop scanning the rest of the line's bytes entirely,
+                // not just skip storing them.
+                if (self.stop_after_column) |stop| {
+                    if (count == stop + 1) return count;
+                }
                 start = i + 1;
             }
         }
@@ -384,4 +405,38 @@ test "row field count varies across rows (ragged CSV) without leaking stale fiel
 
     const row2 = (try scanner.next()).?;
     try std.testing.expectEqual(@as(usize, 2), row2.fields.len);
+}
+
+test "stop_after_column truncates the row, doesn't scan or return trailing fields" {
+    const allocator = std.testing.allocator;
+    const path = "test_stop_after_column.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b,c,d,e\n1,2,3,4,5\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var scanner = try Scanner.openWithOptions(allocator, path, .{ .stop_after_column = 1 });
+    defer scanner.deinit();
+
+    // Header is unaffected — stop_after_column only bounds per-row next().
+    try std.testing.expectEqual(@as(usize, 5), scanner.header.len);
+
+    const row = (try scanner.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), row.fields.len);
+    try std.testing.expectEqualStrings("1", row.get(0).?);
+    try std.testing.expectEqualStrings("2", row.get(1).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), row.get(2));
+}
+
+test "stop_after_column past a short row still returns correctly (ragged CSV)" {
+    const allocator = std.testing.allocator;
+    const path = "test_stop_after_column_ragged.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b,c,d,e\n1,2\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var scanner = try Scanner.openWithOptions(allocator, path, .{ .stop_after_column = 3 });
+    defer scanner.deinit();
+
+    const row = (try scanner.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), row.fields.len);
+    try std.testing.expectEqualStrings("1", row.get(0).?);
+    try std.testing.expectEqualStrings("2", row.get(1).?);
 }

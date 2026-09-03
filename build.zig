@@ -104,6 +104,23 @@ pub fn build(b: *std.Build) void {
     const filter_bench_step = b.step("filter-bench", "Run a WHERE-filtered scan, counting matches (for grep comparison)");
     filter_bench_step.dependOn(&run_filter_bench.step);
 
+    const collect_bench = b.addExecutable(.{
+        .name = "collect_bench",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/collect_bench.zig"),
+        }),
+    });
+    collect_bench.root_module.addImport("scanio", scanio_mod);
+    collect_bench.linkLibC();
+    b.installArtifact(collect_bench);
+    const run_collect_bench = b.addRunArtifact(collect_bench);
+    run_collect_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_collect_bench.addArgs(args);
+    const collect_bench_step = b.step("collect-bench", "Run a WHERE-filtered, projected scan that collects matches (pure Zig, for a fair xan/qsv comparison with no Python/ctypes layer)");
+    collect_bench_step.dependOn(&run_collect_bench.step);
+
     const json_parser_mod = b.addModule("json_parser", .{
         .root_source_file = b.path("src/json_parser.zig"),
         .target = target,

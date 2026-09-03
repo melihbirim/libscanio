@@ -64,6 +64,21 @@ pub const QueryOptions = struct {
     /// size directly (NdjsonScanner.open()) — not yet exposed through
     /// this option; add if a real caller needs to tune it separately.
     csv_chunk_size: ?usize = null,
+    /// Highest column index this Query's caller will actually read —
+    /// the max of every WHERE predicate's column and every projected
+    /// column (plus, for aggregate()/topk()-style single-column callers,
+    /// whatever column they'll read). Null (default) means "don't know,
+    /// split every field" — always correct, just not always fastest.
+    /// CSV only for now (see stop_after_column in ScannerOptions,
+    /// root.zig, for the measured win and why it's safe); ignored for
+    /// NDJSON, which doesn't have a comparable per-field split cost to
+    /// avoid (it parses by JSON key, not fixed position). This is NOT
+    /// auto-computed from `columns`/`where` here, on purpose: a caller
+    /// like aggregate()/topk() reads a column that's only known at the
+    /// call to aggregate()/topk() itself, after Query.open() already
+    /// ran — the bound has to come from whoever knows all the columns
+    /// that will ever be read, which isn't always this struct alone.
+    stop_after_column: ?usize = null,
 };
 
 fn inferFormat(path: []const u8) Format {
@@ -139,6 +154,7 @@ pub const Query = struct {
         const source: Source = switch (format) {
             .csv => .{ .csv = try Scanner.openWithOptions(allocator, path, .{
                 .chunk_size = options.csv_chunk_size orelse scan.default_chunk_size,
+                .stop_after_column = options.stop_after_column,
             }) },
             .ndjson => .{ .ndjson = try NdjsonScanner.open(allocator, path) },
         };
@@ -332,6 +348,30 @@ test "filter: two predicates are ANDed" {
         Predicate.init(1, .eq, "Austin"),
         Predicate.init(2, .gt, "1000"),
     } });
+    defer q.deinit();
+
+    const row = (try q.next()).?;
+    try std.testing.expectEqualStrings("2", row.get(0).?);
+    try std.testing.expectEqual(@as(?Row, null), try q.next());
+}
+
+test "stop_after_column composes with WHERE and projection: trailing unread columns never split" {
+    const allocator = std.testing.allocator;
+    const path = "test_query_stop_after_column.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city,amount,notes,extra\n1,Austin,50,x,y\n2,Austin,1500,x,y\n3,Denver,1500,x,y\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    // Needs columns 0 (projected) and 1,2 (WHERE) — highest is 2, so
+    // stop_after_column=2 should still work correctly even though
+    // "notes"/"extra" (columns 3,4) are never split.
+    var q = try Query.open(allocator, path, .{
+        .columns = &.{0},
+        .where = &.{
+            Predicate.init(1, .eq, "Austin"),
+            Predicate.init(2, .gt, "1000"),
+        },
+        .stop_after_column = 2,
+    });
     defer q.deinit();
 
     const row = (try q.next()).?;
