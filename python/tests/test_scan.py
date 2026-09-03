@@ -159,5 +159,62 @@ try:
 finally:
     os.unlink(P)
 
+
+# NDJSON and JSON-array coverage — real gap until now: format inference
+# (.ndjson/.jsonl/.json -> the NDJSON scanner, sniffed from content for
+# .json specifically) happens at the C ABI level with no format option
+# exposed to Python at all, so this was "should work, per the Zig-level
+# tests" rather than actually verified through ctypes/dlopen(). Same
+# fixture shape as the CSV tests above, for direct comparison.
+ndjson_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".ndjson", delete=False)
+ndjson_tmp.write(
+    '{"customer_id":"1","name":"Alice","revenue":"500"}\n'
+    '{"customer_id":"2","name":"Bob","revenue":"1500"}\n'
+    '{"customer_id":"3","name":"Carol","revenue":"2500"}\n'
+)
+ndjson_tmp.close()
+ND = ndjson_tmp.name
+
+json_array_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+json_array_tmp.write(
+    '[{"customer_id":"1","name":"Alice","revenue":"500"},'
+    '{"customer_id":"2","name":"Bob","revenue":"1500"},'
+    '{"customer_id":"3","name":"Carol","revenue":"2500"}]'
+)
+json_array_tmp.close()
+JA = json_array_tmp.name
+
+try:
+    check("ndjson: schema", libscanio.schema(ND), ["customer_id", "name", "revenue"])
+    check("ndjson: count with no filter", libscanio.count(ND), 3)
+    check("ndjson: scan with filter", list(libscanio.scan(ND, where="revenue > 1000")), [
+        {"customer_id": "2", "name": "Bob", "revenue": "1500"},
+        {"customer_id": "3", "name": "Carol", "revenue": "2500"},
+    ])
+    check(
+        "ndjson: scan_array projected",
+        libscanio.scan_array(ND, columns=["customer_id", "revenue"], where="revenue > 1000"),
+        [("2", "1500"), ("3", "2500")],
+    )
+    agg_nd = libscanio.aggregate(ND, "revenue")
+    check("ndjson: aggregate sum", agg_nd["sum"], 4500.0)
+
+    check("json array: schema", libscanio.schema(JA), ["customer_id", "name", "revenue"])
+    check("json array: count with no filter", libscanio.count(JA), 3)
+    check("json array: scan with filter", list(libscanio.scan(JA, where="revenue > 1000")), [
+        {"customer_id": "2", "name": "Bob", "revenue": "1500"},
+        {"customer_id": "3", "name": "Carol", "revenue": "2500"},
+    ])
+    check(
+        "json array: scan_array projected",
+        libscanio.scan_array(JA, columns=["customer_id", "revenue"], where="revenue > 1000"),
+        [("2", "1500"), ("3", "2500")],
+    )
+    agg_ja = libscanio.aggregate(JA, "revenue")
+    check("json array: aggregate sum", agg_ja["sum"], 4500.0)
+finally:
+    os.unlink(ND)
+    os.unlink(JA)
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

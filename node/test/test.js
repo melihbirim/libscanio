@@ -183,6 +183,63 @@ async function main() {
     fs.unlinkSync(P);
   }
 
+  // NDJSON and JSON-array coverage — real gap until now: format
+  // inference (.ndjson/.jsonl/.json -> the NDJSON scanner, sniffed from
+  // content for .json specifically) happens at the C ABI level with no
+  // format option exposed to Node at all, so this was "should work, per
+  // the Zig-level tests" rather than actually verified through koffi.
+  // Same fixture shape as the CSV tests above, for direct comparison.
+  const ND = path.join(os.tmpdir(), `libscanio_test_${process.pid}.ndjson`);
+  fs.writeFileSync(
+    ND,
+    '{"customer_id":"1","name":"Alice","revenue":"500"}\n' +
+      '{"customer_id":"2","name":"Bob","revenue":"1500"}\n' +
+      '{"customer_id":"3","name":"Carol","revenue":"2500"}\n'
+  );
+  const JA = path.join(os.tmpdir(), `libscanio_test_${process.pid}.json`);
+  fs.writeFileSync(
+    JA,
+    '[{"customer_id":"1","name":"Alice","revenue":"500"},' +
+      '{"customer_id":"2","name":"Bob","revenue":"1500"},' +
+      '{"customer_id":"3","name":"Carol","revenue":"2500"}]'
+  );
+  try {
+    check('ndjson: schema', libscanio.schema(ND), ['customer_id', 'name', 'revenue']);
+    check('ndjson: count with no filter', libscanio.count(ND), 3);
+    check('ndjson: scan with filter', await collect(libscanio.scan(ND, { where: 'revenue > 1000' })), [
+      { customer_id: '2', name: 'Bob', revenue: '1500' },
+      { customer_id: '3', name: 'Carol', revenue: '2500' },
+    ]);
+    check(
+      'ndjson: scanArray projected',
+      libscanio.scanArray(ND, { columns: ['customer_id', 'revenue'], where: 'revenue > 1000' }),
+      [
+        ['2', '1500'],
+        ['3', '2500'],
+      ]
+    );
+    check('ndjson: aggregate sum', libscanio.aggregate(ND, 'revenue').sum, 4500);
+
+    check('json array: schema', libscanio.schema(JA), ['customer_id', 'name', 'revenue']);
+    check('json array: count with no filter', libscanio.count(JA), 3);
+    check('json array: scan with filter', await collect(libscanio.scan(JA, { where: 'revenue > 1000' })), [
+      { customer_id: '2', name: 'Bob', revenue: '1500' },
+      { customer_id: '3', name: 'Carol', revenue: '2500' },
+    ]);
+    check(
+      'json array: scanArray projected',
+      libscanio.scanArray(JA, { columns: ['customer_id', 'revenue'], where: 'revenue > 1000' }),
+      [
+        ['2', '1500'],
+        ['3', '2500'],
+      ]
+    );
+    check('json array: aggregate sum', libscanio.aggregate(JA, 'revenue').sum, 4500);
+  } finally {
+    fs.unlinkSync(ND);
+    fs.unlinkSync(JA);
+  }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }
