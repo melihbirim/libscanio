@@ -31,6 +31,18 @@ const OP_IN = 6;
 const COND_RE = /^(\w+)\s*(>=|<=|!=|>|<|=)\s*(.+)$/;
 const IN_RE = /^(\w+)\s+IN\s*\((.*)\)$/;
 
+/**
+ * A zero-value COptions struct meaning "no columns, no WHERE, no limit,
+ * no bound" — passed instead of JS `null` for scanio_open()'s options
+ * parameter. Real bug found and fixed, not a style preference: passing
+ * `null` there crashed scanio_open() outright on Windows (traced via
+ * CI logging — the call never returned, every other platform was fine)
+ * — a koffi-on-Windows null-struct-pointer marshaling issue, not
+ * anything on the Zig/C ABI side. This sidesteps it entirely by never
+ * passing a null pointer for that parameter at all.
+ */
+const NO_OPTIONS = { columns: null, n_columns: 0, where: null, n_where: 0, limit: -1n, max_column: -1n };
+
 class ScanError extends Error {}
 
 function raiseLastError(fns, fallback) {
@@ -99,7 +111,7 @@ function parseWhere(fns, ctx, where) {
  * always safe for count()/aggregate(), which never return row data.
  */
 function openFull(fns, path, { columns, where, limit } = {}) {
-  const probe = fns.scanio_open(path, null);
+  const probe = fns.scanio_open(path, NO_OPTIONS);
   if (!probe) raiseLastError(fns, `failed to open ${JSON.stringify(path)}`);
 
   let colIndices = null;
@@ -146,14 +158,14 @@ function openFull(fns, path, { columns, where, limit } = {}) {
  */
 function openFiltered(fns, path, where, extraColumn = null) {
   if (!where && extraColumn === null) {
-    const ctx = fns.scanio_open(path, null);
+    const ctx = fns.scanio_open(path, NO_OPTIONS);
     if (!ctx) raiseLastError(fns, `failed to open ${JSON.stringify(path)}`);
     return ctx;
   }
 
   let predicates = [];
   if (where) {
-    const probe = fns.scanio_open(path, null);
+    const probe = fns.scanio_open(path, NO_OPTIONS);
     if (!probe) raiseLastError(fns, `failed to open ${JSON.stringify(path)}`);
     try {
       predicates = parseWhere(fns, probe, where);
@@ -262,7 +274,7 @@ function scanArray(filePath, options = {}) {
 /** Column names, in header order. Doesn't scan any rows. */
 function schema(filePath) {
   const { fns } = load();
-  const ctx = fns.scanio_open(filePath, null);
+  const ctx = fns.scanio_open(filePath, NO_OPTIONS);
   if (!ctx) raiseLastError(fns, `failed to open ${JSON.stringify(filePath)}`);
   try {
     const n = Number(fns.scanio_n_columns(ctx));
@@ -292,7 +304,7 @@ function count(filePath, where = null) {
  */
 function aggregate(filePath, column, where = null) {
   const { fns } = load();
-  const probe = fns.scanio_open(filePath, null);
+  const probe = fns.scanio_open(filePath, NO_OPTIONS);
   if (!probe) raiseLastError(fns, `failed to open ${JSON.stringify(filePath)}`);
   let colIdx;
   try {
@@ -328,7 +340,7 @@ function aggregate(filePath, column, where = null) {
  */
 function topk(filePath, column, k, where = null, descending = true) {
   const { fns } = load();
-  const probe = fns.scanio_open(filePath, null);
+  const probe = fns.scanio_open(filePath, NO_OPTIONS);
   if (!probe) raiseLastError(fns, `failed to open ${JSON.stringify(filePath)}`);
   let colIdx;
   try {
