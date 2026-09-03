@@ -1,8 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // The build script itself always runs on the actual host machine,
+    // regardless of what -Dtarget cross-compiles artifacts for — this is
+    // real, not cross-compiled: Windows CI runners don't reliably have a
+    // "python3" alias (only "python"), found running this on GitHub
+    // Actions' windows-latest.
+    const python_cmd = if (builtin.os.tag == .windows) "python" else "python3";
 
     const scanio_mod = b.addModule("scanio", .{
         .root_source_file = b.path("src/root.zig"),
@@ -40,9 +47,16 @@ pub fn build(b: *std.Build) void {
     });
     c_lib.linkLibC();
     c_lib.installHeader(b.path("include/libscanio.h"), "libscanio.h");
-    b.installArtifact(c_lib);
+    const install_c_lib = b.addInstallArtifact(c_lib, .{});
     const c_lib_step = b.step("c-lib", "Build the C ABI shared library (zig-out/lib/libscanio.*)");
-    c_lib_step.dependOn(b.getInstallStep());
+    // Scoped to c_lib's own install, not b.getInstallStep() (which pulls
+    // in every other example artifact registered anywhere in this file)
+    // — that used to break cross-compiling c-lib for Windows, since
+    // parser_bench (a POSIX-only diagnostic tool, std.posix.mmap) would
+    // get dragged in and fail to compile for a target it was never meant
+    // to support. Found by actually trying `-Dtarget=x86_64-windows-gnu`
+    // before trusting the release workflow would work, not by assuming.
+    c_lib_step.dependOn(&install_c_lib.step);
     // Real gotcha, bitten twice: c_lib and c_api_mod's optimize level comes
     // from whatever -Doptimize this *specific* `zig build` invocation was
     // given (default: Debug). Running `zig build test` or `python-test`
@@ -63,9 +77,9 @@ pub fn build(b: *std.Build) void {
     });
     example.root_module.addImport("scanio", scanio_mod);
     example.linkLibC();
-    b.installArtifact(example);
+    const install_example = b.addInstallArtifact(example, .{});
     const run_example = b.addRunArtifact(example);
-    run_example.step.dependOn(b.getInstallStep());
+    run_example.step.dependOn(&install_example.step);
     if (b.args) |args| run_example.addArgs(args);
     const example_step = b.step("scan", "Run the scan_file example");
     example_step.dependOn(&run_example.step);
@@ -80,9 +94,9 @@ pub fn build(b: *std.Build) void {
     });
     mem_check.root_module.addImport("scanio", scanio_mod);
     mem_check.linkLibC();
-    b.installArtifact(mem_check);
+    const install_mem_check = b.addInstallArtifact(mem_check, .{});
     const run_mem_check = b.addRunArtifact(mem_check);
-    run_mem_check.step.dependOn(b.getInstallStep());
+    run_mem_check.step.dependOn(&install_mem_check.step);
     if (b.args) |args| run_mem_check.addArgs(args);
     const mem_check_step = b.step("mem-check", "Run the format-aware Query scan (for memory/throughput comparison)");
     mem_check_step.dependOn(&run_mem_check.step);
@@ -97,9 +111,9 @@ pub fn build(b: *std.Build) void {
     });
     filter_bench.root_module.addImport("scanio", scanio_mod);
     filter_bench.linkLibC();
-    b.installArtifact(filter_bench);
+    const install_filter_bench = b.addInstallArtifact(filter_bench, .{});
     const run_filter_bench = b.addRunArtifact(filter_bench);
-    run_filter_bench.step.dependOn(b.getInstallStep());
+    run_filter_bench.step.dependOn(&install_filter_bench.step);
     if (b.args) |args| run_filter_bench.addArgs(args);
     const filter_bench_step = b.step("filter-bench", "Run a WHERE-filtered scan, counting matches (for grep comparison)");
     filter_bench_step.dependOn(&run_filter_bench.step);
@@ -114,9 +128,9 @@ pub fn build(b: *std.Build) void {
     });
     collect_bench.root_module.addImport("scanio", scanio_mod);
     collect_bench.linkLibC();
-    b.installArtifact(collect_bench);
+    const install_collect_bench = b.addInstallArtifact(collect_bench, .{});
     const run_collect_bench = b.addRunArtifact(collect_bench);
-    run_collect_bench.step.dependOn(b.getInstallStep());
+    run_collect_bench.step.dependOn(&install_collect_bench.step);
     if (b.args) |args| run_collect_bench.addArgs(args);
     const collect_bench_step = b.step("collect-bench", "Run a WHERE-filtered, projected scan that collects matches (pure Zig, for a fair xan/qsv comparison with no Python/ctypes layer)");
     collect_bench_step.dependOn(&run_collect_bench.step);
@@ -136,9 +150,9 @@ pub fn build(b: *std.Build) void {
     });
     parser_bench.root_module.addImport("json_parser", json_parser_mod);
     parser_bench.linkLibC();
-    b.installArtifact(parser_bench);
+    const install_parser_bench = b.addInstallArtifact(parser_bench, .{});
     const run_parser_bench = b.addRunArtifact(parser_bench);
-    run_parser_bench.step.dependOn(b.getInstallStep());
+    run_parser_bench.step.dependOn(&install_parser_bench.step);
     if (b.args) |args| run_parser_bench.addArgs(args);
     const parser_bench_step = b.step("parser-bench", "Isolated json_parser.zig throughput (no Query/NdjsonScanner layer)");
     parser_bench_step.dependOn(&run_parser_bench.step);
@@ -157,9 +171,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tok_bench.root_module.addImport("json_simd", json_simd_mod);
-    b.installArtifact(tok_bench);
+    const install_tok_bench = b.addInstallArtifact(tok_bench, .{});
     const run_tok_bench = b.addRunArtifact(tok_bench);
-    run_tok_bench.step.dependOn(b.getInstallStep());
+    run_tok_bench.step.dependOn(&install_tok_bench.step);
     const tok_bench_step = b.step("tok-bench", "Isolated SIMD tokenizer throughput (no allocation, no field parsing)");
     tok_bench_step.dependOn(&run_tok_bench.step);
 
@@ -173,9 +187,9 @@ pub fn build(b: *std.Build) void {
     });
     bench.root_module.addImport("scanio", scanio_mod);
     bench.linkLibC();
-    b.installArtifact(bench);
+    const install_bench = b.addInstallArtifact(bench, .{});
     const run_bench = b.addRunArtifact(bench);
-    run_bench.step.dependOn(b.getInstallStep());
+    run_bench.step.dependOn(&install_bench.step);
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run the work-not-done benchmark");
     bench_step.dependOn(&run_bench.step);
@@ -184,12 +198,12 @@ pub fn build(b: *std.Build) void {
     // exercises the built shared library the way a real host loads it.
     // This is the equivalent of csvql's #149 regression guard — a
     // real dlopen(), not a compiled-and-trusted assumption.
-    const smoke_test = b.addSystemCommand(&.{ "python3", "examples/smoke_test.py" });
+    const smoke_test = b.addSystemCommand(&.{ python_cmd, "examples/smoke_test.py" });
     smoke_test.step.dependOn(c_lib_step);
     const smoke_test_step = b.step("smoke-test", "dlopen() the built C ABI shared library and exercise it for real (needs python3)");
     smoke_test_step.dependOn(&smoke_test.step);
 
-    const python_test = b.addSystemCommand(&.{ "python3", "python/tests/test_scan.py" });
+    const python_test = b.addSystemCommand(&.{ python_cmd, "python/tests/test_scan.py" });
     python_test.step.dependOn(c_lib_step);
     const python_test_step = b.step("python-test", "Run the Python binding test suite (needs python3)");
     python_test_step.dependOn(&python_test.step);

@@ -34,7 +34,11 @@ function candidateDirs() {
     if (parent === dir) break;
     dir = parent;
     if (fs.existsSync(path.join(dir, 'build.zig'))) {
+      // zig-out/lib on POSIX; on Windows the loadable .dll lands in
+      // zig-out/bin (zig-out/lib only gets the .lib import stub) — check
+      // both rather than special-case by platform.
       dirs.push(path.join(dir, 'zig-out', 'lib'));
+      dirs.push(path.join(dir, 'zig-out', 'bin'));
       break;
     }
   }

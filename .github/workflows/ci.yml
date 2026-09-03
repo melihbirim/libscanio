@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: zig build test
+        run: zig build test
+
+      - name: zig build c-lib (ReleaseFast)
+        run: zig build c-lib -Doptimize=ReleaseFast
+
+      - name: zig build smoke-test
+        run: zig build smoke-test
+
+      - name: zig build python-test
+        run: zig build python-test
+
+      - name: npm install (node binding)
+        working-directory: node
+        run: npm install
+
+      - name: zig build node-test
+        run: zig build node-test

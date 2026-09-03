@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            libdir: lib
+            libname: libscanio.so
+            asset: libscanio-linux-x86_64.so
+          - target: aarch64-linux-gnu
+            libdir: lib
+            libname: libscanio.so
+            asset: libscanio-linux-aarch64.so
+          - target: x86_64-macos
+            libdir: lib
+            libname: libscanio.dylib
+            asset: libscanio-macos-x86_64.dylib
+          - target: aarch64-macos
+            libdir: lib
+            libname: libscanio.dylib
+            asset: libscanio-macos-aarch64.dylib
+          - target: x86_64-windows-gnu
+            # The loadable .dll lands in zig-out/bin on Windows, not
+            # zig-out/lib (which only gets the .lib import stub) —
+            # verified by actually cross-compiling this target locally
+            # before trusting the workflow, not assumed.
+            libdir: bin
+            libname: scanio.dll
+            asset: libscanio-windows-x86_64.dll
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      # Cross-compiled from Linux for every target above — Zig ships its
+      # own bundled libc/linker for each, no native macOS/Windows machine
+      # needed to BUILD (only to RUN/verify, which ci.yml's matrix does
+      # separately against real runners).
+      - name: Build c-lib for ${{ matrix.target }}
+        run: zig build c-lib -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Rename artifact
+        run: cp zig-out/${{ matrix.libdir }}/${{ matrix.libname }} ${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

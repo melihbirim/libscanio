@@ -29,7 +29,12 @@ def _candidate_dirs() -> list[Path]:
     here = Path(__file__).resolve()
     for parent in here.parents:
         if (parent / "build.zig").exists():
+            # zig-out/lib on POSIX; on Windows the loadable .dll lands in
+            # zig-out/bin (zig-out/lib only gets the .lib import stub) —
+            # check both rather than special-case by platform, since it's
+            # harmless to check a dir that doesn't have the file.
             dirs.append(parent / "zig-out" / "lib")
+            dirs.append(parent / "zig-out" / "bin")
             break
 
     env_path = os.environ.get("LIBSCANIO_LIB_PATH")
