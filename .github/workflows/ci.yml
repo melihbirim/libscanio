@@ -57,3 +57,11 @@ jobs:
 
       - name: zig build node-test
         run: zig build node-test
+        env:
+          # Windows-only node-test failure hit here with zero output and
+          # exit code 5 (no JS stack trace at all — looks like a native
+          # crash inside koffi's own FFI engine, not a normal JS
+          # exception). Turned on for every platform, not just Windows —
+          # cheap, and this is exactly the kind of failure that needs the
+          # log from the run that actually reproduces it, not a guess.
+          LIBSCANIO_DEBUG: '1'

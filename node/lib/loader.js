@@ -55,7 +55,13 @@ function load() {
   for (const dir of candidateDirs()) {
     const candidate = path.join(dir, name);
     if (fs.existsSync(candidate)) {
+      if (process.env.LIBSCANIO_DEBUG) {
+        console.error(`[libscanio] loading ${candidate}`);
+      }
       cached = build(candidate);
+      if (process.env.LIBSCANIO_DEBUG) {
+        console.error('[libscanio] loaded successfully');
+      }
       return cached;
     }
   }

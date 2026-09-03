@@ -10,6 +10,16 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+
+process.on('uncaughtException', (e) => {
+  console.error('UNCAUGHT EXCEPTION:', e);
+  process.exit(1);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('UNHANDLED REJECTION:', e);
+  process.exit(1);
+});
+
 const libscanio = require('../lib/index');
 
 let passed = 0;
