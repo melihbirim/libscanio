@@ -2,6 +2,8 @@
 
 Node binding for [libscanio](../README.md) — scan CSV files without loading them into memory. Same shape as the Python binding, via [koffi](https://koffi.dev) (dynamic FFI, no native compilation step).
 
+**Platform support: macOS and Linux, verified in CI. Windows is a known gap, not silently missing** — `scanio_open()` crashes outright through koffi on Windows (traced to that exact call, root cause still unknown; two targeted fixes didn't resolve it). Everything else in this project works on Windows (Zig, the C ABI, the Python binding) — this is specifically a koffi-on-Windows issue. See [ROADMAP.md](../ROADMAP.md)'s M5b entry for the full investigation.
+
 ## Setup
 
 ```bash

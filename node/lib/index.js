@@ -34,12 +34,15 @@ const IN_RE = /^(\w+)\s+IN\s*\((.*)\)$/;
 /**
  * A zero-value COptions struct meaning "no columns, no WHERE, no limit,
  * no bound" — passed instead of JS `null` for scanio_open()'s options
- * parameter. Real bug found and fixed, not a style preference: passing
- * `null` there crashed scanio_open() outright on Windows (traced via
- * CI logging — the call never returned, every other platform was fine)
- * — a koffi-on-Windows null-struct-pointer marshaling issue, not
- * anything on the Zig/C ABI side. This sidesteps it entirely by never
- * passing a null pointer for that parameter at all.
+ * parameter. Cleaner and marginally safer than passing null either way,
+ * kept for that reason, but NOTE: this was originally written as a fix
+ * for a koffi crash on scanio_open() on Windows (traced via CI logging
+ * — the call never returned) on the theory that passing null for a
+ * typed struct pointer was the problem. It wasn't — the identical crash
+ * still happens with this non-null struct in place. Root cause is still
+ * unknown; Node binding tests are skipped on Windows in CI until it's
+ * actually diagnosed (see ci.yml and ROADMAP.md's M5b entry). Left in
+ * place since it's not wrong, just not the fix it was written to be.
  */
 const NO_OPTIONS = { columns: null, n_columns: 0, where: null, n_where: 0, limit: -1n, max_column: -1n };
 
