@@ -77,6 +77,23 @@ path yet; that gap is the actual lever left on the table (see
 [ROADMAP.md](../ROADMAP.md)'s M9 entry), not evidence libscanio's core loop
 is behind.
 
+## Scale: does RSS actually stay flat past 417MB?
+
+Every number above used the 417MB fixture. The core claim is "bounded
+regardless of file size" — worth checking against a file 20x bigger, not
+just asserting it extrapolates. `bench/.taxi-data/trips.csv` (also from
+csvql, same NYC taxi schema): 8.5GB, 20,000,000 rows.
+
+| file | size | peak RSS |
+|---|---|---|
+| sample.csv | 417MB | ~2.2MB |
+| trips.csv | 8.5GB | ~2.16-2.21MB (3 runs) |
+
+20x the file size, same peak RSS. Throughput held steady too (~2.1M
+rows/sec) — this file has a narrower/different column set than the 51-col
+sample, so its rows/sec isn't directly comparable to the filtered-scan
+numbers above, but the flat RSS is the actual point being checked here.
+
 ## Memory: chunked reads vs mmap/full-load
 
 See [DESIGN.md](DESIGN.md) for the full chunked-read rationale and the
