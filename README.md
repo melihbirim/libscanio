@@ -2,7 +2,7 @@
 
 Scan and filter structured data without loading it. Your family's RAM-friendly data scanner.
 
-**open → scan → process, regardless of file size.**
+**open → scan → process, regardless of file size.** Measured, not assumed: ~2.2MB peak RSS on a 417MB file, and still ~2.2MB on an 8.5GB one (20x the size, same memory) — see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project, limit, count, aggregates, top-K. Chunked reads, not mmap: peak memory tracks a fixed buffer size (~2MB), not the file size. See [docs/DESIGN.md](docs/DESIGN.md) for the numbers.
 
@@ -15,22 +15,22 @@ CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg ag
 ```python
 import libscanio
 
+# Real query from docs/BENCHMARKS.md, run against the actual 417MB/1M-row
+# fixture: 967,553 matches, 0.43s, 2.2MB peak RSS.
 for row in libscanio.scan(
-    "10gb.csv",
-    columns=["customer_id", "revenue"],
-    where="revenue > 1000",
-    limit=100,
+    "sample.csv",
+    columns=["trip_id", "cab_type"],
+    where="cab_type = yellow",
 ):
-    print(row)  # {'customer_id': '4821', 'revenue': '1050'}
+    print(row)  # {'trip_id': '649084905', 'cab_type': 'yellow'}
 ```
 
 ```zig
 const scanio = @import("scanio");
 
-var q = try scanio.Query.open(allocator, "10gb.csv", .{
-    .columns = &.{ 0, 2 }, // customer_id, revenue
-    .where = &.{scanio.Predicate.init(2, .gt, "1000")},
-    .limit = 100,
+var q = try scanio.Query.open(allocator, "sample.csv", .{
+    .columns = &.{ 0, 24 }, // trip_id, cab_type
+    .where = &.{scanio.Predicate.init(24, .eq, "yellow")},
 });
 defer q.deinit();
 while (try q.next()) |row| {
