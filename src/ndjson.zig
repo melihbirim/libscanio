@@ -58,6 +58,25 @@
 //! non-goals) and fail loudly with NestedValueNotSupported rather than
 //! silently stringifying — json_parser.zig can parse them, libscanio
 //! chooses not to expose them as flat row fields.
+//!
+//! Fourth finding: every measurement above (4.3-6.0M rows/sec) used a
+//! 3-4-field test fixture. A real 51-column NDJSON file (the same taxi
+//! CSV data used throughout this project, converted to NDJSON) measured
+//! 187K rows/sec — 23x slower for 17x more fields, the signature of
+//! O(n^2) cost, not O(n). Root cause: next() looped over every header
+//! key and called JsonObject.get() (a linear scan over the row's own
+//! fields) once per key — O(header.len * row.fields.len) per row. Fixed
+//! with `header_index`, a hash map from header key to column index built
+//! once at open(), turning the lookup into one pass over the row's OWN
+//! fields (O(row.fields.len) hash lookups) instead of one pass per
+//! header key. Isolated before AND after fixing it, not just trusted:
+//! parse-only (no lookup at all) measured 242K rows/sec on the same wide
+//! fixture — meaning the fixed lookup now costs ~13% overhead (210K vs
+//! 242K rows/sec), down from being the dominant cost entirely. The
+//! remaining 242K rows/sec ceiling is JSON parsing itself (tokenizing,
+//! escaping, building Field structs — costs that scale with field count
+//! regardless of lookup strategy), a different, harder lever than this
+//! one was.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const scan = @import("root.zig");
@@ -85,6 +104,18 @@ pub const NdjsonScanner = struct {
     /// at the start of every nextLine()/nextObject() call.
     line_scratch: std.ArrayListUnmanaged(u8),
     header: [][]const u8,
+    /// header key -> index, built once at open(). Real fix for a real
+    /// quadratic-cost bug: next() used to loop over every header key and
+    /// call JsonObject.get() (a linear scan over the row's own fields)
+    /// for each one — O(header.len * row.fields.len) per row. Fine for
+    /// the 3-4-field fixtures this was originally measured against
+    /// (4.3-6.0M rows/sec), but a real 51-column NDJSON file (taxi
+    /// fixture, converted from the same CSV data used everywhere else in
+    /// this project) measured 187K rows/sec — 23x slower for 17x more
+    /// fields, the signature of O(n^2), not O(n). This map turns the
+    /// lookup into one pass over the row's OWN fields (O(row.fields.len)
+    /// hash lookups) instead of one pass per header key.
+    header_index: std.StringHashMapUnmanaged(usize),
     /// The first row's raw JSON text, captured at open() time to derive
     /// the header. Replayed as the first next() call's row instead of
     /// re-reading it from the file (the chunked reader can't "rewind" a
@@ -137,6 +168,7 @@ pub const NdjsonScanner = struct {
             .eof = false,
             .line_scratch = .{},
             .header = &[_][]const u8{},
+            .header_index = .{},
             .first_row_line = &[_]u8{},
             .row_arena = std.heap.ArenaAllocator.init(allocator),
         };
@@ -164,12 +196,19 @@ pub const NdjsonScanner = struct {
             try keys.append(allocator, try allocator.dupe(u8, field.key));
         }
         scanner.header = try keys.toOwnedSlice(allocator);
+
+        try scanner.header_index.ensureTotalCapacity(allocator, @intCast(scanner.header.len));
+        for (scanner.header, 0..) |key, idx| {
+            scanner.header_index.putAssumeCapacity(key, idx);
+        }
+
         return scanner;
     }
 
     pub fn deinit(self: *NdjsonScanner) void {
         self.row_arena.deinit();
         self.parse_fields.deinit(self.allocator);
+        self.header_index.deinit(self.allocator);
         for (self.header) |k| self.allocator.free(k);
         self.allocator.free(self.header);
         self.allocator.free(self.first_row_line);
@@ -209,12 +248,16 @@ pub const NdjsonScanner = struct {
         ) catch return NdjsonError.InvalidJson;
 
         self.ensureCapacity(self.header.len);
-        for (self.header, 0..) |key, i| {
-            const val = obj.get(key) orelse {
-                self.field_buf[i] = "";
-                continue;
-            };
-            self.field_buf[i] = try render(val);
+        // One pass over THIS ROW's own fields (not the header) — see
+        // header_index's doc comment for why this replaced a per-header-
+        // key linear scan. Default every slot to "" first (a row missing
+        // a header key, or a header key this row never got a value
+        // written for below, both need that default) then overwrite only
+        // the ones this row actually has.
+        for (self.field_buf[0..self.header.len]) |*f| f.* = "";
+        for (obj.fields) |field| {
+            const idx = self.header_index.get(field.key) orelse continue;
+            self.field_buf[idx] = try render(field.value);
         }
         return Row{ .fields = self.field_buf[0..self.header.len] };
     }
@@ -534,3 +577,4 @@ test "json array: count() fast path counts objects without parsing fields" {
     defer s.deinit();
     try std.testing.expectEqual(@as(usize, 3), try s.countRemaining());
 }
+

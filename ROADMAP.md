@@ -38,6 +38,17 @@
 
   NDJSON's win is essentially free — same speed, 29x less memory, since line-splitting was never the bottleneck (JSON parsing dominates either way, unaffected by the I/O layer change — verified in isolation before trusting the headline number, since an earlier run of this same comparison showed a bogus 18x *slowdown* that turned out to be a stale, un-rebuilt benchmark binary, not a real regression). JSON array's win costs ~50% more time — the streaming brace-depth scan does genuinely more structural work per byte than one bulk convert pass followed by ordinary line-splitting did. Both are now bounded by chunk size regardless of file size, matching CSV and `cat`.
 
+  Later, real correction: every NDJSON/JSON-array throughput number above (4.3-6.0M rows/sec) used a 3-4-field test fixture. Measured against a real 51-column NDJSON file (the same taxi CSV data used everywhere in this project, converted to NDJSON) and got 187K rows/sec — 23x slower for 17x more fields, the signature of O(n^2) cost. Root cause: `next()` looped over every header key and called `JsonObject.get()` (a linear scan over the row's own fields) once per key. Fixed with `header_index` (`src/ndjson.zig`) — a hash map from header key to column index built once at `open()` — turning the lookup into one pass over each row's own fields instead of one pass per header key. Isolated before AND after fixing it: parse-only (no lookup at all) measured 242K rows/sec on the same wide fixture, meaning the fixed lookup now costs ~13% overhead (210K vs 242K rows/sec) instead of being the dominant cost. Narrow fixtures unaffected (4.1-4.3M rows/sec, unchanged). The remaining 242K rows/sec ceiling on wide rows is JSON parsing itself (tokenizing, escaping, building `Field` structs — costs that scale with field count regardless of lookup strategy), a different, harder lever than this one was — not attempted here.
+
+  | file (real taxi data, same 1M rows) | format | size | rows/sec | peak RSS |
+  |---|---|---|---|---|
+  | sample.csv | CSV | 417MB | ~2.1-2.2M | ~2.2MB |
+  | sample.ndjson (51 fields) | NDJSON | 1.47GB | ~205K | ~2.0-2.1MB |
+  | sample_array.json (51 fields) | JSON array | 1.47GB | ~132K | ~2.0-2.1MB |
+  | sample_narrow.ndjson (3 fields) | NDJSON | 70MB | ~4.1-4.3M | ~2.0MB |
+
+  Memory stays flat across every format and field count — the chunked-read design applies uniformly, not just to CSV. Speed does not: JSON's per-row parsing cost (SIMD tokenizing, escaping, object construction) that CSV's flat field-split never pays, plus JSON's own verbosity (repeating every key on every row — the 51-field NDJSON file is 3.5x the CSV file's size for the same data) explain most of the CSV-vs-JSON gap; JSON array trails NDJSON further (~1.5x slower) from the streaming brace-depth scan's real structural cost.
+
   Three real findings from actually measuring this, not assuming:
 
   1. The first implementation used `std.json.parseFromSlice` per line and measured 42K rows/sec vs CSV's 17M — 400x slower, building a full parse tree per row is real cost. Fixed by pulling in `json_parser.zig`/`json_simd.zig` from [zson](https://github.com/melihbirim/zson) (MIT, same author, vendored into `src/`) — a SIMD-tokenized, zero-copy JSON line parser already solving exactly this problem.
