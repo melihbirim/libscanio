@@ -20,8 +20,22 @@ const TopK = scan.TopK;
 
 const c_allocator = std.heap.c_allocator;
 
-threadlocal var last_error_buf: [512]u8 = undefined;
-threadlocal var last_error: ?[]const u8 = null;
+// NOT threadlocal, on purpose — real, reproduced bug, not a hypothetical
+// one: `threadlocal` here SIGSEGV'd on Linux inside the real dlopen()
+// smoke test (Python ctypes.CDLL(), the actual consumer path), zero
+// output before the crash. This is a known class of issue independent
+// of Zig — a shared library loaded via dlopen() at RUNTIME (not linked
+// at program startup) generally needs the "general dynamic" TLS model;
+// Zig's default model on Linux assumes "initial exec" (library present
+// at process startup), which SIGSEGVs when that assumption is false.
+// Same root cause as a documented RedHat KB issue for dlopen()+TLS in
+// general, not Zig-specific. Traded real thread-safety for
+// scanio_last_error() specifically (a race between threads could see
+// the wrong thread's error message) for the library actually working
+// when dlopen()'d — the scan operations themselves don't touch this
+// state, only the diagnostic error-message path does.
+var last_error_buf: [512]u8 = undefined;
+var last_error: ?[]const u8 = null;
 
 fn setError(comptime fmt: []const u8, args: anytype) void {
     last_error = std.fmt.bufPrint(&last_error_buf, fmt, args) catch "error (message too long)";

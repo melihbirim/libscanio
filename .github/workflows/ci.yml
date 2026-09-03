@@ -27,6 +27,17 @@ jobs:
         with:
           node-version: '20'
 
+      # Real failure hit here, not hypothetical: zig build test on
+      # macos-latest linked with "undefined symbol:
+      # __availability_version_check" and dozens of other libSystem
+      # symbols missing, even though the identical Zig version links
+      # fine on a real Mac. Known class of issue — some macOS runner
+      # images don't have SDKROOT pointed at a full SDK by default,
+      # which Zig's linker needs. Fixed by pointing it explicitly.
+      - name: Set macOS SDKROOT
+        if: runner.os == 'macOS'
+        run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+
       - name: zig build test
         run: zig build test
 

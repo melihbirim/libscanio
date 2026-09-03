@@ -16,10 +16,20 @@ import os
 import sys
 import tempfile
 
-lib_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.path.dirname(__file__), "..", "zig-out", "lib",
-    "libscanio.dylib" if sys.platform == "darwin" else "libscanio.so",
-)
+def _default_lib_path():
+    here = os.path.dirname(__file__)
+    if sys.platform == "win32":
+        # The loadable .dll lands in zig-out/bin on Windows, not
+        # zig-out/lib (which only gets the .lib import stub) — real bug
+        # found running this in CI: this used to fall through to the
+        # "else" branch below and look for a nonexistent libscanio.so.
+        return os.path.join(here, "..", "zig-out", "bin", "scanio.dll")
+    if sys.platform == "darwin":
+        return os.path.join(here, "..", "zig-out", "lib", "libscanio.dylib")
+    return os.path.join(here, "..", "zig-out", "lib", "libscanio.so")
+
+
+lib_path = sys.argv[1] if len(sys.argv) > 1 else _default_lib_path()
 
 lib = ctypes.CDLL(lib_path)
 
