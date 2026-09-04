@@ -118,6 +118,23 @@ pub fn build(b: *std.Build) void {
     const count_bench_step = b.step("count-bench", "Run Query.count()'s no-WHERE fast path (for xan/duckdb count comparison)");
     count_bench_step.dependOn(&run_count_bench.step);
 
+    const scan_bench = b.addExecutable(.{
+        .name = "scan_bench",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/scan_bench.zig"),
+        }),
+    });
+    scan_bench.root_module.addImport("scanio", scanio_mod);
+    scan_bench.linkLibC();
+    const install_scan_bench = b.addInstallArtifact(scan_bench, .{});
+    const run_scan_bench = b.addRunArtifact(scan_bench);
+    run_scan_bench.step.dependOn(&install_scan_bench.step);
+    if (b.args) |args| run_scan_bench.addArgs(args);
+    const scan_bench_step = b.step("scan-bench", "Run a WHERE-filtered materialized scan (scan_array()-equivalent, for concurrency comparison)");
+    scan_bench_step.dependOn(&run_scan_bench.step);
+
     const parallel_bench = b.addExecutable(.{
         .name = "parallel_bench",
         .root_module = b.createModule(.{

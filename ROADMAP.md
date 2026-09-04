@@ -185,10 +185,43 @@ Correctness must be verified before any performance claim. Datasets: 10 MB / 100
 
 Two findings worth keeping, not just the numbers: (1) full materialization is the actual cost driver, not parsing speed — Node's JSON tools all load the whole file into one string then build a JS object per record, so memory scales with file size regardless of how fast the byte-level parsing is, and hits a hard wall well under 2GB. libscanio never does either (chunked reads, C-land row buffers, only matched rows cross into consumer memory) — that's why it wins on speed too, not just memory. (2) A fast native library doesn't imply a fast binding — `simdjson` wraps the fastest JSON parser that exists and still lost to plain `JSON.parse` by ~6x, because the N-API marshaling boundary plus still-necessary JS object construction ate the SIMD advantage entirely. Same root cause, different ecosystem, as this session's own koffi-vs-ctypes findings on the Windows Node work (M5b) — the binding layer, not the parser, was the bottleneck both times.
 
+## N-way concurrency experiment (per-query memory under concurrent load)
+
+Motivated by an outside-eye question ("what's the actual research angle here, not just 'fast CSV parser'?"): every benchmark in this file up to now measured ONE query at a time — the traditional single-analyst-one-big-query shape every CSV/DB benchmark is built around. Agent tool-calling is structurally different: many independent, small, frequent queries, often concurrent (a fleet of agents, parallel subagent tool calls, many sandboxed sessions sharing one host). Peak memory for ONE query doesn't answer "how many of these can run at once on a memory-constrained host" — that's a different, unmeasured axis. Real experiment, not assumed: launch N independent, single-threaded processes simultaneously (each unaware of the others, `threads=1` on both sides to isolate memory scaling from CPU-parallelism confounds), measure peak COMBINED RSS across all N plus total wall time, N = 1/2/4/8/16/32. Real 500MB slice of the real `~/code/sieswi/fixtures/ecommerce_10gb.csv` fixture (`/tmp/bench_500mb.csv`, 6.22M rows, warm page cache both sides). Correctness verified first and under real concurrency (`matches=1244118` from every process, every N, both tasks).
+
+**Task 1 — bare WHERE-filtered count** (`libscanio`'s `filter_bench`, single-threaded, vs `duckdb -c "PRAGMA threads=1; SELECT count(*) ... WHERE ..."`):
+
+| N | libscanio wall / combined RSS | duckdb wall / combined RSS |
+|---|---|---|
+| 1 | 0.70s / 1.8MB | 2.37s / 86.8MB |
+| 2 | 0.64s / 3.8MB | 2.30s / 173.9MB |
+| 4 | 0.68s / 8.3MB | 2.44s / 347.8MB |
+| 8 | 0.71s / 15.5MB | 2.82s / 654.5MB |
+| 16 | 1.37s / 31.1MB | 4.75s / 1,300.2MB |
+| 32 | 2.65s / 65.0MB | 10.09s / 2,470.4MB |
+
+Both scale ~linearly in memory (expected — N independent processes), but the per-process constant differs by ~48x (libscanio ~2MB/query even under load, duckdb ~87MB/query even at `threads=1`). At N=32: 65MB total vs 2.47GB — 38x. Wall time degrades worse for duckdb too (4.3x slowdown N=1→32) than libscanio (3.8x) — and libscanio's baseline was already 3.4x faster, so the absolute gap widens sharply under concurrent load, not just the memory gap.
+
+**Task 2 — materialized filtered scan** (`libscanio`'s `scan_bench.zig`, new: single-threaded, duplicates every matching row's fields into memory — same cost class as `scan_array()`/`scanArray()`, NOT the bounded-memory `count()`/streaming `scan()` path — vs `duckdb -c "PRAGMA threads=1; COPY (SELECT * ... WHERE ...) TO '/dev/null' (FORMAT csv)"`, duckdb's own natural way to produce all matching rows: a streaming write, not full in-memory materialization):
+
+| N | libscanio wall / combined RSS | duckdb wall / combined RSS |
+|---|---|---|
+| 1 | 0.82s / 276.1MB | 4.50s / 88.6MB |
+| 2 | 0.91s / 367.0MB | 4.37s / 113.2MB |
+| 4 | 1.17s / 722.7MB | 4.39s / 225.9MB |
+| 8 | 1.30s / 1,057.2MB | 4.41s / 445.7MB |
+| 16 | 2.17s / 1,944.2MB | 4.48s / 879.9MB |
+| 32 | 4.90s / 2,756.0MB | 4.66s / 1,761.9MB |
+
+**This one reverses**, and it's the more important finding of the two, not a footnote: at N=32, libscanio's combined memory (2.76GB) is now HIGHER than duckdb's (1.76GB), and libscanio's wall time degrades badly under load (0.82s → 4.90s, ~6x) while duckdb's stays almost flat (4.50s → 4.66s). Root cause, consistent with what this codebase's own doc comments already say (`scanArray()`'s doc comment in `node/lib/index.js`: "not memory-bounded"): materializing EVERY matching row means duplicating it past the reused scan buffer — real, unavoidable memory cost that scales with (matches × N), same as any engine would pay. DuckDB's vectorized engine can stream matching rows straight to output without holding the whole result set in memory at once — a genuine architectural advantage for bulk output that libscanio's simpler row-at-a-time-then-copy model doesn't have. Also single-threaded DuckDB's near-flat wall time under N=32 concurrent COPY-to-null suggests its buffer/execution machinery amortizes far better under load than libscanio's per-process arena/copy overhead does — a real, not-yet-understood gap worth its own investigation, not just accepted.
+
+**Honest, sharper thesis after both experiments, not the naive "libscanio wins everything" version**: bounded-memory concurrency advantage lives specifically in the STREAMING/aggregate interface (`count()`, filtered `count()`, one-row-at-a-time `scan()` consumption, `topK()`, `aggregate()`) — the moment a caller asks for ALL matching rows materialized at once (`scan_array()`/`scanArray()`), the advantage shrinks and can reverse, because now the cost is dominated by (matches × N), not engine architecture. For an agent-tooling design (the paper's actual thesis, per `paper_plan` — not "fast CSV parser" but "why bounded-memory agent-facing data access is a distinct design point"), the real, falsifiable, now-measured recommendation is: prefer streaming/aggregate-shaped tool calls over bulk-materialize ones wherever the agent's actual question allows it (a count, a top-K, a single-column aggregate) — that's where the concurrency headroom genuinely exists; a bulk `scan_array()` call doesn't inherit it for free.
+
 ## Honest gaps
 
 Named directly, not left implicit — asked for an outside-eye assessment of the project and these are the real weak points that came out of it, not resolved yet:
 
+- **`scan_bench`'s wall-time degradation under N-way concurrent load (0.82s → 4.90s at N=32, ~6x) is unexplained.** The N-way concurrency experiment above surfaced it but didn't investigate WHY — allocator contention across N concurrent processes (each using `std.heap.c_allocator`), page-fault/TLB pressure from N processes each duplicating ~1.24M rows' worth of strings simultaneously, or something else. DuckDB's near-flat wall time under the same load (4.50s → 4.66s) for the equivalent task is the comparison point — understanding that gap is the natural next step, not just reporting the numbers.
 - **No fuzzing anywhere.** Every correctness check in this project so far is either a hand-written unit test or a comparison against a real fixture — none of it is property-based/fuzz testing (random/adversarial CSV, NDJSON, or JSON-array input hunting for parser crashes, infinite loops, or silent wrong answers). Given how much of this codebase is hand-written state machines over byte streams (CSV/NDJSON/JSON-array boundary tracking, parallel range-splitting), this is the highest-value gap to close next.
 - **JSON-array parallel path is under-tested on shape diversity.** Every real-scale benchmark and correctness check for `parallel.zig`'s JSON-array code ran against fixtures with zero escaped characters (no `\"`, no `\\`) — the escape-handling branches (`skip_next_byte` carrying an in-progress escape across a chunk boundary, `isEscapedAt`-based backslash-parity checks) are covered by small unit tests but never exercised at real multi-GB scale or under real-world messy data (user-generated text fields with actual escapes, unicode, etc.).
 - **Windows Node support is a known, unresolved crash.** `scanio_open()` crashes through koffi on Windows (see M5b) — diagnosed as far as pinpointing the exact call, two theories tried and disproven, no working fix. CI skips it rather than papering over it, but it's still an open gap for any Windows Node consumer.
