@@ -139,6 +139,25 @@ async function main() {
     const bottom1 = libscanio.topk(P, 'revenue', 1, null, false);
     check('topk: ascending', bottom1[0].customer_id, '1');
 
+    const orderedAsc = libscanio.orderBy(P, 'revenue');
+    check('orderBy: ascending, all rows', orderedAsc.map((r) => r.customer_id), ['1', '2', '3']);
+
+    const orderedDesc = libscanio.orderBy(P, 'revenue', null, true);
+    check('orderBy: descending', orderedDesc.map((r) => r.customer_id), ['3', '2', '1']);
+
+    const orderedFiltered = libscanio.orderBy(P, 'revenue', 'revenue > 1000', true);
+    check('orderBy: composes with where', orderedFiltered.map((r) => r.customer_id), ['3', '2']);
+
+    const orderedEmpty = libscanio.orderBy(P, 'revenue', 'revenue > 99999');
+    check('orderBy: empty result set', orderedEmpty, []);
+
+    const desc = await libscanio.describe(P);
+    check(
+      'describe: basic types',
+      Object.fromEntries(desc.map((d) => [d.column, d.type])),
+      { customer_id: 'integer', name: 'string', revenue: 'integer' }
+    );
+
     const prof = await libscanio.profile(P);
     check('profile: columns', prof.columns, ['customer_id', 'name', 'revenue']);
     check('profile: rowCount', prof.rowCount, 3);
@@ -238,6 +257,37 @@ async function main() {
   } finally {
     fs.unlinkSync(ND);
     fs.unlinkSync(JA);
+  }
+
+  // describe(): dedicated fixture covering every type category.
+  const DESC_P = path.join(os.tmpdir(), `libscanio_test_desc_${process.pid}.csv`);
+  fs.writeFileSync(
+    DESC_P,
+    'id,price,active,created_at,notes\n' +
+      '1,19.99,true,2023-05-26T22:00:00Z,\n' +
+      '2,29.50,false,2023-06-01T10:15:30Z,\n' +
+      '3,9.75,true,2023-07-04T00:00:00Z,\n'
+  );
+  try {
+    const descFull = Object.fromEntries((await libscanio.describe(DESC_P)).map((d) => [d.column, d.type]));
+    check('describe: float/boolean/datetime/empty', descFull, {
+      id: 'integer',
+      price: 'float',
+      active: 'boolean',
+      created_at: 'datetime',
+      notes: 'empty',
+    });
+  } finally {
+    fs.unlinkSync(DESC_P);
+  }
+
+  const ALNUM_P = path.join(os.tmpdir(), `libscanio_test_alnum_${process.pid}.csv`);
+  fs.writeFileSync(ALNUM_P, 'order_id,amount\nORD001,50\nORD002,1500\n');
+  try {
+    const descAlnum = Object.fromEntries((await libscanio.describe(ALNUM_P)).map((d) => [d.column, d.type]));
+    check('describe: alphanumeric ID column stays string, not integer', descAlnum, { order_id: 'string', amount: 'integer' });
+  } finally {
+    fs.unlinkSync(ALNUM_P);
   }
 
   console.log(`\n${passed}/${total} Node binding tests passed`);

@@ -1,7 +1,7 @@
 """
-libscanio MCP server — exposes scan/schema/profile/count/aggregate/topk
-as agent-callable tools over CSV files, without ever loading a file into
-memory (see ../docs/DESIGN.md).
+libscanio MCP server — exposes scan/schema/profile/count/aggregate/topk/
+order_by/describe as agent-callable tools over CSV files, without ever
+loading a file into memory (see ../docs/DESIGN.md).
 
 This file is deliberately thin: every tool is a direct pass-through to
 the libscanio Python binding (../python/libscanio). No filtering,
@@ -79,11 +79,40 @@ def topk(
 
 
 @server.tool()
+def order_by(
+    path: str,
+    column: str,
+    where: Optional[str] = None,
+    descending: bool = False,
+) -> list[dict[str, str]]:
+    """Every matching row, sorted by `column` (numeric if it parses as
+    one, string compare otherwise). Materializes the whole matching
+    result set before sorting — bounded by the FILTERED row count, not
+    the file size, same tradeoff aggregate()/topk() already accept. For
+    just the best/worst K rows, prefer topk() — it's one pass, not a
+    full sort, and doesn't materialize the whole result set first."""
+    return libscanio.order_by(path, column, where=where, descending=descending)
+
+
+@server.tool()
+def describe(path: str, sample_size: int = 1000) -> list[dict]:
+    """Column names + an inferred type per column (integer / float /
+    boolean / datetime / string / empty), sampled from the first
+    `sample_size` rows — bounded cost regardless of file size. A
+    heuristic, not a schema: a column consistent for `sample_size` rows
+    that changes shape further down won't be caught. Good first call
+    before deciding what to filter/aggregate/sort on for a file an agent
+    hasn't seen before."""
+    return libscanio.describe(path, sample_size=sample_size)
+
+
+@server.tool()
 def profile(path: str) -> dict:
     """Cheap first look at a file an agent hasn't seen before: columns,
     row count, and best-effort aggregates for columns that look numeric.
     Costs one full scan per numeric column found — fine as a one-off,
-    not something to call repeatedly on a wide file."""
+    not something to call repeatedly on a wide file. For inferred TYPES
+    per column (not just numeric-vs-not), prefer describe()."""
     return libscanio.profile(path)
 
 

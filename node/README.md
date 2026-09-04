@@ -33,6 +33,8 @@ for await (const row of libscanio.scan('10gb.csv', {
 - `count(path, where?)` — row count
 - `aggregate(path, column, where?)` — count/sum/min/max/avg
 - `topk(path, column, k, where?, descending?)` — best K rows by column, every column returned per row
+- `orderBy(path, column, where?, descending?)` — every matching row, sorted by column
+- `describe(path, sampleSize?)` — column names + inferred type per column (integer/float/boolean/datetime/string/empty), sampled from the first `sampleSize` rows
 - `profile(path)` — schema + row count + best-effort numeric-column aggregates
 
 WHERE syntax: `"col OP val [AND col OP val ...]"` or `"col IN (a, b, c)"`. Operators: `= != > >= < <= IN`. Only `AND` joins clauses.

@@ -20,6 +20,7 @@
 //! doesn't change the API.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const simd_count = @import("simd_count.zig");
 
 /// Default read-buffer size, overridable per-Scanner via ScannerOptions
 /// (and per-Query via QueryOptions.csv_chunk_size). Bigger = fewer read()
@@ -80,14 +81,26 @@ pub const OwnedRow = topk_mod.OwnedRow;
 pub const Entry = topk_mod.Entry;
 pub const topK = topk_mod.topK;
 
+const parallel_mod = @import("parallel.zig");
+pub const ParallelError = parallel_mod.ParallelError;
+pub const parallelCountRows = parallel_mod.parallelCountRows;
+pub const parallelCountRowsWhere = parallel_mod.parallelCountRowsWhere;
+
+const order_mod = @import("order.zig");
+pub const OrderedRows = order_mod.OrderedRows;
+pub const orderBy = order_mod.orderBy;
+
 test {
     _ = query_mod;
     _ = ndjson_mod;
     _ = aggregate_mod;
     _ = topk_mod;
+    _ = order_mod;
     _ = json_parser_mod;
     _ = json_simd_mod;
+    _ = parallel_mod;
     _ = json_array_mod;
+    _ = simd_count;
 }
 
 pub const Row = struct {
@@ -189,9 +202,15 @@ pub const Scanner = struct {
     /// Newline-only fast path for count() with no WHERE clause: reads
     /// through the rest of the file in chunks, counting '\n' without
     /// splitting a single field. Same bounded-memory property as next().
+    /// Counting itself is vectorized (simd_count.countByte) — the scalar
+    /// per-byte loop this replaced was measured against xan (Rust,
+    /// SIMD-backed byte search) on a real 10.46GB/130M-row file: xan
+    /// counted rows in 6.00s, this loop took 13.41s for the identical
+    /// operation — over 2x slower for pure byte comparison, nothing
+    /// CSV-specific about the cost. See simd_count.zig's doc comment.
     pub fn countRemaining(self: *Scanner) !usize {
         var n: usize = 0;
-        var saw_any_after_last_nl = false;
+        var last_byte: ?u8 = null;
         while (true) {
             if (self.buf_pos >= self.buf_len) {
                 if (self.eof) break;
@@ -199,18 +218,14 @@ pub const Scanner = struct {
                 if (self.buf_len == 0) break;
             }
             const chunk = self.buf[self.buf_pos..self.buf_len];
-            for (chunk) |c| {
-                if (c == '\n') {
-                    n += 1;
-                    saw_any_after_last_nl = false;
-                } else {
-                    saw_any_after_last_nl = true;
-                }
-            }
+            n += simd_count.countByte(chunk, '\n');
+            last_byte = chunk[chunk.len - 1];
             self.buf_pos = self.buf_len;
         }
         // A final row with no trailing newline still counts.
-        if (saw_any_after_last_nl) n += 1;
+        if (last_byte) |b| {
+            if (b != '\n') n += 1;
+        }
         return n;
     }
 
