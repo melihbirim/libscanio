@@ -83,6 +83,7 @@ const scan = @import("root.zig");
 const Row = scan.Row;
 const json_parser = @import("json_parser.zig");
 const json_array = @import("json_array.zig");
+const simd_count = @import("simd_count.zig");
 
 pub const NdjsonError = error{
     EmptyFile,
@@ -376,7 +377,7 @@ pub const NdjsonScanner = struct {
         }
         switch (self.mode) {
             .line_delimited => {
-                var saw_any_after_last_nl = false;
+                var last_byte: ?u8 = null;
                 while (true) {
                     if (self.buf_pos >= self.buf_len) {
                         if (self.eof) break;
@@ -384,17 +385,13 @@ pub const NdjsonScanner = struct {
                         if (self.buf_len == 0) break;
                     }
                     const chunk = self.buf[self.buf_pos..self.buf_len];
-                    for (chunk) |c| {
-                        if (c == '\n') {
-                            n += 1;
-                            saw_any_after_last_nl = false;
-                        } else {
-                            saw_any_after_last_nl = true;
-                        }
-                    }
+                    n += simd_count.countByte(chunk, '\n');
+                    last_byte = chunk[chunk.len - 1];
                     self.buf_pos = self.buf_len;
                 }
-                if (saw_any_after_last_nl) n += 1;
+                if (last_byte) |b| {
+                    if (b != '\n') n += 1;
+                }
             },
             .json_array => {
                 while (try self.nextObject()) |_| n += 1;

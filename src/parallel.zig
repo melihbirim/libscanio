@@ -35,6 +35,7 @@ const query_mod = @import("query.zig");
 const json_parser = @import("json_parser.zig");
 const topk_mod = @import("topk.zig");
 pub const OwnedRow = topk_mod.OwnedRow;
+const simd_count = @import("simd_count.zig");
 
 pub const ParallelError = error{EmptyFile};
 
@@ -126,23 +127,19 @@ fn countRange(file: std.fs.File, range: Range) !usize {
     var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
     var pos = range.start;
     var n: usize = 0;
-    var saw_any_after_last_nl = false;
+    var last_byte: ?u8 = null;
     while (pos < range.end) {
         const remaining: u64 = range.end - pos;
         const to_read: usize = @intCast(@min(@as(u64, buf.len), remaining));
         const read = try file.pread(buf[0..to_read], pos);
         if (read == 0) break;
-        for (buf[0..read]) |c| {
-            if (c == '\n') {
-                n += 1;
-                saw_any_after_last_nl = false;
-            } else {
-                saw_any_after_last_nl = true;
-            }
-        }
+        n += simd_count.countByte(buf[0..read], '\n');
+        last_byte = buf[read - 1];
         pos += read;
     }
-    if (saw_any_after_last_nl) n += 1;
+    if (last_byte) |b| {
+        if (b != '\n') n += 1;
+    }
     return n;
 }
 
