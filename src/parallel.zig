@@ -1414,12 +1414,23 @@ fn ndjsonScanColumnarWorkerRun(w: *NdjsonScanColumnarWorker) void {
 /// scan_bench.zig's own two-pass fix for the same idea at smaller
 /// scope) not pursued here since the actual measured cost driver was
 /// the many-small-allocations pattern, not this merge step.
-fn mergeColumnarWorkers(allocator: Allocator, n_cols: usize, comptime WorkerT: type, workers: []const WorkerT) !ColumnarScanResult {
+/// Frees each worker's ColumnBuf array right after its data is copied into
+/// `final_columns`, instead of the caller holding every worker's buffers
+/// alive until this whole function returns (Zig's `defer` in the caller
+/// would otherwise keep ALL of them allocated simultaneously with the
+/// growing final buffer — a real, measured near-2x transient memory peak
+/// during merge, found by comparing libscanio's actual peak RSS against
+/// pyarrow.dataset's on the same query: libscanio's RESULT data was
+/// comparable in size, but its peak RSS was far higher, and this was why).
+/// `workers` is consumed: every worker's ColumnBuf is deinitialized by the
+/// time this returns, success or error.
+fn mergeColumnarWorkers(allocator: Allocator, n_cols: usize, comptime WorkerT: type, workers: []WorkerT) !ColumnarScanResult {
     const final_columns = try newColumnBufs(allocator, n_cols);
     errdefer deinitColumnBufs(allocator, final_columns);
+    errdefer for (workers) |*w| deinitColumnBufs(allocator, w.columns);
 
     var total_rows: usize = 0;
-    for (workers) |w| {
+    for (workers) |*w| {
         for (0..n_cols) |ci| {
             const base: u32 = @intCast(final_columns[ci].data.items.len);
             try final_columns[ci].data.appendSlice(allocator, w.columns[ci].data.items);
@@ -1428,6 +1439,7 @@ fn mergeColumnarWorkers(allocator: Allocator, n_cols: usize, comptime WorkerT: t
             }
         }
         total_rows += w.n_rows;
+        deinitColumnBufs(allocator, w.columns);
     }
     return .{ .allocator = allocator, .columns = final_columns, .n_rows = total_rows, .n_cols = n_cols };
 }
@@ -1509,7 +1521,6 @@ pub fn parallelScanColumnar(
             for (workers) |w| deinitColumnBufs(allocator, w.columns);
             return e;
         }
-        defer for (workers) |w| deinitColumnBufs(allocator, w.columns);
         return mergeColumnarWorkers(allocator, n_cols, CsvScanColumnarWorker, workers);
     } else {
         var hdr = try buildNdjsonHeader(allocator, file, file_size);
@@ -1532,7 +1543,6 @@ pub fn parallelScanColumnar(
             for (workers) |w| deinitColumnBufs(allocator, w.columns);
             return e;
         }
-        defer for (workers) |w| deinitColumnBufs(allocator, w.columns);
         return mergeColumnarWorkers(allocator, n_cols, NdjsonScanColumnarWorker, workers);
     }
 }
