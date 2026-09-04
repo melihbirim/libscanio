@@ -33,6 +33,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const query_mod = @import("query.zig");
 const json_parser = @import("json_parser.zig");
+const topk_mod = @import("topk.zig");
+pub const OwnedRow = topk_mod.OwnedRow;
 
 pub const ParallelError = error{EmptyFile};
 
@@ -636,6 +638,250 @@ pub fn parallelCountRowsWhere(
     return total;
 }
 
+pub const ScannedRows = struct {
+    allocator: Allocator,
+    rows: []OwnedRow,
+
+    pub fn deinit(self: ScannedRows) void {
+        for (self.rows) |r| r.deinit();
+        self.allocator.free(self.rows);
+    }
+};
+
+const CsvScanCtx = struct {
+    allocator: Allocator,
+    delimiter: u8,
+    predicates: []const query_mod.Predicate,
+    field_buf: std.ArrayListUnmanaged([]const u8) = .{},
+    rows: std.ArrayListUnmanaged(OwnedRow) = .{},
+
+    fn onLine(self: *CsvScanCtx, line: []const u8) !void {
+        self.field_buf.clearRetainingCapacity();
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i <= line.len) : (i += 1) {
+            if (i == line.len or line[i] == self.delimiter) {
+                try self.field_buf.append(self.allocator, line[start..i]);
+                start = i + 1;
+            }
+        }
+        const scan = @import("root.zig");
+        const row = scan.Row{ .fields = self.field_buf.items };
+        if (query_mod.matches(row, self.predicates)) {
+            try self.rows.append(self.allocator, try topk_mod.copyRow(self.allocator, row));
+        }
+    }
+};
+
+const CsvScanWorker = struct {
+    allocator: Allocator,
+    file: std.fs.File,
+    range: Range,
+    delimiter: u8,
+    predicates: []const query_mod.Predicate,
+    rows: []OwnedRow = &.{},
+    err: ?anyerror = null,
+};
+
+fn csvScanWorkerRun(w: *CsvScanWorker) void {
+    var ctx = CsvScanCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates };
+    defer ctx.field_buf.deinit(w.allocator);
+    forEachLineInRange(w.allocator, w.file, w.range, CsvScanCtx, &ctx, CsvScanCtx.onLine) catch |e| {
+        for (ctx.rows.items) |r| r.deinit();
+        ctx.rows.deinit(w.allocator);
+        w.err = e;
+        return;
+    };
+    w.rows = ctx.rows.toOwnedSlice(w.allocator) catch |e| {
+        for (ctx.rows.items) |r| r.deinit();
+        ctx.rows.deinit(w.allocator);
+        w.err = e;
+        return;
+    };
+}
+
+const NdjsonScanCtx = struct {
+    allocator: Allocator,
+    header_index: *const std.StringHashMapUnmanaged(usize),
+    predicates: []const query_mod.Predicate,
+    field_buf: [][]const u8,
+    arena: std.heap.ArenaAllocator,
+    rows: std.ArrayListUnmanaged(OwnedRow) = .{},
+
+    fn onLine(self: *NdjsonScanCtx, line: []const u8) !void {
+        if (line.len == 0) return;
+        _ = self.arena.reset(.retain_capacity);
+        const obj = json_parser.parseObject(line, self.arena.allocator()) catch return;
+        for (self.field_buf) |*f| f.* = "";
+        for (obj.fields) |field| {
+            const idx = self.header_index.get(field.key) orelse continue;
+            self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+        }
+        const scan = @import("root.zig");
+        const row = scan.Row{ .fields = self.field_buf };
+        if (query_mod.matches(row, self.predicates)) {
+            try self.rows.append(self.allocator, try topk_mod.copyRow(self.allocator, row));
+        }
+    }
+};
+
+const NdjsonScanWorker = struct {
+    allocator: Allocator,
+    file: std.fs.File,
+    range: Range,
+    header: [][]const u8,
+    header_index: *const std.StringHashMapUnmanaged(usize),
+    predicates: []const query_mod.Predicate,
+    rows: []OwnedRow = &.{},
+    err: ?anyerror = null,
+};
+
+fn ndjsonScanWorkerRun(w: *NdjsonScanWorker) void {
+    const field_buf = w.allocator.alloc([]const u8, w.header.len) catch |e| {
+        w.err = e;
+        return;
+    };
+    var ctx = NdjsonScanCtx{
+        .allocator = w.allocator,
+        .header_index = w.header_index,
+        .predicates = w.predicates,
+        .field_buf = field_buf,
+        .arena = std.heap.ArenaAllocator.init(w.allocator),
+    };
+    defer {
+        ctx.arena.deinit();
+        w.allocator.free(field_buf);
+    }
+    forEachLineInRange(w.allocator, w.file, w.range, NdjsonScanCtx, &ctx, NdjsonScanCtx.onLine) catch |e| {
+        for (ctx.rows.items) |r| r.deinit();
+        ctx.rows.deinit(w.allocator);
+        w.err = e;
+        return;
+    };
+    w.rows = ctx.rows.toOwnedSlice(w.allocator) catch |e| {
+        for (ctx.rows.items) |r| r.deinit();
+        ctx.rows.deinit(w.allocator);
+        w.err = e;
+        return;
+    };
+}
+
+/// Materialized WHERE-filtered row scan — parallel equivalent of the
+/// bindings' scanArray() (Python/Node), brought down into Zig core so
+/// it's available to any consumer, not just those two. Same
+/// CSV-parallel/NDJSON-parallel/JSON-array-delegates-to-Query split as
+/// parallelCountRowsWhere() (see its doc comment for the JSON-array
+/// reasoning), same OwnedRow-copying cost topK()/orderBy() already
+/// accept (a matched row has to survive past the worker's own reused
+/// line buffer). Result order: workers' rows concatenated in RANGE
+/// order (worker 0's matches, then worker 1's, ...) — NOT a promised
+/// global merge back to exact file order, a deliberate choice (asked,
+/// not assumed) since most callers of a parallel bulk scan don't need
+/// it and enforcing it would cost a real ordering pass for no benefit
+/// to those callers. `predicates.len == 0` still filters nothing (scans
+/// every row) — unlike parallelCountRowsWhere(), there's no cheaper
+/// "fast path" available for the no-WHERE case here (every row has to
+/// be materialized regardless), so no special-casing.
+pub fn parallelScan(
+    allocator: Allocator,
+    path: []const u8,
+    delimiter: u8,
+    predicates: []const query_mod.Predicate,
+    num_threads_in: usize,
+) !ScannedRows {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const file_size = (try file.stat()).size;
+    if (file_size == 0) return ParallelError.EmptyFile;
+
+    if (try sniffFormat(file, file_size) == .json_array) {
+        const scan = @import("root.zig");
+        var q = try scan.Query.open(allocator, path, .{ .where = predicates, .format = .ndjson });
+        defer q.deinit();
+        var rows: std.ArrayListUnmanaged(OwnedRow) = .{};
+        errdefer {
+            for (rows.items) |r| r.deinit();
+            rows.deinit(allocator);
+        }
+        while (try q.next()) |row| {
+            try rows.append(allocator, try topk_mod.copyRow(allocator, row));
+        }
+        return .{ .allocator = allocator, .rows = try rows.toOwnedSlice(allocator) };
+    }
+
+    const is_csv = query_mod.inferFormat(path) == .csv;
+    const data_start: u64 = if (is_csv) try alignForwardToNewline(file, allocator, 0, file_size) else 0;
+    if (data_start >= file_size) return .{ .allocator = allocator, .rows = &.{} };
+
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const requested = if (num_threads_in == 0) cpu_count else num_threads_in;
+    const data_len = file_size - data_start;
+    const num_threads = @max(1, @min(requested, data_len));
+
+    const ranges = try splitRangesFrom(allocator, file, data_start, file_size, num_threads);
+    defer allocator.free(ranges);
+
+    var total_rows: std.ArrayListUnmanaged(OwnedRow) = .{};
+    errdefer {
+        for (total_rows.items) |r| r.deinit();
+        total_rows.deinit(allocator);
+    }
+
+    if (is_csv) {
+        const workers = try allocator.alloc(CsvScanWorker, num_threads);
+        defer allocator.free(workers);
+        const threads = try allocator.alloc(std.Thread, num_threads);
+        defer allocator.free(threads);
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates };
+        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, csvScanWorkerRun, .{&workers[i]});
+        for (threads) |t| t.join();
+
+        var first_err: ?anyerror = null;
+        for (workers) |w| {
+            if (w.err) |e| first_err = e;
+        }
+        if (first_err) |e| {
+            for (workers) |w| {
+                for (w.rows) |r| r.deinit();
+                if (w.rows.len > 0) allocator.free(w.rows);
+            }
+            return e;
+        }
+        for (workers) |w| {
+            try total_rows.appendSlice(allocator, w.rows);
+            if (w.rows.len > 0) allocator.free(w.rows);
+        }
+    } else {
+        var hdr = try buildNdjsonHeader(allocator, file, file_size);
+        defer hdr.deinit();
+        const workers = try allocator.alloc(NdjsonScanWorker, num_threads);
+        defer allocator.free(workers);
+        const threads = try allocator.alloc(std.Thread, num_threads);
+        defer allocator.free(threads);
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
+        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, ndjsonScanWorkerRun, .{&workers[i]});
+        for (threads) |t| t.join();
+
+        var first_err: ?anyerror = null;
+        for (workers) |w| {
+            if (w.err) |e| first_err = e;
+        }
+        if (first_err) |e| {
+            for (workers) |w| {
+                for (w.rows) |r| r.deinit();
+                if (w.rows.len > 0) allocator.free(w.rows);
+            }
+            return e;
+        }
+        for (workers) |w| {
+            try total_rows.appendSlice(allocator, w.rows);
+            if (w.rows.len > 0) allocator.free(w.rows);
+        }
+    }
+
+    return .{ .allocator = allocator, .rows = try total_rows.toOwnedSlice(allocator) };
+}
+
 test "parallelCountRows matches single-thread count on a small file" {
     const allocator = std.testing.allocator;
     const path = "test_parallel_small.csv";
@@ -939,4 +1185,122 @@ test "parallelCountRowsWhere: JSON array, pretty-printed multi-line still filter
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
     try std.testing.expectEqual(@as(usize, 2), try parallelCountRowsWhere(allocator, path, ',', &predicates, 4));
+}
+
+test "parallelScan: CSV, single-threaded returns matching rows with full field data" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_scan_csv.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city,amount\n1,Austin,50\n2,Denver,1500\n3,Austin,900\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+    var result = try parallelScan(allocator, path, ',', &predicates, 1);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("1", result.rows[0].get(0).?);
+    try std.testing.expectEqualStrings("Austin", result.rows[0].get(1).?);
+    try std.testing.expectEqualStrings("50", result.rows[0].get(2).?);
+    try std.testing.expectEqualStrings("3", result.rows[1].get(0).?);
+}
+
+test "parallelScan: CSV, no predicates returns every row" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_scan_csv_all.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id\n1\n2\n3\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var result = try parallelScan(allocator, path, ',', &.{}, 4);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+}
+
+test "parallelScan: CSV, real multi-chunk file — result set matches Query.count(), every row's own fields are internally consistent" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_scan_csv_large.csv";
+
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "id,city,amount\n");
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) {
+        const city = if (i % 3 == 0) "Austin" else "Denver";
+        try data.writer(allocator).print("{d},{s},{d}\n", .{ i, city, i * 3 });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const scan = @import("root.zig");
+    var q = try scan.Query.open(allocator, path, .{ .where = &.{scan.Predicate.init(1, .eq, "Austin")} });
+    defer q.deinit();
+    const expected_count = try q.count();
+
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+    var result = try parallelScan(allocator, path, ',', &predicates, 8);
+    defer result.deinit();
+
+    try std.testing.expectEqual(expected_count, result.rows.len);
+    // Every returned row's own id/city/amount fields must be mutually
+    // consistent (amount == id*3, city == "Austin") — catches a wrong
+    // field_buf/header mapping even if the COUNT happens to be right.
+    for (result.rows) |row| {
+        try std.testing.expectEqualStrings("Austin", row.get(1).?);
+        const id = try std.fmt.parseInt(usize, row.get(0).?, 10);
+        const amount = try std.fmt.parseInt(usize, row.get(2).?, 10);
+        try std.testing.expectEqual(id * 3, amount);
+    }
+}
+
+test "parallelScan: NDJSON matches Query result set, fields internally consistent" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_scan_ndjson.ndjson";
+
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    var i: usize = 0;
+    while (i < 50_000) : (i += 1) {
+        const city = if (i % 4 == 0) "Austin" else "Denver";
+        try data.writer(allocator).print("{{\"id\":{d},\"city\":\"{s}\",\"amount\":{d}}}\n", .{ i, city, i * 5 });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const scan = @import("root.zig");
+    var q = try scan.Query.open(allocator, path, .{ .where = &.{scan.Predicate.init(1, .eq, "Austin")} });
+    defer q.deinit();
+    const expected_count = try q.count();
+
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+    var result = try parallelScan(allocator, path, ',', &predicates, 8);
+    defer result.deinit();
+
+    try std.testing.expectEqual(expected_count, result.rows.len);
+    for (result.rows) |row| {
+        try std.testing.expectEqualStrings("Austin", row.get(1).?);
+        const id = try std.fmt.parseInt(usize, row.get(0).?, 10);
+        const amount = try std.fmt.parseInt(usize, row.get(2).?, 10);
+        try std.testing.expectEqual(id * 5, amount);
+    }
+}
+
+test "parallelScan: JSON array matches Query result set" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_scan_json_array.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "[{\"id\":1,\"city\":\"Austin\"},{\"id\":2,\"city\":\"Denver\"},{\"id\":3,\"city\":\"Austin\"}]" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+    var result = try parallelScan(allocator, path, ',', &predicates, 4);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+}
+
+test "parallelScan: empty file returns EmptyFile" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_scan_empty.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    try std.testing.expectError(ParallelError.EmptyFile, parallelScan(allocator, path, ',', &.{}, 4));
 }
