@@ -96,4 +96,4 @@ Not a database, not a dataframe, not a SQL engine, no query optimizer, no distri
 
 ## License
 
-MIT — see [LICENSE.md](LICENSE.md).
+Apache-2.0 — see [LICENSE.md](LICENSE.md).

@@ -7,7 +7,7 @@
     "test": "node test/test.js"
   },
   "keywords": ["csv", "ndjson", "scan", "streaming"],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=18"
   },
