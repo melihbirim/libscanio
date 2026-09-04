@@ -8,7 +8,7 @@ CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project, limit, 
 
 ## Status
 
-CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, a C ABI, Python and [Node](node/) bindings, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No group-by or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
+CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, single-column ORDER BY, per-column type inference (`describe()`), a bounded-memory parallel scan/count/filtered-scan path (beats DuckDB on speed AND memory at every concurrency level measured — see ROADMAP.md), zero-copy Arrow output (`scan_table()`, Python), a C ABI, Python and [Node](node/) bindings, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No group-by, multi-column ORDER BY, or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
 
 ## Quickstart
 

@@ -33,16 +33,23 @@ def scan(
     where: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> list[dict[str, str]]:
-    """Scan a CSV file and return matching rows. Streams under the hood —
-    memory stays bounded regardless of file size — but this tool
+    """Scan a CSV file and return matching rows. This tool always
     materializes the result list to return it over MCP, so pass `limit`
     for a large file rather than pulling every row into one response.
+
+    Uses scan_array() under the hood, not scan()+list(): when `columns`
+    and `limit` are both unset, that dispatches to libscanio's real
+    multi-threaded parallel scan engine (measured faster AND leaner than
+    DuckDB at every concurrency level tested — see ROADMAP.md) instead
+    of draining a single-threaded row-at-a-time generator. `columns`/
+    `limit` still fall back to the single-threaded path (the parallel
+    engine doesn't support projection or a row limit yet).
 
     where: e.g. "revenue > 1000", "city = Austin AND revenue > 1000", or
     "color IN (yellow, green)". Operators: = != > >= < <= IN. Only AND
     joins clauses — no OR (IN covers "any of these values" without it).
     """
-    return list(libscanio.scan(path, columns=columns, where=where, limit=limit))
+    return libscanio.scan_array(path, columns=columns, where=where, limit=limit, as_dict=True)
 
 
 @server.tool()
