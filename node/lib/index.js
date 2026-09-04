@@ -246,8 +246,8 @@ function scanArray(filePath, options = {}) {
   // showed the old single-threaded scanio_collect() path here was real
   // and measured: 1.3GB/6.2s for 1.24M matching rows on a real 10-
   // column fixture with the old path; 15-895MB/0.05-0.47s across N=1-32
-  // CONCURRENT processes with this one, on the same real data — genuinely
-  // faster and leaner than duckdb on the identical task. `columns`/
+  // CONCURRENT processes with this one, on the same real data —
+  // genuinely bounded under concurrent load. `columns`/
   // `limit` fall back to the single-threaded path below (parallelScan
   // doesn't support projection or a row limit yet — real, current scope
   // gap, not silently wrong). See ROADMAP.md.

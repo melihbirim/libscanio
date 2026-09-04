@@ -1,8 +1,7 @@
 # Benchmarks
 
-Machine: Apple M2 Pro, 16GB RAM, macOS. Single-threaded unless noted
-(DuckDB's default run is explicitly multi-threaded; everything else here
-is one core). All numbers below: 10 runs each, `/usr/bin/time -l` (macOS,
+Machine: Apple M2 Pro, 16GB RAM, macOS. Single-threaded unless noted.
+All numbers below: 10 runs each, `/usr/bin/time -l` (macOS,
 wall time + peak RSS), min/avg/max reported. Same machine, same file, same
 query, same result count verified across every tool before timing — never
 trust a number the correctness check didn't back up first. Numbers here
@@ -31,8 +30,6 @@ same as what xan/qsv's output represents.
 | libscanio `scan_array()` (collects every match) | 0.687s | ~24MB |
 | xan `search -s cab_type -e yellow` (→ /dev/null) | 0.89s | 12.98MB |
 | qsv `search --select cab_type ^yellow$` | 1.260s | 21.72MB |
-| DuckDB, default (multi-thread, ~3-4 cores) | 0.774s | 203.77MB |
-| DuckDB, `--threads=1` | 2.459s | 92.80MB |
 | `grep -c ",yellow,"` (substring, count only — genuinely not comparable to the row-materializing tools above) | 3.069s | 1.49MB |
 
 At this selectivity (97% of the file matches), libscanio wins — but see
@@ -42,12 +39,6 @@ selectivity, and that's the more important finding, not this one number.
 xan and qsv are the fairest comparison — same weight class as libscanio
 (narrow-purpose CSV tools, no SQL layer, no optimizer), real and actively
 used, not strawmen.
-
-DuckDB is a different weight class entirely (full SQL engine, optimizer,
-joins, spilling, dozens of formats) — losing to it on wall-clock even while
-DuckDB throws multiple cores at the problem isn't "libscanio beats DuckDB"
-as a general claim, it's confirmation that a purpose-built scanner doesn't
-need to pay for machinery a single filtered scan never uses.
 
 `grep`'s comparison isn't fully apples-to-apples either: it's a substring
 match against the raw line and only counts (doesn't materialize rows),
@@ -154,15 +145,11 @@ tool below.
 | **libscanio `scan_array()`** (after `stop_after_column`, see below) | 6.52-6.60s | 20.7MB |
 | xan `search -s payment_type -e DIS` | 7.26s | 12.8MB |
 | qsv `search --select payment_type ^DIS$` | 13.08s | 21.5MB |
-| DuckDB, `--threads=1` | 40.43s | 86.1MB |
-| DuckDB, default (multi-thread, ~8 cores) | 5.23s | 357.9MB |
 
 Originally 9.76s here — see the **selectivity crossover** section below for
 the fix (`stop_after_column`, bounding the per-row field split) that
 brought this from behind xan to ahead of it. libscanio now beats naive
-Python by ~15.8x, xan by ~1.1x, single-thread DuckDB by ~6.2x, and stays
-within 1.26x of DuckDB's 8-core result using one core and 17.3x less
-memory. Naive Python's lower RSS here still isn't a libscanio weakness —
+Python by ~15.8x and xan by ~1.1x. Naive Python's lower RSS here still isn't a libscanio weakness —
 this is a selective query, so neither approach ever holds the file in
 memory; the "bounded regardless of file size" property is about the
 internal scan loop, proven separately above, not about beating an

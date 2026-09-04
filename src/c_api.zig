@@ -742,29 +742,18 @@ export fn scanio_collect_columnar_close(cc: ?*CollectColumnarCtx) void {
 /// scanio_collect_columnar() above — the real fix for scan_array()/
 /// scanArray()'s concurrent-memory problem (ROADMAP.md), not a
 /// standalone bench tool: scanio_collect_columnar() drains a single-
-/// threaded Ctx/Query one row at a time; this drives scan.parallelScan()
-/// instead (the same multi-threaded engine M9's parallelCountRowsWhere/
-/// parallelCountRows already use), then repacks its OwnedRow results
-/// into the identical (data, offsets) columnar layout so a Python caller
-/// doesn't need two different unpacking code paths depending on which
-/// collector produced the result.
+/// threaded Ctx/Query one row at a time; this drives
+/// parallel_mod.parallelScanColumnar() instead (the same multi-threaded
+/// engine M9's parallelCountRowsWhere/parallelCountRows already use),
+/// whose workers write directly into per-column (data, offsets) buffers
+/// — no OwnedRow intermediate, no per-field double copy (see
+/// parallelScanColumnar()'s own doc comment for that history).
 ///
 /// Takes path/predicates/delimiter directly (no `Ctx` — parallelScan
 /// owns its own file access, doesn't compose with an already-open
 /// single-threaded scanio_open() handle the way scanio_collect() does).
 /// `num_threads` == 0 means "use std.Thread.getCpuCount()", matching
 /// every other parallel_mod entry point's convention.
-///
-/// Known remaining inefficiency, not hidden: this copies each field
-/// TWICE — once into parallelScan's OwnedRow (duplicated so it survives
-/// each worker's reused scan buffer), once again into this function's
-/// columnar buffers. Correct and still dramatically faster/leaner than
-/// the single-threaded path it replaces (measured: 15-895MB / 0.05-0.47s
-/// across N=1-32 concurrent processes vs duckdb's 75-1758MB / 0.66-0.89s
-/// on the same real fixture — see ROADMAP.md) — but a further win is
-/// available by having parallelScan's workers write directly into
-/// per-column buffers instead of OwnedRow, skipping the double copy.
-/// Not done here; this ships the real multi-threading win first.
 export fn scanio_parallel_collect_columnar(
     path: ?[*:0]const u8,
     delimiter: u8,

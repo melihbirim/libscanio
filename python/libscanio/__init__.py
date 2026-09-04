@@ -250,8 +250,8 @@ def scan_array(
     path this replaced measured 1.3GB/6.2s for 1.24M matching rows on a
     real 10-column fixture; the multi-threaded path this uses now
     measured 15-895MB/0.05-0.47s across N=1-32 CONCURRENT processes on
-    the same real data — genuinely faster and leaner than duckdb on the
-    identical task, not just "less bad." `columns`/`limit` fall back to
+    the same real data — genuinely bounded under concurrent load, not
+    just "less bad." `columns`/`limit` fall back to
     the single-threaded path (parallelScan doesn't support projection or
     a row limit yet — real, current scope gap, not silently wrong).
     """

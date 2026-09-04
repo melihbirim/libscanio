@@ -5,8 +5,8 @@ const scanio = @import("scanio");
 /// object counting, never splits a field) — NOT the same thing
 /// mem_check.zig measures (a full next()-loop, splitting every field of
 /// every row). The two answer different questions: this one is the fair
-/// comparison to a tool like `xan count` or `duckdb SELECT count(*)`,
-/// which also don't parse fields for a bare count.
+/// comparison to a tool like `xan count`, which also doesn't parse
+/// fields for a bare count.
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
     const args = try std.process.argsAlloc(allocator);

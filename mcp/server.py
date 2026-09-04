@@ -39,11 +39,11 @@ def scan(
 
     Uses scan_array() under the hood, not scan()+list(): when `columns`
     and `limit` are both unset, that dispatches to libscanio's real
-    multi-threaded parallel scan engine (measured faster AND leaner than
-    DuckDB at every concurrency level tested — see ROADMAP.md) instead
-    of draining a single-threaded row-at-a-time generator. `columns`/
-    `limit` still fall back to the single-threaded path (the parallel
-    engine doesn't support projection or a row limit yet).
+    multi-threaded parallel scan engine (measured leaner than pyarrow
+    under N-way concurrent load — see ROADMAP.md) instead of draining a
+    single-threaded row-at-a-time generator. `columns`/`limit` still
+    fall back to the single-threaded path (the parallel engine doesn't
+    support projection or a row limit yet).
 
     where: e.g. "revenue > 1000", "city = Austin AND revenue > 1000", or
     "color IN (yellow, green)". Operators: = != > >= < <= IN. Only AND

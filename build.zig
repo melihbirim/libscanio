@@ -115,7 +115,7 @@ pub fn build(b: *std.Build) void {
     const run_count_bench = b.addRunArtifact(count_bench);
     run_count_bench.step.dependOn(&install_count_bench.step);
     if (b.args) |args| run_count_bench.addArgs(args);
-    const count_bench_step = b.step("count-bench", "Run Query.count()'s no-WHERE fast path (for xan/duckdb count comparison)");
+    const count_bench_step = b.step("count-bench", "Run Query.count()'s no-WHERE fast path (for xan count comparison)");
     count_bench_step.dependOn(&run_count_bench.step);
 
     const scan_bench = b.addExecutable(.{
