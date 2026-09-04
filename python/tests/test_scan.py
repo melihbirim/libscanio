@@ -155,6 +155,13 @@ try:
     ordered_empty = libscanio.order_by(P, "revenue", where="revenue > 99999")
     check("order_by: empty result set", ordered_empty, [])
 
+    desc = libscanio.describe(P)
+    check(
+        "describe: basic types",
+        {d["column"]: d["type"] for d in desc},
+        {"customer_id": "integer", "name": "string", "revenue": "integer"},
+    )
+
     prof = libscanio.profile(P)
     check("profile: columns", prof["columns"], ["customer_id", "name", "revenue"])
     check("profile: row_count", prof["row_count"], 3)
@@ -227,6 +234,41 @@ try:
 finally:
     os.unlink(ND)
     os.unlink(JA)
+
+
+# describe(): dedicated fixture covering every type category, not just
+# the integer/string columns the CSV fixture above happens to have.
+describe_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
+describe_tmp.write(
+    "id,price,active,created_at,notes\n"
+    "1,19.99,true,2023-05-26T22:00:00Z,\n"
+    "2,29.50,false,2023-06-01T10:15:30Z,\n"
+    "3,9.75,true,2023-07-04T00:00:00Z,\n"
+)
+describe_tmp.close()
+DESC_P = describe_tmp.name
+try:
+    desc_full = {d["column"]: d["type"] for d in libscanio.describe(DESC_P)}
+    check(
+        "describe: float/boolean/datetime/empty",
+        desc_full,
+        {"id": "integer", "price": "float", "active": "boolean", "created_at": "datetime", "notes": "empty"},
+    )
+finally:
+    os.unlink(DESC_P)
+
+alnum_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
+alnum_tmp.write("order_id,amount\nORD001,50\nORD002,1500\n")
+alnum_tmp.close()
+ALNUM_P = alnum_tmp.name
+try:
+    check(
+        "describe: alphanumeric ID column stays string, not integer",
+        {d["column"]: d["type"] for d in libscanio.describe(ALNUM_P)},
+        {"order_id": "string", "amount": "integer"},
+    )
+finally:
+    os.unlink(ALNUM_P)
 
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

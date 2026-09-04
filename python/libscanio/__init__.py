@@ -12,17 +12,20 @@ libscanio — scan huge CSV files without loading them into memory.
         print(row)  # {'customer_id': '4821', 'revenue': '1050'}
 
 Streaming by default — scan() is a generator, nothing is materialized
-until you iterate it. Values are always strings; libscanio has no type
-inference (same as raw CSV).
+until you iterate it. Values returned by scan()/scan_array() are always
+strings; libscanio does no type conversion there (same as raw CSV).
+describe() is the exception — a diagnostic, sampled TYPE GUESS per
+column, not a schema scan() itself relies on or enforces.
 """
 
 import ctypes
+import datetime
 import re
 from typing import Iterator, Optional, Sequence, Union
 
 from ._loader import CAgg, COptions, CPredicate, load
 
-__all__ = ["scan", "scan_array", "schema", "count", "aggregate", "topk", "order_by", "profile", "ScanError"]
+__all__ = ["scan", "scan_array", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
@@ -495,3 +498,89 @@ def profile(path: str, sample_limit: int = 1) -> dict:
         "row_count": total_rows,
         "numeric_columns": {col: aggregate(path, col) for col in numeric_cols},
     }
+
+
+# Conservative on purpose: unambiguous ISO-ish formats only. No MM/DD-vs-
+# DD/MM guessing (real ambiguity, no way to resolve it from the string
+# alone) and no locale-dependent month names. A column that doesn't match
+# any of these just falls through to "string" — a wrong "string"
+# classification is a missed nicety; a wrong "datetime" classification is
+# actively misleading, so the bar here favors false negatives.
+_DATETIME_FORMATS = (
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d",
+)
+
+
+def _infer_column_type(values: list[str]) -> str:
+    """`values`: non-empty sampled strings for one column. Checked most-
+    specific first (boolean, then integer, then float, then datetime),
+    ALL must match for that classification to apply — a bounded sample
+    is already forgiving of rare exceptions further down the file;
+    requiring every SAMPLED value to agree keeps false positives low."""
+    if not values:
+        return "empty"
+
+    if all(v.lower() in ("true", "false") for v in values):
+        return "boolean"
+
+    def is_int(v: str) -> bool:
+        try:
+            int(v)
+            return True
+        except ValueError:
+            return False
+
+    if all(is_int(v) for v in values):
+        return "integer"
+
+    def is_float(v: str) -> bool:
+        try:
+            float(v)
+            return True
+        except ValueError:
+            return False
+
+    if all(is_float(v) for v in values):
+        return "float"
+
+    def is_datetime(v: str) -> bool:
+        for fmt in _DATETIME_FORMATS:
+            try:
+                datetime.datetime.strptime(v, fmt)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    if all(is_datetime(v) for v in values):
+        return "datetime"
+
+    return "string"
+
+
+def describe(path: str, sample_size: int = 1000) -> list[dict]:
+    """Column names + an inferred type per column (integer / float /
+    boolean / datetime / string / empty), sampled from the first
+    `sample_size` rows — bounded cost regardless of file size, same
+    tradeoff profile()'s own numeric-column detection accepts.
+
+    This is a heuristic, not a schema: a column that's consistent for
+    `sample_size` rows and then changes shape further down won't be
+    caught (same limitation profile() already has for its numeric-column
+    detection). Datetime detection is deliberately conservative — a
+    small set of unambiguous ISO-ish formats, no MM/DD-vs-DD/MM guessing
+    — a wrong "string" classification is a missed nicety, a wrong
+    "datetime" one is actively misleading.
+    """
+    cols = schema(path)
+    sample_rows = list(scan(path, limit=sample_size))
+
+    result = []
+    for col in cols:
+        values = [r.get(col, "") for r in sample_rows]
+        non_empty = [v for v in values if v != ""]
+        result.append({"column": col, "type": _infer_column_type(non_empty)})
+    return result

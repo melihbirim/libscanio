@@ -469,4 +469,59 @@ async function profile(filePath, sampleLimit = 1) {
   return { columns: cols, rowCount: totalRows, numericColumns };
 }
 
-module.exports = { scan, scanArray, schema, count, aggregate, topk, orderBy, profile, ScanError };
+// Conservative on purpose: unambiguous ISO-ish formats only, checked with
+// a fixed regex per format rather than a general date parser (JS's Date
+// constructor accepts far more than real ISO 8601 and silently reinterprets
+// ambiguous strings) — no MM/DD-vs-DD/MM guessing, no locale-dependent
+// names. A wrong "string" classification is a missed nicety; a wrong
+// "datetime" one is actively misleading, so this favors false negatives.
+const DATETIME_PATTERNS = [
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/,
+  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,
+  /^\d{4}-\d{2}-\d{2}$/,
+];
+
+function isDatetime(v) {
+  return DATETIME_PATTERNS.some((re) => re.test(v)) && !Number.isNaN(Date.parse(v));
+}
+
+/**
+ * `values`: non-empty sampled strings for one column. Checked most-specific
+ * first (boolean, then integer, then float, then datetime) — ALL must
+ * match for that classification to apply, same reasoning as the Python
+ * binding's _infer_column_type(): a bounded sample is already forgiving of
+ * rare exceptions further down the file, so requiring every SAMPLED value
+ * to agree keeps false positives low.
+ */
+function inferColumnType(values) {
+  if (values.length === 0) return 'empty';
+  if (values.every((v) => v.toLowerCase() === 'true' || v.toLowerCase() === 'false')) return 'boolean';
+  if (values.every((v) => /^-?\d+$/.test(v))) return 'integer';
+  if (values.every((v) => v !== '' && !Number.isNaN(Number(v)))) return 'float';
+  if (values.every(isDatetime)) return 'datetime';
+  return 'string';
+}
+
+/**
+ * Column names + an inferred type per column (integer / float / boolean /
+ * datetime / string / empty), sampled from the first `sampleSize` rows —
+ * bounded cost regardless of file size, same tradeoff profile()'s own
+ * numeric-column detection accepts.
+ *
+ * A heuristic, not a schema: a column consistent for `sampleSize` rows
+ * that changes shape further down won't be caught. Datetime detection is
+ * deliberately conservative — see DATETIME_PATTERNS above.
+ */
+async function describe(filePath, sampleSize = 1000) {
+  const cols = schema(filePath);
+  const sampleRows = [];
+  for await (const row of scan(filePath, { limit: sampleSize })) sampleRows.push(row);
+
+  return cols.map((col) => {
+    const nonEmpty = sampleRows.map((r) => r[col] ?? '').filter((v) => v !== '');
+    return { column: col, type: inferColumnType(nonEmpty) };
+  });
+}
+
+module.exports = { scan, scanArray, schema, count, aggregate, topk, orderBy, profile, describe, ScanError };
