@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const query_mod = @import("query.zig");
 
 pub const ParallelError = error{EmptyFile};
 
@@ -173,15 +174,127 @@ fn parallelCountLines(allocator: Allocator, path: []const u8, num_threads_in: us
     return total;
 }
 
-/// Row count, header excluded — parallel equivalent of
-/// Query.count()'s no-WHERE fast path. `num_threads` == 0 means "use
-/// std.Thread.getCpuCount()". Correct for both CSV and NDJSON (both are
-/// one-record-per-line; JSON arrays are NOT supported here yet — their
-/// record boundary is a balanced `{...}`, not a newline, so line-count
-/// splitting doesn't apply without more work).
+/// Sniffs line-delimited (CSV, NDJSON) vs JSON-array from the first
+/// non-whitespace byte — same rule NdjsonScanner.openWithChunkSize()
+/// uses (see ndjson.zig), reimplemented here via a single small pread()
+/// instead of opening a full scanner just to read one byte. `.csv` is
+/// returned for anything that isn't a JSON-array (both CSV and NDJSON
+/// are one-record-per-line at the byte level, so they share the same
+/// newline-counting path below — this function only needs to tell JSON
+/// arrays apart from everything else).
+const SniffedFormat = enum { line_delimited, json_array };
+
+fn sniffFormat(file: std.fs.File, file_size: u64) !SniffedFormat {
+    var buf: [256]u8 = undefined;
+    const to_read: usize = @intCast(@min(@as(u64, buf.len), file_size));
+    const n = try file.pread(buf[0..to_read], 0);
+    for (buf[0..n]) |b| {
+        if (b == ' ' or b == '\t' or b == '\n' or b == '\r') continue;
+        return if (b == '[') .json_array else .line_delimited;
+    }
+    return .line_delimited; // all whitespace in the sniffed window — treat as the common case
+}
+
+/// Sequential (NOT parallel — see doc comment below) top-level object
+/// count for a JSON-array file. Same brace-depth/in-string/escape state
+/// machine as NdjsonScanner.nextObject() (ndjson.zig), reimplemented
+/// here over raw pread() chunks instead of a scanner's buffer, since
+/// this only needs a count, not materialized object text.
+///
+/// Why this isn't split across threads like the line-delimited path:
+/// a JSON array's Nth object boundary can only be found by tracking
+/// nesting depth from the START of the file — unlike a newline, which
+/// is self-describing at any byte offset, "is this `}` a top-level
+/// close or a nested one" depends on everything read so far. A correct
+/// parallel split would need a sequential pre-pass to find aligned
+/// boundaries anyway, and that pre-pass already IS the count (walking
+/// depth to find N boundaries costs the same as walking depth to find
+/// all of them) — so for bare counting specifically, splitting further
+/// buys nothing. It would start paying off for parallel WHERE-filtered
+/// scans or field extraction (the actually-expensive part per this
+/// session's NDJSON work), where per-object work dwarfs the boundary
+/// walk — not implemented here, out of scope for this slice.
+fn countJsonArrayObjects(file: std.fs.File, file_size: u64) !usize {
+    var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
+    var pos: u64 = 0;
+    var count: usize = 0;
+    var started = false;
+    var depth: usize = 0;
+    var in_string = false;
+    var escape = false;
+
+    while (pos < file_size) {
+        const remaining: u64 = file_size - pos;
+        const to_read: usize = @intCast(@min(@as(u64, buf.len), remaining));
+        const n = try file.pread(buf[0..to_read], pos);
+        if (n == 0) break;
+        for (buf[0..n]) |c| {
+            if (!started) {
+                if (c == '{') {
+                    started = true;
+                    depth = 1;
+                }
+                continue;
+            }
+            if (in_string) {
+                if (escape) {
+                    escape = false;
+                } else if (c == '\\') {
+                    escape = true;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '{') {
+                depth += 1;
+            } else if (c == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    count += 1;
+                    started = false;
+                }
+            }
+        }
+        pos += n;
+    }
+    return count;
+}
+
+/// Row count — parallel equivalent of Query.count()'s no-WHERE fast
+/// path. `num_threads` == 0 means "use std.Thread.getCpuCount()".
+/// Format is determined two ways, matching how the rest of libscanio
+/// does it (query.zig's inferFormat(), same extension rule): CSV has a
+/// header line that isn't a data row, NDJSON doesn't — get this wrong
+/// and every NDJSON file undercounts by exactly one row, which a naive
+/// "always subtract the header" version of this function did until a
+/// correctness test caught it (`.ndjson` test fixtures have no header
+/// line to subtract; CSV's does, and Scanner.open() already consumes it
+/// before Scanner.countRemaining() is ever called — this function has
+/// no Scanner instance, so it has to know which format it's counting,
+/// not just assume CSV's rule applies everywhere). Content is ALSO
+/// sniffed (not just extension) to catch JSON arrays specifically —
+/// `.json` files can legitimately be either NDJSON-lines or a JSON
+/// array, and a JSON array's record boundary is a balanced `{...}`, not
+/// a newline; routing those through newline-counting would silently
+/// miscount (over on a pretty-printed array, under on a minified one —
+/// both covered by this file's own tests).
 pub fn parallelCountRows(allocator: Allocator, path: []const u8, num_threads: usize) !usize {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const file_size = (try file.stat()).size;
+    if (file_size == 0) return ParallelError.EmptyFile;
+
+    if (try sniffFormat(file, file_size) == .json_array) {
+        return countJsonArrayObjects(file, file_size);
+    }
+
+    const has_header = query_mod.inferFormat(path) == .csv;
     const total_lines = try parallelCountLines(allocator, path, num_threads);
     if (total_lines == 0) return ParallelError.EmptyFile;
+    if (!has_header) return total_lines;
     return total_lines - 1;
 }
 
@@ -245,4 +358,110 @@ test "parallelCountRows matches single-thread count on a real multi-chunk-bounda
     const parallel_count = try parallelCountRows(allocator, path, 8);
     try std.testing.expectEqual(single_count, parallel_count);
     try std.testing.expectEqual(@as(usize, 200_000), parallel_count);
+}
+
+test "parallelCountRows: NDJSON (line-delimited) matches NdjsonScanner.countRemaining()" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_ndjson.ndjson";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+        \\{"id":1,"city":"Austin"}
+        \\{"id":2,"city":"Denver"}
+        \\{"id":3,"city":"Boston"}
+        \\
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const scan = @import("root.zig");
+    var single = try scan.NdjsonScanner.open(allocator, path);
+    defer single.deinit();
+    const single_count = try single.countRemaining();
+
+    const parallel_count = try parallelCountRows(allocator, path, 4);
+    try std.testing.expectEqual(single_count, parallel_count);
+    try std.testing.expectEqual(@as(usize, 3), parallel_count);
+}
+
+test "parallelCountRows: NDJSON on a real multi-chunk-boundary file matches single-thread" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_ndjson_large.ndjson";
+
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) {
+        try data.writer(allocator).print("{{\"id\":{d},\"name\":\"row-{d}\",\"amount\":{d}}}\n", .{ i, i, i * 7 });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const scan = @import("root.zig");
+    var single = try scan.NdjsonScanner.open(allocator, path);
+    defer single.deinit();
+    const single_count = try single.countRemaining();
+
+    const parallel_count = try parallelCountRows(allocator, path, 8);
+    try std.testing.expectEqual(single_count, parallel_count);
+    try std.testing.expectEqual(@as(usize, 100_000), parallel_count);
+}
+
+test "parallelCountRows: JSON array is NOT miscounted via newlines (pretty-printed, multi-line)" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_json_array_pretty.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+        \\[
+        \\  {
+        \\    "id": 1,
+        \\    "city": "Austin"
+        \\  },
+        \\  {
+        \\    "id": 2,
+        \\    "city": "Denver"
+        \\  },
+        \\  {
+        \\    "id": 3,
+        \\    "city": "Boston"
+        \\  }
+        \\]
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    // Naive newline counting would badly overcount this (13 lines, 3 objects) —
+    // the whole point of sniffFormat()/countJsonArrayObjects() existing.
+    try std.testing.expectEqual(@as(usize, 3), try parallelCountRows(allocator, path, 4));
+}
+
+test "parallelCountRows: JSON array minified onto one line still counts objects, not newlines" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_json_array_minified.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "[{\"id\":1},{\"id\":2},{\"id\":3},{\"id\":4}]" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    // Naive newline counting would badly undercount this (0 newlines, 4 objects).
+    try std.testing.expectEqual(@as(usize, 4), try parallelCountRows(allocator, path, 4));
+}
+
+test "parallelCountRows: JSON array matches NdjsonScanner.countRemaining() on a real multi-chunk file" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_json_array_large.json";
+
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "[");
+    var i: usize = 0;
+    while (i < 50_000) : (i += 1) {
+        if (i > 0) try data.appendSlice(allocator, ",");
+        try data.writer(allocator).print("{{\"id\":{d},\"name\":\"row-{d}, with a comma and \\\"quotes\\\"\",\"amount\":{d}}}", .{ i, i, i * 7 });
+    }
+    try data.appendSlice(allocator, "]");
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const scan = @import("root.zig");
+    var single = try scan.NdjsonScanner.open(allocator, path);
+    defer single.deinit();
+    const single_count = try single.countRemaining();
+
+    const parallel_count = try parallelCountRows(allocator, path, 8);
+    try std.testing.expectEqual(single_count, parallel_count);
+    try std.testing.expectEqual(@as(usize, 50_000), parallel_count);
 }

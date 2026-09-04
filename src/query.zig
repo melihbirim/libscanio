@@ -81,7 +81,7 @@ pub const QueryOptions = struct {
     stop_after_column: ?usize = null,
 };
 
-fn inferFormat(path: []const u8) Format {
+pub fn inferFormat(path: []const u8) Format {
     // .json routes here too, not just .ndjson/.jsonl: NdjsonScanner
     // sniffs array-vs-line-delimited from content, since a .json file
     // could legitimately be either.
