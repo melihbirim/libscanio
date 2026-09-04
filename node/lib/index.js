@@ -388,6 +388,54 @@ function topk(filePath, column, k, where = null, descending = true) {
 }
 
 /**
+ * Every matching row, sorted by `column` (numeric if the column parses as
+ * one, string compare otherwise — same rule `where`'s predicates already
+ * use). Materializes the whole matching result set before sorting, same
+ * memory tradeoff aggregate()/topk() already accept: bounded by the
+ * FILTERED row count, not the file size. See ROADMAP.md's M10 entry.
+ */
+function orderBy(filePath, column, where = null, descending = false) {
+  const { fns } = load();
+  const probe = fns.scanio_open(filePath, NO_OPTIONS);
+  if (!probe) raiseLastError(fns, `failed to open ${JSON.stringify(filePath)}`);
+  let colIdx;
+  try {
+    colIdx = resolveColumn(fns, probe, column);
+  } finally {
+    fns.scanio_close(probe);
+  }
+
+  const ctx = openFiltered(fns, filePath, where);
+  try {
+    const n = Number(fns.scanio_n_columns(ctx));
+    const names = Array.from({ length: n }, (_, i) => fns.scanio_column_name(ctx, i));
+
+    const octx = fns.scanio_order_by(ctx, colIdx, descending ? 1 : 0);
+    if (!octx) raiseLastError(fns, 'order_by failed');
+    try {
+      const results = [];
+      const fieldsPtr = [null];
+      const nOut = [0];
+      while (true) {
+        const rc = fns.scanio_order_by_next(octx, fieldsPtr, nOut);
+        if (rc === 0) break;
+        if (rc < 0) raiseLastError(fns, 'order_by failed');
+        const nFields = Number(nOut[0]);
+        const values = koffi.decode(fieldsPtr[0], 'str', nFields);
+        const row = {};
+        for (let i = 0; i < nFields; i++) row[names[i]] = values[i];
+        results.push(row);
+      }
+      return results;
+    } finally {
+      fns.scanio_order_by_close(octx);
+    }
+  } finally {
+    fns.scanio_close(ctx);
+  }
+}
+
+/**
  * A cheap overview for a caller deciding how to query a file it hasn't
  * seen before: column names, total row count, and best-effort aggregates
  * for columns that look numeric.
@@ -421,4 +469,4 @@ async function profile(filePath, sampleLimit = 1) {
   return { columns: cols, rowCount: totalRows, numericColumns };
 }
 
-module.exports = { scan, scanArray, schema, count, aggregate, topk, profile, ScanError };
+module.exports = { scan, scanArray, schema, count, aggregate, topk, orderBy, profile, ScanError };

@@ -138,6 +138,19 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_topk_close.argtypes = [ctypes.c_void_p]
     lib.scanio_topk_close.restype = None
 
+    lib.scanio_order_by.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    lib.scanio_order_by.restype = ctypes.c_void_p
+
+    lib.scanio_order_by_next.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.scanio_order_by_next.restype = ctypes.c_int
+
+    lib.scanio_order_by_close.argtypes = [ctypes.c_void_p]
+    lib.scanio_order_by_close.restype = None
+
     lib.scanio_collect.argtypes = [ctypes.c_void_p]
     lib.scanio_collect.restype = ctypes.c_void_p
 

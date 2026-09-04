@@ -139,6 +139,18 @@ async function main() {
     const bottom1 = libscanio.topk(P, 'revenue', 1, null, false);
     check('topk: ascending', bottom1[0].customer_id, '1');
 
+    const orderedAsc = libscanio.orderBy(P, 'revenue');
+    check('orderBy: ascending, all rows', orderedAsc.map((r) => r.customer_id), ['1', '2', '3']);
+
+    const orderedDesc = libscanio.orderBy(P, 'revenue', null, true);
+    check('orderBy: descending', orderedDesc.map((r) => r.customer_id), ['3', '2', '1']);
+
+    const orderedFiltered = libscanio.orderBy(P, 'revenue', 'revenue > 1000', true);
+    check('orderBy: composes with where', orderedFiltered.map((r) => r.customer_id), ['3', '2']);
+
+    const orderedEmpty = libscanio.orderBy(P, 'revenue', 'revenue > 99999');
+    check('orderBy: empty result set', orderedEmpty, []);
+
     const prof = await libscanio.profile(P);
     check('profile: columns', prof.columns, ['customer_id', 'name', 'revenue']);
     check('profile: rowCount', prof.rowCount, 3);

@@ -22,7 +22,7 @@ from typing import Iterator, Optional, Sequence, Union
 
 from ._loader import CAgg, COptions, CPredicate, load
 
-__all__ = ["scan", "scan_array", "schema", "count", "aggregate", "topk", "profile", "ScanError"]
+__all__ = ["scan", "scan_array", "schema", "count", "aggregate", "topk", "order_by", "profile", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
@@ -418,6 +418,42 @@ def topk(
                 results.append(row)
         finally:
             lib.scanio_topk_close(tctx)
+    finally:
+        lib.scanio_close(ctx)
+
+
+def order_by(
+    path: str,
+    column: str,
+    where: Optional[str] = None,
+    descending: bool = False,
+) -> list[dict[str, str]]:
+    """Every matching row, sorted by `column` (numeric if the column
+    parses as one, string compare otherwise — same rule scan()'s WHERE
+    clause already uses). Materializes the whole matching result set
+    before sorting, same memory tradeoff aggregate()/topk() already
+    accept: bounded by the FILTERED row count, not the file size."""
+    lib = load()
+    ctx, _keepalive = _open_filtered(lib, path, where)
+    try:
+        col_idx = _resolve_column(lib, ctx, column)
+        names = [lib.scanio_column_name(ctx, i).decode() for i in range(lib.scanio_n_columns(ctx))]
+        octx = lib.scanio_order_by(ctx, col_idx, 1 if descending else 0)
+        if not octx:
+            _raise_last_error(lib, "order_by failed")
+        try:
+            results = []
+            fields = ctypes.POINTER(ctypes.c_char_p)()
+            n = ctypes.c_size_t()
+            while True:
+                rc = lib.scanio_order_by_next(octx, ctypes.byref(fields), ctypes.byref(n))
+                if rc == 0:
+                    return results
+                if rc < 0:
+                    _raise_last_error(lib, "order_by failed")
+                results.append({names[i]: fields[i].decode() for i in range(n.value)})
+        finally:
+            lib.scanio_order_by_close(octx)
     finally:
         lib.scanio_close(ctx)
 

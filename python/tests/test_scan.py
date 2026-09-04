@@ -143,6 +143,18 @@ try:
     bottom1 = libscanio.topk(P, "revenue", 1, descending=False)
     check("topk: ascending", bottom1[0]["customer_id"], "1")
 
+    ordered_asc = libscanio.order_by(P, "revenue")
+    check("order_by: ascending, all rows", [r["customer_id"] for r in ordered_asc], ["1", "2", "3"])
+
+    ordered_desc = libscanio.order_by(P, "revenue", descending=True)
+    check("order_by: descending", [r["customer_id"] for r in ordered_desc], ["3", "2", "1"])
+
+    ordered_filtered = libscanio.order_by(P, "revenue", where="revenue > 1000", descending=True)
+    check("order_by: composes with where", [r["customer_id"] for r in ordered_filtered], ["3", "2"])
+
+    ordered_empty = libscanio.order_by(P, "revenue", where="revenue > 99999")
+    check("order_by: empty result set", ordered_empty, [])
+
     prof = libscanio.profile(P)
     check("profile: columns", prof["columns"], ["customer_id", "name", "revenue"])
     check("profile: row_count", prof["row_count"], 3)

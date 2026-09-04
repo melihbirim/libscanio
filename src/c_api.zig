@@ -411,6 +411,97 @@ export fn scanio_topk_close(tctx: ?*TopkCtx) void {
     c_allocator.destroy(t);
 }
 
+/// Owns a completed ORDER BY result plus the reusable NUL-terminated-copy
+/// buffers scanio_order_by_next() hands back — same shape as TopkCtx
+/// above, minus the sort key (ORDER BY has no separate "key" concept
+/// exposed to the caller the way top-K's ranking value is).
+const OrderByCtx = struct {
+    result: scan.OrderedRows,
+    index: usize = 0,
+    field_cstrs: [][]u8 = &.{},
+    field_ptrs: [][*:0]const u8 = &.{},
+
+    fn ensureFieldCapacity(self: *OrderByCtx, n: usize) void {
+        if (n <= self.field_cstrs.len) return;
+        const old_len = self.field_cstrs.len;
+        const grown_cstrs = c_allocator.realloc(self.field_cstrs, n) catch return;
+        self.field_cstrs = grown_cstrs;
+        for (self.field_cstrs[old_len..]) |*slot| slot.* = &.{};
+        const grown_ptrs = c_allocator.realloc(self.field_ptrs, n) catch return;
+        self.field_ptrs = grown_ptrs;
+    }
+};
+
+/// Runs ORDER BY over the REST of ctx's rows (same drains-the-query
+/// semantics as scanio_topk()/scanio_count()) and returns a handle to
+/// walk the sorted results via scanio_order_by_next(). Materializes
+/// every matching row before sorting — see order.zig's doc comment for
+/// why (peak memory scales with the filtered row count, not the file
+/// size — the same tradeoff scanio_topk()/scanio_aggregate() already
+/// accept, not a new one introduced here).
+export fn scanio_order_by(ctx: ?*Ctx, column: usize, descending: c_int) ?*OrderByCtx {
+    clearError();
+    const c = ctx orelse {
+        setError("scanner is null", .{});
+        return null;
+    };
+    const result = scan.orderBy(c_allocator, &c.query, column, descending != 0) catch |e| {
+        setError("order_by failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    const octx = c_allocator.create(OrderByCtx) catch {
+        var r = result;
+        r.deinit();
+        setError("out of memory allocating order_by context", .{});
+        return null;
+    };
+    octx.* = .{ .result = result };
+    return octx;
+}
+
+/// Walks the sorted results, one row at a time — same call shape as
+/// scanio_next()/scanio_topk_next(): 1 = row filled in, 0 = exhausted,
+/// -1 = error.
+export fn scanio_order_by_next(octx: ?*OrderByCtx, out_fields: ?*[*]const [*:0]const u8, out_n: ?*usize) c_int {
+    clearError();
+    const o = octx orelse {
+        setError("order_by context is null", .{});
+        return -1;
+    };
+    if (o.index >= o.result.rows.len) return 0;
+    const row = o.result.rows[o.index];
+    o.index += 1;
+
+    o.ensureFieldCapacity(row.fields.len);
+    for (row.fields, 0..) |field, i| {
+        if (o.field_cstrs[i].len < field.len + 1) {
+            const grown = c_allocator.realloc(o.field_cstrs[i], field.len + 1) catch {
+                setError("out of memory copying row", .{});
+                return -1;
+            };
+            o.field_cstrs[i] = grown;
+        }
+        @memcpy(o.field_cstrs[i][0..field.len], field);
+        o.field_cstrs[i][field.len] = 0;
+        o.field_ptrs[i] = @ptrCast(o.field_cstrs[i].ptr);
+    }
+
+    if (out_fields) |of| of.* = o.field_ptrs.ptr;
+    if (out_n) |on| on.* = row.fields.len;
+    return 1;
+}
+
+export fn scanio_order_by_close(octx: ?*OrderByCtx) void {
+    const o = octx orelse return;
+    o.result.deinit();
+    for (o.field_cstrs) |buf| {
+        if (buf.len > 0) c_allocator.free(buf);
+    }
+    if (o.field_cstrs.len > 0) c_allocator.free(o.field_cstrs);
+    if (o.field_ptrs.len > 0) c_allocator.free(o.field_ptrs);
+    c_allocator.destroy(o);
+}
+
 /// Owns a bulk-collected scan result: every matching row's fields,
 /// NUL-separated, row-major, in one contiguous buffer. Exists to let a
 /// caller (Python via ctypes) fetch the WHOLE result in a single bulk
@@ -705,6 +796,58 @@ test "C ABI: scanio_topk composes with a WHERE-filtered ctx" {
     try std.testing.expectEqual(@as(c_int, 1), scanio_topk_next(tctx, &fields, &n, &key));
     try std.testing.expectEqualStrings("3", std.mem.span(fields[0]));
     try std.testing.expectEqual(@as(c_int, 0), scanio_topk_next(tctx, &fields, &n, &key));
+}
+
+test "C ABI: scanio_order_by walks results ascending" {
+    const path = "test_c_api_orderby.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,50\n2,1500\n3,900\n4,3000\n5,200\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const ctx = scanio_open(path, null);
+    defer scanio_close(ctx);
+
+    const octx = scanio_order_by(ctx, 1, 0); // ascending
+    try std.testing.expect(octx != null);
+    defer scanio_order_by_close(octx);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_order_by_next(octx, &fields, &n));
+    try std.testing.expectEqualStrings("1", std.mem.span(fields[0])); // 50
+    try std.testing.expectEqual(@as(c_int, 1), scanio_order_by_next(octx, &fields, &n));
+    try std.testing.expectEqualStrings("5", std.mem.span(fields[0])); // 200
+    try std.testing.expectEqual(@as(c_int, 1), scanio_order_by_next(octx, &fields, &n));
+    try std.testing.expectEqualStrings("3", std.mem.span(fields[0])); // 900
+    try std.testing.expectEqual(@as(c_int, 1), scanio_order_by_next(octx, &fields, &n));
+    try std.testing.expectEqualStrings("2", std.mem.span(fields[0])); // 1500
+    try std.testing.expectEqual(@as(c_int, 1), scanio_order_by_next(octx, &fields, &n));
+    try std.testing.expectEqualStrings("4", std.mem.span(fields[0])); // 3000
+    try std.testing.expectEqual(@as(c_int, 0), scanio_order_by_next(octx, &fields, &n));
+}
+
+test "C ABI: scanio_order_by composes with a WHERE-filtered ctx, descending" {
+    const path = "test_c_api_orderby_filtered.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city,amount\n1,Austin,50\n2,Denver,3000\n3,Austin,1500\n4,Austin,900\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]CPredicate{.{ .column = 1, .op = 0, .value = "Austin" }};
+    const opts = COptions{ .columns = null, .n_columns = 0, .where = &preds, .n_where = 1, .limit = -1 };
+    const ctx = scanio_open(path, &opts);
+    defer scanio_close(ctx);
+
+    const octx = scanio_order_by(ctx, 2, 1); // descending
+    defer scanio_order_by_close(octx);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    try std.testing.expectEqual(@as(c_int, 1), scanio_order_by_next(octx, &fields, &n));
+    try std.testing.expectEqualStrings("3", std.mem.span(fields[0])); // 1500
+    try std.testing.expectEqual(@as(c_int, 1), scanio_order_by_next(octx, &fields, &n));
+    try std.testing.expectEqualStrings("4", std.mem.span(fields[0])); // 900
+    try std.testing.expectEqual(@as(c_int, 1), scanio_order_by_next(octx, &fields, &n));
+    try std.testing.expectEqualStrings("1", std.mem.span(fields[0])); // 50
+    try std.testing.expectEqual(@as(c_int, 0), scanio_order_by_next(octx, &fields, &n));
 }
 
 test "C ABI: scanio_collect packs matching rows into one NUL-separated buffer" {
