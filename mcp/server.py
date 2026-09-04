@@ -1,7 +1,7 @@
 """
-libscanio MCP server — exposes scan/schema/profile/count/aggregate/topk
-as agent-callable tools over CSV files, without ever loading a file into
-memory (see ../docs/DESIGN.md).
+libscanio MCP server — exposes scan/schema/profile/count/aggregate/topk/
+order_by as agent-callable tools over CSV files, without ever loading a
+file into memory (see ../docs/DESIGN.md).
 
 This file is deliberately thin: every tool is a direct pass-through to
 the libscanio Python binding (../python/libscanio). No filtering,
@@ -76,6 +76,22 @@ def topk(
     """Top K rows by a numeric column, best-to-worst — one pass, not a
     full sort. Each row includes a "_key" entry with its sort value."""
     return libscanio.topk(path, column, k, where=where, descending=descending)
+
+
+@server.tool()
+def order_by(
+    path: str,
+    column: str,
+    where: Optional[str] = None,
+    descending: bool = False,
+) -> list[dict[str, str]]:
+    """Every matching row, sorted by `column` (numeric if it parses as
+    one, string compare otherwise). Materializes the whole matching
+    result set before sorting — bounded by the FILTERED row count, not
+    the file size, same tradeoff aggregate()/topk() already accept. For
+    just the best/worst K rows, prefer topk() — it's one pass, not a
+    full sort, and doesn't materialize the whole result set first."""
+    return libscanio.order_by(path, column, where=where, descending=descending)
 
 
 @server.tool()

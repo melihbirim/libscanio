@@ -1,6 +1,6 @@
 # libscanio-mcp
 
-MCP server exposing libscanio's `scan`/`schema`/`profile`/`count`/`aggregate`/`topk` as agent-callable tools over CSV files, without loading a file into memory (see [../docs/DESIGN.md](../docs/DESIGN.md)).
+MCP server exposing libscanio's `scan`/`schema`/`profile`/`count`/`aggregate`/`topk`/`order_by` as agent-callable tools over CSV files, without loading a file into memory (see [../docs/DESIGN.md](../docs/DESIGN.md)).
 
 This package is a thin wrapper, on purpose — no filtering/formatting/AI-specific logic lives here or in libscanio itself. See [../ROADMAP.md](../ROADMAP.md)'s M8 entry.
 
@@ -21,4 +21,5 @@ python3 -m venv .venv
 - `count(path, where=None)` — row count
 - `aggregate(path, column, where=None)` — count/sum/min/max/avg
 - `topk(path, column, k, where=None, descending=True)` — best K rows by column
+- `order_by(path, column, where=None, descending=False)` — every matching row, sorted by column
 - `profile(path)` — schema + row count + best-effort numeric-column aggregates
