@@ -146,6 +146,16 @@ function build(libPath) {
       scanio_collect_n_rows: lib.func('size_t scanio_collect_n_rows(void *)'),
       scanio_collect_n_cols: lib.func('size_t scanio_collect_n_cols(void *)'),
       scanio_collect_close: lib.func('void scanio_collect_close(void *)'),
+      scanio_parallel_collect_columnar: lib.func(
+        'void *scanio_parallel_collect_columnar(str, char, CPredicate *, size_t, size_t)'
+      ),
+      scanio_collect_columnar_n_rows: lib.func('size_t scanio_collect_columnar_n_rows(void *)'),
+      scanio_collect_columnar_n_cols: lib.func('size_t scanio_collect_columnar_n_cols(void *)'),
+      scanio_collect_columnar_data: lib.func('void *scanio_collect_columnar_data(void *, size_t, _Out_ size_t *)'),
+      scanio_collect_columnar_offsets: lib.func(
+        'uint32_t *scanio_collect_columnar_offsets(void *, size_t, _Out_ size_t *)'
+      ),
+      scanio_collect_columnar_close: lib.func('void scanio_collect_columnar_close(void *)'),
       scanio_close: lib.func('void scanio_close(void *)'),
       scanio_last_error: lib.func('str scanio_last_error()'),
     },

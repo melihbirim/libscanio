@@ -166,6 +166,33 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_collect_close.argtypes = [ctypes.c_void_p]
     lib.scanio_collect_close.restype = None
 
+    lib.scanio_collect_columnar.argtypes = [ctypes.c_void_p]
+    lib.scanio_collect_columnar.restype = ctypes.c_void_p
+
+    lib.scanio_parallel_collect_columnar.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char,
+        ctypes.POINTER(CPredicate),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    lib.scanio_parallel_collect_columnar.restype = ctypes.c_void_p
+
+    lib.scanio_collect_columnar_n_rows.argtypes = [ctypes.c_void_p]
+    lib.scanio_collect_columnar_n_rows.restype = ctypes.c_size_t
+
+    lib.scanio_collect_columnar_n_cols.argtypes = [ctypes.c_void_p]
+    lib.scanio_collect_columnar_n_cols.restype = ctypes.c_size_t
+
+    lib.scanio_collect_columnar_data.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    lib.scanio_collect_columnar_data.restype = ctypes.c_void_p  # not c_char_p: no NUL terminator, offsets mark boundaries
+
+    lib.scanio_collect_columnar_offsets.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    lib.scanio_collect_columnar_offsets.restype = ctypes.POINTER(ctypes.c_uint32)
+
+    lib.scanio_collect_columnar_close.argtypes = [ctypes.c_void_p]
+    lib.scanio_collect_columnar_close.restype = None
+
     lib.scanio_close.argtypes = [ctypes.c_void_p]
     lib.scanio_close.restype = None
 

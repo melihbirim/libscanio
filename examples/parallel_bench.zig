@@ -15,7 +15,7 @@ pub fn main() !void {
     if (args.len >= 4) {
         const column = args[2];
         const value = args[3];
-        const op: scanio.Op = if (args.len >= 5) blk: {
+        const op: scanio.Op = if (args.len >= 5 and !std.mem.eql(u8, args[4], "materialize")) blk: {
             if (std.mem.eql(u8, args[4], "gt")) break :blk .gt;
             if (std.mem.eql(u8, args[4], "gte")) break :blk .gte;
             if (std.mem.eql(u8, args[4], "lt")) break :blk .lt;
@@ -27,6 +27,21 @@ pub fn main() !void {
         const col_idx = probe.columnIndex(column) orelse return error.UnknownColumn;
         probe.deinit();
         const predicates = [_]scanio.Predicate{scanio.Predicate.init(col_idx, op, value)};
+
+        // "materialize" as the 5th arg: parallelScan (multi-threaded,
+        // holds every matching row's fields in memory), not just a
+        // count — for comparing libscanio's OWN multi-threaded
+        // materialized-scan memory footprint against N-separate-process
+        // baselines (see ROADMAP.md).
+        if (args.len >= 5 and std.mem.eql(u8, args[4], "materialize")) {
+            var result = try scanio.parallelScan(allocator, path, ',', &predicates, 0);
+            const n = result.rows.len;
+            result.deinit();
+            const t1 = std.time.nanoTimestamp();
+            std.debug.print("matches={d} time={d:.3}s\n", .{ n, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
+            return;
+        }
+
         const count = try scanio.parallelCountRowsWhere(allocator, path, ',', &predicates, 0);
         const t1 = std.time.nanoTimestamp();
         std.debug.print("matches={d} time={d:.3}s\n", .{ count, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });

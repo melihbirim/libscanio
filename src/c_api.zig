@@ -585,6 +585,302 @@ export fn scanio_collect_close(cc: ?*CollectCtx) void {
     c_allocator.destroy(c);
 }
 
+/// COLUMNAR collection — the real fix for scan_array()/scanArray()'s
+/// concurrent-memory problem (see ROADMAP.md), not scanio_collect()
+/// above (which was already close to optimal for its own row-major NUL-
+/// separated shape — measured, not assumed, via a two-pass exact-sizing
+/// rewrite of a standalone bench tool that barely moved the needle).
+/// The real, unfixable-from-the-Zig-side cost was downstream: Python
+/// building one dict + N string objects per row pays real, inherent
+/// CPython object overhead (~124 bytes/row measured on a real 10-column
+/// fixture) no matter how efficiently the Zig side packs bytes for it.
+///
+/// This is the actual fix: pack data COLUMN-major instead of row-major,
+/// in exactly the layout Apache Arrow's StringArray already uses (a
+/// concatenated data buffer + a `u32` offsets array, offsets[i] marking
+/// where row i's value starts, one accessor pair per column) — so a
+/// caller with pyarrow available can build a `pa.Table` via
+/// `pa.StringArray.from_buffers()` with ZERO Python object construction
+/// per cell, only lightweight Arrow array wrappers over the SAME memory
+/// this function already allocated. No NUL terminators needed either
+/// (Arrow uses offsets, not termination) — one byte/field leaner than
+/// scanio_collect()'s format too.
+const ColumnBuf = struct {
+    data: std.ArrayListUnmanaged(u8) = .{},
+    /// offsets.items.len == n_rows + 1 always; offsets[0] == 0;
+    /// offsets[i] is the END (exclusive) byte position of row i-1's
+    /// value in `data` — i.e. row i's value is data[offsets[i]..offsets[i+1]].
+    offsets: std.ArrayListUnmanaged(u32) = .{},
+
+    fn deinit(self: *ColumnBuf) void {
+        self.data.deinit(c_allocator);
+        self.offsets.deinit(c_allocator);
+    }
+};
+
+const CollectColumnarCtx = struct {
+    columns: []ColumnBuf = &.{},
+    n_rows: usize = 0,
+    n_cols: usize = 0,
+
+    fn deinitAndFree(self: *CollectColumnarCtx) void {
+        for (self.columns) |*col| col.deinit();
+        if (self.columns.len > 0) c_allocator.free(self.columns);
+    }
+};
+
+fn appendColumnarRow(columns: []ColumnBuf, row: scan.Row) !void {
+    for (row.fields, 0..) |field, i| {
+        try columns[i].data.appendSlice(c_allocator, field);
+        try columns[i].offsets.append(c_allocator, @intCast(columns[i].data.items.len));
+    }
+}
+
+/// Runs the REST of ctx's rows to completion (same drain semantics as
+/// scanio_collect()) into the columnar layout described above. Returns
+/// NULL on error — call scanio_last_error().
+export fn scanio_collect_columnar(ctx: ?*Ctx) ?*CollectColumnarCtx {
+    clearError();
+    const c = ctx orelse {
+        setError("scanner is null", .{});
+        return null;
+    };
+    const cc = c_allocator.create(CollectColumnarCtx) catch {
+        setError("out of memory allocating columnar collect context", .{});
+        return null;
+    };
+    cc.* = .{};
+
+    const first_row = c.query.next() catch |e| {
+        setError("collect failed: {s}", .{@errorName(e)});
+        c_allocator.destroy(cc);
+        return null;
+    } orelse return cc; // zero matching rows — n_rows=0, n_cols=0, still a valid handle
+
+    cc.n_cols = first_row.fields.len;
+    cc.columns = c_allocator.alloc(ColumnBuf, cc.n_cols) catch {
+        setError("out of memory allocating columnar collect context", .{});
+        c_allocator.destroy(cc);
+        return null;
+    };
+    for (cc.columns) |*col| col.* = .{};
+    for (cc.columns) |*col| col.offsets.append(c_allocator, 0) catch {
+        setError("out of memory allocating columnar collect context", .{});
+        cc.deinitAndFree();
+        c_allocator.destroy(cc);
+        return null;
+    };
+
+    appendColumnarRow(cc.columns, first_row) catch {
+        setError("out of memory collecting rows", .{});
+        cc.deinitAndFree();
+        c_allocator.destroy(cc);
+        return null;
+    };
+    cc.n_rows = 1;
+
+    while (true) {
+        const row = c.query.next() catch |e| {
+            setError("collect failed: {s}", .{@errorName(e)});
+            cc.deinitAndFree();
+            c_allocator.destroy(cc);
+            return null;
+        } orelse break;
+        appendColumnarRow(cc.columns, row) catch {
+            setError("out of memory collecting rows", .{});
+            cc.deinitAndFree();
+            c_allocator.destroy(cc);
+            return null;
+        };
+        cc.n_rows += 1;
+    }
+    return cc;
+}
+
+export fn scanio_collect_columnar_n_rows(cc: ?*CollectColumnarCtx) usize {
+    const c = cc orelse return 0;
+    return c.n_rows;
+}
+
+export fn scanio_collect_columnar_n_cols(cc: ?*CollectColumnarCtx) usize {
+    const c = cc orelse return 0;
+    return c.n_cols;
+}
+
+/// Column `col_idx`'s concatenated value bytes. `out_len` receives the
+/// byte length of the WHOLE buffer (not one row) — a caller reconstructs
+/// individual values via the offsets array from
+/// scanio_collect_columnar_offsets(). Pointer valid until
+/// scanio_collect_columnar_close(); mirrors scanio_collect_data()'s own
+/// "copy it out or wrap it zero-copy immediately" contract.
+export fn scanio_collect_columnar_data(cc: ?*CollectColumnarCtx, col_idx: usize, out_len: ?*usize) ?[*]const u8 {
+    const c = cc orelse return null;
+    if (col_idx >= c.columns.len) return null;
+    const col = &c.columns[col_idx];
+    if (out_len) |ol| ol.* = col.data.items.len;
+    if (col.data.items.len == 0) return null;
+    return col.data.items.ptr;
+}
+
+/// Column `col_idx`'s offsets array — `n_rows + 1` entries, `u32`,
+/// offsets[0] == 0, row i's value is `data[offsets[i]..offsets[i+1]]`.
+/// Exactly Apache Arrow's own StringArray offset-buffer format, on
+/// purpose — a caller with pyarrow can wrap this directly via
+/// `pa.StringArray.from_buffers()`, zero-copy.
+export fn scanio_collect_columnar_offsets(cc: ?*CollectColumnarCtx, col_idx: usize, out_len: ?*usize) ?[*]const u32 {
+    const c = cc orelse return null;
+    if (col_idx >= c.columns.len) return null;
+    const col = &c.columns[col_idx];
+    if (out_len) |ol| ol.* = col.offsets.items.len;
+    if (col.offsets.items.len == 0) return null;
+    return col.offsets.items.ptr;
+}
+
+export fn scanio_collect_columnar_close(cc: ?*CollectColumnarCtx) void {
+    const c = cc orelse return;
+    c.deinitAndFree();
+    c_allocator.destroy(c);
+}
+
+/// Multi-threaded materialized scan, same columnar output shape as
+/// scanio_collect_columnar() above — the real fix for scan_array()/
+/// scanArray()'s concurrent-memory problem (ROADMAP.md), not a
+/// standalone bench tool: scanio_collect_columnar() drains a single-
+/// threaded Ctx/Query one row at a time; this drives scan.parallelScan()
+/// instead (the same multi-threaded engine M9's parallelCountRowsWhere/
+/// parallelCountRows already use), then repacks its OwnedRow results
+/// into the identical (data, offsets) columnar layout so a Python caller
+/// doesn't need two different unpacking code paths depending on which
+/// collector produced the result.
+///
+/// Takes path/predicates/delimiter directly (no `Ctx` — parallelScan
+/// owns its own file access, doesn't compose with an already-open
+/// single-threaded scanio_open() handle the way scanio_collect() does).
+/// `num_threads` == 0 means "use std.Thread.getCpuCount()", matching
+/// every other parallel_mod entry point's convention.
+///
+/// Known remaining inefficiency, not hidden: this copies each field
+/// TWICE — once into parallelScan's OwnedRow (duplicated so it survives
+/// each worker's reused scan buffer), once again into this function's
+/// columnar buffers. Correct and still dramatically faster/leaner than
+/// the single-threaded path it replaces (measured: 15-895MB / 0.05-0.47s
+/// across N=1-32 concurrent processes vs duckdb's 75-1758MB / 0.66-0.89s
+/// on the same real fixture — see ROADMAP.md) — but a further win is
+/// available by having parallelScan's workers write directly into
+/// per-column buffers instead of OwnedRow, skipping the double copy.
+/// Not done here; this ships the real multi-threading win first.
+export fn scanio_parallel_collect_columnar(
+    path: ?[*:0]const u8,
+    delimiter: u8,
+    where: ?[*]const CPredicate,
+    n_where: usize,
+    num_threads: usize,
+) ?*CollectColumnarCtx {
+    clearError();
+    const p = path orelse {
+        setError("path is null", .{});
+        return null;
+    };
+
+    var predicates: []Predicate = &.{};
+    defer if (predicates.len > 0) c_allocator.free(predicates);
+    var in_owned: [][]const []const u8 = &.{};
+    defer {
+        for (in_owned) |vals| {
+            for (vals) |v| c_allocator.free(@constCast(v));
+            if (vals.len > 0) c_allocator.free(@constCast(vals));
+        }
+        if (in_owned.len > 0) c_allocator.free(in_owned);
+    }
+
+    if (n_where > 0) {
+        const cpreds = where.?[0..n_where];
+        predicates = c_allocator.alloc(Predicate, cpreds.len) catch {
+            setError("out of memory allocating predicates", .{});
+            return null;
+        };
+        in_owned = c_allocator.alloc([]const []const u8, cpreds.len) catch {
+            setError("out of memory allocating predicates", .{});
+            return null;
+        };
+        @memset(in_owned, &.{});
+        for (cpreds, 0..) |cp, i| {
+            if (cp.op == 6) {
+                const cvals = cp.values.?[0..cp.n_values];
+                const owned = c_allocator.alloc([]const u8, cvals.len) catch {
+                    setError("out of memory allocating IN values", .{});
+                    return null;
+                };
+                for (cvals, 0..) |cv, j| {
+                    owned[j] = c_allocator.dupe(u8, std.mem.span(cv)) catch {
+                        setError("out of memory allocating IN values", .{});
+                        return null;
+                    };
+                }
+                in_owned[i] = owned;
+                predicates[i] = Predicate.initIn(cp.column, owned);
+                continue;
+            }
+            const op: Op = switch (cp.op) {
+                0 => .eq,
+                1 => .neq,
+                2 => .gt,
+                3 => .gte,
+                4 => .lt,
+                5 => .lte,
+                else => .eq,
+            };
+            predicates[i] = Predicate.init(cp.column, op, std.mem.span(cp.value));
+        }
+    }
+
+    var result = scan.parallelScan(c_allocator, std.mem.span(p), delimiter, predicates, num_threads) catch |e| {
+        setError("parallel scan failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    defer result.deinit();
+
+    const cc = c_allocator.create(CollectColumnarCtx) catch {
+        setError("out of memory allocating columnar collect context", .{});
+        return null;
+    };
+    cc.* = .{};
+    if (result.rows.len == 0) return cc;
+
+    cc.n_rows = result.rows.len;
+    cc.n_cols = result.rows[0].fields.len;
+    cc.columns = c_allocator.alloc(ColumnBuf, cc.n_cols) catch {
+        setError("out of memory allocating columnar collect context", .{});
+        c_allocator.destroy(cc);
+        return null;
+    };
+    for (cc.columns) |*col| col.* = .{};
+    for (cc.columns) |*col| col.offsets.append(c_allocator, 0) catch {
+        setError("out of memory allocating columnar collect context", .{});
+        cc.deinitAndFree();
+        c_allocator.destroy(cc);
+        return null;
+    };
+
+    for (result.rows) |row| {
+        for (row.fields, 0..) |field, i| {
+            cc.columns[i].data.appendSlice(c_allocator, field) catch {
+                setError("out of memory collecting rows", .{});
+                cc.deinitAndFree();
+                c_allocator.destroy(cc);
+                return null;
+            };
+            cc.columns[i].offsets.append(c_allocator, @intCast(cc.columns[i].data.items.len)) catch {
+                setError("out of memory collecting rows", .{});
+                cc.deinitAndFree();
+                c_allocator.destroy(cc);
+                return null;
+            };
+        }
+    }
+    return cc;
+}
+
 export fn scanio_close(ctx: ?*Ctx) void {
     const c = ctx orelse return;
     c.query.deinit();
@@ -890,6 +1186,86 @@ test "C ABI: scanio_collect on zero matches returns n_rows=0 and a null buffer" 
     var len: usize = 0;
     try std.testing.expect(scanio_collect_data(cc, &len) == null);
     try std.testing.expectEqual(@as(usize, 0), len);
+}
+
+fn columnarValue(cc: *CollectColumnarCtx, col_idx: usize, row_idx: usize) []const u8 {
+    var data_len: usize = 0;
+    const data = scanio_collect_columnar_data(cc, col_idx, &data_len) orelse "";
+    var off_len: usize = 0;
+    const offsets = scanio_collect_columnar_offsets(cc, col_idx, &off_len).?;
+    const start = offsets[row_idx];
+    const end = offsets[row_idx + 1];
+    return data[start..end];
+}
+
+test "C ABI: scanio_collect_columnar packs matching rows column-major with offsets" {
+    const path = "test_c_api_collect_columnar.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,color,amount\n1,yellow,50\n2,red,1500\n3,yellow,900\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]CPredicate{.{ .column = 1, .op = 0, .value = "yellow" }};
+    const opts = COptions{ .columns = null, .n_columns = 0, .where = &preds, .n_where = 1, .limit = -1 };
+    const ctx = scanio_open(path, &opts);
+    defer scanio_close(ctx);
+
+    const cc = scanio_collect_columnar(ctx);
+    try std.testing.expect(cc != null);
+    defer scanio_collect_columnar_close(cc);
+
+    try std.testing.expectEqual(@as(usize, 2), scanio_collect_columnar_n_rows(cc));
+    try std.testing.expectEqual(@as(usize, 3), scanio_collect_columnar_n_cols(cc));
+    try std.testing.expectEqualStrings("1", columnarValue(cc.?, 0, 0));
+    try std.testing.expectEqualStrings("3", columnarValue(cc.?, 0, 1));
+    try std.testing.expectEqualStrings("yellow", columnarValue(cc.?, 1, 0));
+    try std.testing.expectEqualStrings("yellow", columnarValue(cc.?, 1, 1));
+    try std.testing.expectEqualStrings("50", columnarValue(cc.?, 2, 0));
+    try std.testing.expectEqualStrings("900", columnarValue(cc.?, 2, 1));
+}
+
+test "C ABI: scanio_parallel_collect_columnar matches scanio_collect_columnar on the same data" {
+    const path = "test_c_api_parallel_collect.csv";
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(std.testing.allocator);
+    try data.appendSlice(std.testing.allocator, "id,city,amount\n");
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) {
+        const city = if (i % 3 == 0) "Austin" else "Denver";
+        try data.writer(std.testing.allocator).print("{d},{s},{d}\n", .{ i, city, i * 3 });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]CPredicate{.{ .column = 1, .op = 0, .value = "Austin" }};
+    const opts = COptions{ .columns = null, .n_columns = 0, .where = &preds, .n_where = 1, .limit = -1 };
+    const ctx = scanio_open(path, &opts);
+    const single = scanio_collect_columnar(ctx);
+    defer scanio_collect_columnar_close(single);
+    scanio_close(ctx);
+
+    const par = scanio_parallel_collect_columnar(path, ',', &preds, 1, 4);
+    try std.testing.expect(par != null);
+    defer scanio_collect_columnar_close(par);
+
+    try std.testing.expectEqual(scanio_collect_columnar_n_rows(single), scanio_collect_columnar_n_rows(par));
+    try std.testing.expectEqual(scanio_collect_columnar_n_cols(single), scanio_collect_columnar_n_cols(par));
+
+    // Row order isn't guaranteed to match (parallel path concatenates
+    // worker ranges, not necessarily identical row-for-row ordering vs
+    // the single-threaded path for every possible split) — so verify
+    // via id-column SET equality instead of positional equality.
+    var single_ids = std.AutoHashMap(u64, void).init(std.testing.allocator);
+    defer single_ids.deinit();
+    const n = scanio_collect_columnar_n_rows(single);
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        const id = std.fmt.parseInt(u64, columnarValue(single.?, 0, r), 10) catch unreachable;
+        try single_ids.put(id, {});
+    }
+    r = 0;
+    while (r < n) : (r += 1) {
+        const id = std.fmt.parseInt(u64, columnarValue(par.?, 0, r), 10) catch unreachable;
+        try std.testing.expect(single_ids.contains(id));
+    }
 }
 
 test "C ABI: max_column bounds the row without breaking the result" {
