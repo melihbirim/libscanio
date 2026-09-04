@@ -83,12 +83,18 @@ pub const topK = topk_mod.topK;
 const parallel_mod = @import("parallel.zig");
 pub const ParallelError = parallel_mod.ParallelError;
 pub const parallelCountRows = parallel_mod.parallelCountRows;
+pub const parallelCountRowsWhere = parallel_mod.parallelCountRowsWhere;
+
+const order_mod = @import("order.zig");
+pub const OrderedRows = order_mod.OrderedRows;
+pub const orderBy = order_mod.orderBy;
 
 test {
     _ = query_mod;
     _ = ndjson_mod;
     _ = aggregate_mod;
     _ = topk_mod;
+    _ = order_mod;
     _ = json_parser_mod;
     _ = json_simd_mod;
     _ = parallel_mod;

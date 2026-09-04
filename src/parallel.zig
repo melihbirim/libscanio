@@ -311,8 +311,6 @@ pub fn parallelCountRows(allocator: Allocator, path: []const u8, num_threads: us
     return total_lines - 1;
 }
 
-pub const FilterError = error{JsonArrayFilterNotSupported};
-
 fn trimCR(line: []const u8) []const u8 {
     if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
     return line;
@@ -561,12 +559,16 @@ fn buildNdjsonHeader(allocator: Allocator, file: std.fs.File, file_size: u64) !N
 /// the same query_mod.Predicate shape (numeric column index, not name —
 /// resolve names via a throwaway Scanner/NdjsonScanner open first, same
 /// as Query.open()/the Python/Node bindings already do). CSV and NDJSON
-/// both supported (NDJSON via a shared, once-built header_index — see
-/// buildNdjsonHeader()); JSON arrays return FilterError.JsonArrayFilterNotSupported
-/// rather than silently running unfiltered or giving a wrong count —
-/// filtering a JSON array in parallel needs per-object JSON parsing
-/// composed with the sequential brace-depth boundary walk
-/// countJsonArrayObjects() already does, not implemented here.
+/// run the real parallel path (NDJSON via a shared, once-built
+/// header_index — see buildNdjsonHeader()). JSON arrays delegate to the
+/// existing single-threaded Query/NdjsonScanner path instead — not a
+/// missing feature, a deliberate non-duplication: a JSON array's Nth
+/// object boundary can only be found by walking brace depth from the
+/// start of the file (see countJsonArrayObjects()'s doc comment above),
+/// so a correct parallel split needs a sequential pre-pass that already
+/// costs as much as doing the filtering directly — reimplementing JSON-
+/// object parsing a third time in this file for zero speed benefit
+/// isn't worth the maintenance cost of a third copy of that logic.
 pub fn parallelCountRowsWhere(
     allocator: Allocator,
     path: []const u8,
@@ -582,7 +584,13 @@ pub fn parallelCountRowsWhere(
     if (file_size == 0) return ParallelError.EmptyFile;
 
     if (try sniffFormat(file, file_size) == .json_array) {
-        return FilterError.JsonArrayFilterNotSupported;
+        // Query.open() below opens its own handle — this function's
+        // `file` (and its `defer file.close()` above) still owns and
+        // closes the one used for sniffing; two independent read-only
+        // opens of the same path is safe on every platform.
+        var q = try query_mod.Query.open(allocator, path, .{ .where = predicates, .format = .ndjson });
+        defer q.deinit();
+        return q.count();
     }
 
     const is_csv = query_mod.inferFormat(path) == .csv;
@@ -900,12 +908,35 @@ test "parallelCountRowsWhere: NDJSON, real multi-chunk file matches Query.count(
     try std.testing.expectEqual(@as(usize, 20_000), parallel_count);
 }
 
-test "parallelCountRowsWhere: JSON array returns JsonArrayFilterNotSupported, not a wrong count" {
+test "parallelCountRowsWhere: JSON array, single predicate matches Query.count()" {
     const allocator = std.testing.allocator;
     const path = "test_parallel_where_json_array.json";
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "[{\"id\":1,\"amount\":50},{\"id\":2,\"amount\":1500}]" });
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "[{\"id\":1,\"amount\":50},{\"id\":2,\"amount\":1500},{\"id\":3,\"amount\":2500}]" });
     defer std.fs.cwd().deleteFile(path) catch {};
 
+    const scan = @import("root.zig");
+    var q = try scan.Query.open(allocator, path, .{ .where = &.{query_mod.Predicate.init(1, .gt, "1000")} });
+    defer q.deinit();
+    const single_count = try q.count();
+
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .gt, "1000")};
-    try std.testing.expectError(FilterError.JsonArrayFilterNotSupported, parallelCountRowsWhere(allocator, path, ',', &predicates, 4));
+    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, 4);
+    try std.testing.expectEqual(single_count, parallel_count);
+    try std.testing.expectEqual(@as(usize, 2), parallel_count);
+}
+
+test "parallelCountRowsWhere: JSON array, pretty-printed multi-line still filters correctly" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_where_json_array_pretty.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+        \\[
+        \\  {"id": 1, "city": "Austin", "amount": 50},
+        \\  {"id": 2, "city": "Denver", "amount": 3000},
+        \\  {"id": 3, "city": "Austin", "amount": 1500}
+        \\]
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+    try std.testing.expectEqual(@as(usize, 2), try parallelCountRowsWhere(allocator, path, ',', &predicates, 4));
 }

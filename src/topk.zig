@@ -32,7 +32,7 @@ pub const OwnedRow = struct {
     }
 };
 
-fn copyRow(allocator: Allocator, row: Row) !OwnedRow {
+pub fn copyRow(allocator: Allocator, row: Row) !OwnedRow {
     const fields = try allocator.alloc([]u8, row.fields.len);
     var filled: usize = 0;
     errdefer {
