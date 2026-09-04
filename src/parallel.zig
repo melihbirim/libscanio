@@ -1414,48 +1414,46 @@ fn ndjsonScanColumnarWorkerRun(w: *NdjsonScanColumnarWorker) void {
 /// scan_bench.zig's own two-pass fix for the same idea at smaller
 /// scope) not pursued here since the actual measured cost driver was
 /// the many-small-allocations pattern, not this merge step.
-/// Two-pass exact-sized merge — same technique that fixed scan_bench.zig's
-/// per-field slice-header overhead earlier in this project: count first,
-/// allocate exactly once, fill once. By the time this runs, every worker
-/// has ALREADY finished scanning (so every worker's exact final byte/row
-/// count is already known from its populated ColumnBuf — no second file
-/// read needed, just summing lengths already in memory), so `final_columns`
-/// can be sized with `ensureTotalCapacityPrecise` up front instead of
-/// growing via repeated `appendSlice` calls (which would pay its OWN
-/// doubling-growth overshoot on top of each worker's, the dominant
-/// remaining cost after the eager-free fix below wasn't enough on its
-/// own — see this function's git history / ROADMAP.md for the
-/// measurements that led here). Each worker's buffer is freed immediately
-/// after its data is copied into the final buffer (not deferred to the
-/// caller) — the smaller, earlier fix, kept because it's still correct
-/// and still helps, just wasn't the dominant cost by itself.
-/// `workers` is consumed: every worker's ColumnBuf is deinitialized by the
-/// time this returns, success or error.
+/// Reverted here to the simplest correct version, deliberately, after TWO
+/// different "smarter" rewrites both made real measurements WORSE, not
+/// better — logged in full in ROADMAP.md so the same dead ends aren't
+/// retried. (1) Reserving every final column at FULL final size up front,
+/// before freeing any worker, won big on single-call memory (~26% less)
+/// but made N=32 concurrent memory WORSE (a guaranteed worker-buffers-
+/// plus-final-buffers 2x peak the instant reservation finished). (2)
+/// Growing each final column to its EXACT running total after every
+/// worker (no doubling overshoot, no upfront full-size reservation
+/// either) was supposed to fix that — instead it was worse than BOTH:
+/// realloc's move-and-copy behavior means every exact-growth step briefly
+/// holds old-buffer-plus-new-buffer simultaneously too, and doing that
+/// n_workers times compounded allocator churn into a bigger single-call
+/// peak (557-588MB) than even the ORIGINAL doubling-growth appendSlice
+/// this function now uses again. Eager-freeing each worker's buffer right
+/// after it's copied (rather than the caller deferring all worker
+/// cleanup to function exit) is the one part of this investigation that
+/// was unambiguously safe and is kept. A real fix for the remaining gap
+/// vs pyarrow.dataset would need workers to write directly into a
+/// shared final buffer during the SCAN itself (true two-pass over the
+/// FILE — count matches first, then write at precomputed offsets — not
+/// this single-scan-then-reshuffle approach), a genuinely different,
+/// bigger design not attempted here.
+/// `workers` is consumed: every worker's ColumnBuf is deinitialized by
+/// the time this returns, success or error.
 fn mergeColumnarWorkers(allocator: Allocator, n_cols: usize, comptime WorkerT: type, workers: []WorkerT) !ColumnarScanResult {
     const final_columns = try newColumnBufs(allocator, n_cols);
     errdefer deinitColumnBufs(allocator, final_columns);
     errdefer for (workers) |*w| deinitColumnBufs(allocator, w.columns);
 
     var total_rows: usize = 0;
-    for (workers) |w| total_rows += w.n_rows;
-
-    for (0..n_cols) |ci| {
-        var total_bytes: usize = 0;
-        for (workers) |w| total_bytes += w.columns[ci].data.items.len;
-        try final_columns[ci].data.ensureTotalCapacityPrecise(allocator, total_bytes);
-        // newColumnBufs() already appended the leading 0 via a regular
-        // append() — items.len is 1 here, don't append it again.
-        try final_columns[ci].offsets.ensureTotalCapacityPrecise(allocator, total_rows + 1);
-    }
-
     for (workers) |*w| {
         for (0..n_cols) |ci| {
             const base: u32 = @intCast(final_columns[ci].data.items.len);
-            final_columns[ci].data.appendSliceAssumeCapacity(w.columns[ci].data.items);
+            try final_columns[ci].data.appendSlice(allocator, w.columns[ci].data.items);
             for (w.columns[ci].offsets.items[1..]) |off| {
-                final_columns[ci].offsets.appendAssumeCapacity(base + off);
+                try final_columns[ci].offsets.append(allocator, base + off);
             }
         }
+        total_rows += w.n_rows;
         deinitColumnBufs(allocator, w.columns);
     }
     return .{ .allocator = allocator, .columns = final_columns, .n_rows = total_rows, .n_cols = n_cols };
