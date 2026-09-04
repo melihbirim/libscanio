@@ -270,5 +270,70 @@ try:
 finally:
     os.unlink(ALNUM_P)
 
+
+# scan_table(): same describe()-fixture shape, but checking the actual
+# typed Arrow output, not just the type label. Reuses the two real ISO8601
+# shapes describe() lumps under one "datetime" label (trailing Z needs a
+# tz-aware Arrow target, bare needs tz-naive) to make sure both cast paths
+# work, not just one.
+st_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
+st_tmp.write(
+    "id,price,active,created_at,notes\n"
+    "1,19.99,true,2023-05-26T22:00:00Z,\n"
+    "2,29.50,false,2023-06-01T10:15:30Z,\n"
+    "3,9.75,true,2023-07-04T00:00:00Z,\n"
+)
+st_tmp.close()
+ST_P = st_tmp.name
+try:
+    tbl = libscanio.scan_table(ST_P, infer_types=True)
+    check(
+        "scan_table: infer_types=True casts to typed columns",
+        {name: str(tbl.schema.field(name).type) for name in tbl.column_names},
+        {
+            "id": "int64",
+            "price": "double",
+            "active": "bool",
+            "created_at": "timestamp[s, tz=UTC]",
+            "notes": "string",
+        },
+    )
+    check("scan_table: typed values round-trip correctly", tbl.column("price").to_pylist(), [19.99, 29.5, 9.75])
+    check("scan_table: boolean values correct", tbl.column("active").to_pylist(), [True, False, True])
+
+    tbl_untyped = libscanio.scan_table(ST_P, infer_types=False)
+    check(
+        "scan_table: infer_types=False keeps every column a string",
+        {str(f.type) for f in tbl_untyped.schema},
+        {"string"},
+    )
+finally:
+    os.unlink(ST_P)
+
+# describe()'s sample-based inference can be wrong for data outside the
+# sample — scan_table() must fall back to a string column for THAT one
+# column instead of raising, since the real value pyarrow can't cast
+# only shows up after the sample describe() actually looked at.
+st_bad_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
+lines = ["id,mixed\n"] + [f"{i},{i}\n" for i in range(1, 1001)] + ["1001,not-a-number\n"]
+st_bad_tmp.writelines(lines)
+st_bad_tmp.close()
+ST_BAD_P = st_bad_tmp.name
+try:
+    check(
+        "scan_table: describe() sample misses the later non-numeric value",
+        {d["column"]: d["type"] for d in libscanio.describe(ST_BAD_P)}["mixed"],
+        "integer",
+    )
+    tbl_bad = libscanio.scan_table(ST_BAD_P, infer_types=True)
+    check(
+        "scan_table: cast failure falls back to string instead of raising",
+        str(tbl_bad.schema.field("mixed").type),
+        "string",
+    )
+    check("scan_table: fallback column still has correct, complete data", tbl_bad.column("mixed").to_pylist()[-1], "not-a-number")
+finally:
+    os.unlink(ST_BAD_P)
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

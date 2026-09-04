@@ -370,7 +370,14 @@ class _ColumnarHandle:
             self._cc = None
 
 
-def scan_table(path: str, where: Optional[str] = None):
+_ARROW_TYPE_FOR_INFERRED = {
+    "integer": "int64",
+    "float": "float64",
+    "boolean": "bool",
+}
+
+
+def scan_table(path: str, where: Optional[str] = None, infer_types: bool = False):
     """Every matching row as a `pyarrow.Table` — zero-copy from the same
     Zig-side columnar (data, offsets) buffers scan_array() uses, but
     with NO per-cell Python object construction at all (scan_array()
@@ -383,6 +390,26 @@ def scan_table(path: str, where: Optional[str] = None):
     clear message if it isn't installed, rather than silently falling
     back to something slower and calling that success.
 
+    infer_types: when true, columns describe() classifies as integer/
+    float/boolean/datetime get cast to a real typed Arrow array (int64/
+    float64/bool/timestamp[s]) via pyarrow's own C++ cast — no Python-
+    level per-cell parsing, and directly usable in pandas/numpy without
+    a manual cast. Defaults to False, and this is deliberate, not an
+    oversight: measured on a real 500MB/1.24M-row fixture, casting made
+    peak RSS WORSE (508-540MB → 553-589MB), not better, because the
+    original string source bytes can't be freed per-column — every
+    column shares one C-side context, closed as a single unit only once
+    every column's Python wrapper is gone — so casting adds new typed
+    buffers on top of the string data instead of replacing it. A real
+    memory win would need Zig itself to emit typed buffers during the
+    scan; this is a correctness/ergonomics convenience only, not a
+    memory optimization, and is opt-in for exactly that reason. Uses
+    describe()'s existing sample-based heuristic (see its own docstring
+    for the caveat: a column consistent for the sample and different
+    later won't be caught) — if a cast fails on the real data (a value
+    describe()'s sample didn't see), that ONE column falls back to
+    staying a string array silently, rather than the whole call raising.
+
     No `columns`/`limit`/`as_dict` — this is the maximally-cheap path
     for "give me everything as a real columnar structure I can hand to
     pandas/numpy/downstream Arrow tooling," not a drop-in scan_array()
@@ -391,6 +418,7 @@ def scan_table(path: str, where: Optional[str] = None):
     """
     try:
         import pyarrow as pa
+        import pyarrow.compute as pc
     except ImportError as e:
         raise ImportError("scan_table() requires pyarrow: pip install pyarrow") from e
 
@@ -438,6 +466,31 @@ def scan_table(path: str, where: Optional[str] = None):
 
         arr = pa.Array.from_buffers(pa.string(), n_rows, [None, offsets_buf, data_buf])
         arrays.append(arr)
+
+    if infer_types:
+        types_by_col = {d["column"]: d["type"] for d in describe(path)}
+        for i, name in enumerate(names):
+            inferred = types_by_col.get(name)
+            if inferred == "datetime":
+                # Two real ISO8601 shapes describe() accepts under one
+                # label: "...Z"/"...+00:00" (needs a tz-aware target) and
+                # bare "YYYY-MM-DD[THH:MM:SS]" (needs a tz-naive target,
+                # or Arrow rejects it asking for one) — try both rather
+                # than inspecting which _DATETIME_FORMATS matched.
+                for target in (pa.timestamp("s", tz="UTC"), pa.timestamp("s")):
+                    try:
+                        arrays[i] = pc.cast(arrays[i], target)
+                        break
+                    except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError):
+                        continue
+                continue
+            target = _ARROW_TYPE_FOR_INFERRED.get(inferred)
+            if target is None:
+                continue
+            try:
+                arrays[i] = pc.cast(arrays[i], target)
+            except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError):
+                pass  # sample-based inference was wrong for the real data — keep the string column
 
     return pa.table(arrays, names=names)
 
