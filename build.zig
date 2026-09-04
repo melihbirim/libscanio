@@ -101,6 +101,23 @@ pub fn build(b: *std.Build) void {
     const mem_check_step = b.step("mem-check", "Run the format-aware Query scan (for memory/throughput comparison)");
     mem_check_step.dependOn(&run_mem_check.step);
 
+    const parallel_bench = b.addExecutable(.{
+        .name = "parallel_bench",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/parallel_bench.zig"),
+        }),
+    });
+    parallel_bench.root_module.addImport("scanio", scanio_mod);
+    parallel_bench.linkLibC();
+    const install_parallel_bench = b.addInstallArtifact(parallel_bench, .{});
+    const run_parallel_bench = b.addRunArtifact(parallel_bench);
+    run_parallel_bench.step.dependOn(&install_parallel_bench.step);
+    if (b.args) |args| run_parallel_bench.addArgs(args);
+    const parallel_bench_step = b.step("parallel-bench", "Run parallelCountRows(Where) (for multi-threaded comparison)");
+    parallel_bench_step.dependOn(&run_parallel_bench.step);
+
     const filter_bench = b.addExecutable(.{
         .name = "filter_bench",
         .root_module = b.createModule(.{
