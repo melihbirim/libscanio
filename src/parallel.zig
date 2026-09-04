@@ -2011,6 +2011,68 @@ test "parallelScanColumnar: CSV matches parallelScan's OwnedRow output on a real
     }
 }
 
+/// Wraps a child allocator and counts alloc() calls — used below as a
+/// regression guard against parallelScanColumnar() silently reverting to
+/// an OwnedRow-style per-field allocator.dupe(): that pattern costs one
+/// alloc() call per (row, column) pair, whereas ColumnBuf's amortized
+/// ArrayList growth costs one alloc() call per doubling, independent of
+/// row count. A future change that reintroduces the double-copy would
+/// blow this bound even though every existing correctness test (which
+/// only checks VALUES, not allocation shape) would still pass.
+const CountingAllocator = struct {
+    child: Allocator,
+    count: usize = 0,
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "parallelScanColumnar: allocation count stays far below rows*cols (double-copy regression guard)" {
+    const backing = std.testing.allocator;
+    const path = "test_parallel_columnar_alloc_count.csv";
+
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(backing);
+    try data.appendSlice(backing, "id,city,amount\n");
+    var i: usize = 0;
+    const n_rows: usize = 20_000;
+    while (i < n_rows) : (i += 1) {
+        try data.writer(backing).print("{d},Austin,{d}\n", .{ i, i * 3 });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var counting = CountingAllocator{ .child = backing };
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+
+    var colResult = try parallelScanColumnar(counting.allocator(), path, ',', &predicates, 4);
+    defer colResult.deinit();
+
+    try std.testing.expectEqual(n_rows, colResult.n_rows);
+
+    const n_cols: usize = 3;
+    const owned_row_floor = n_rows * n_cols; // what a per-field allocator.dupe() approach would cost, at minimum
+    try std.testing.expect(counting.count < owned_row_floor / 10);
+}
+
 test "parallelScanColumnar: NDJSON matches expected count and field consistency" {
     const allocator = std.testing.allocator;
     const path = "test_parallel_columnar_ndjson.ndjson";
