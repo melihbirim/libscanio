@@ -220,29 +220,38 @@ fn sniffFormat(file: std.fs.File, file_size: u64) !SniffedFormat {
     return .line_delimited; // all whitespace in the sniffed window — treat as the common case
 }
 
-/// Sequential (NOT parallel — see doc comment below) top-level object
-/// count for a JSON-array file. Same brace-depth/in-string/escape state
-/// machine as NdjsonScanner.nextObject() (ndjson.zig), reimplemented
-/// here over raw pread() chunks instead of a scanner's buffer, since
-/// this only needs a count, not materialized object text.
-///
-/// Why this isn't split across threads like the line-delimited path:
-/// a JSON array's Nth object boundary can only be found by tracking
-/// nesting depth from the START of the file — unlike a newline, which
-/// is self-describing at any byte offset, "is this `}` a top-level
-/// close or a nested one" depends on everything read so far. A correct
-/// parallel split would need a sequential pre-pass to find aligned
-/// boundaries anyway, and that pre-pass already IS the count (walking
-/// depth to find N boundaries costs the same as walking depth to find
-/// all of them) — so for bare counting specifically, splitting further
-/// buys nothing. It would start paying off for parallel WHERE-filtered
-/// scans or field extraction (the actually-expensive part per this
-/// session's NDJSON work), where per-object work dwarfs the boundary
-/// walk — not implemented here, out of scope for this slice.
-fn countJsonArrayObjects(file: std.fs.File, file_size: u64) !usize {
+/// Shared brace-depth/in-string/escape state machine, used by both
+/// countJsonArrayObjects() (sequential, no boundaries needed) and
+/// findJsonArrayRanges() (records boundaries too) — same logic, one
+/// copy, a callback per completed top-level object instead of two
+/// slightly-drifting hand-written loops. Plain per-byte scalar scan —
+/// two different vectorized versions of this were tried and measured
+/// worse, not assumed worse: (1) a fixed-16-byte-chunk bitmask+@ctz scan
+/// (the technique that fixed json_simd.zig's tokenizer) regressed
+/// (3.06s -> 4.10s on a real 1M-object fixture) because structural chars
+/// in real JSON objects land every ~10-20 bytes, so most searches
+/// resolve inside the FIRST 16-byte chunk — the fixed-chunk setup cost
+/// (compare/mask-build/@ctz) is paid without ever reaching the span
+/// where a wider scan pays for itself, the same failure mode an earlier
+/// ndjson.zig fast-path attempt hit. (2) Switching to 4 separate
+/// std.mem.indexOfScalarPos calls (stdlib's own tiered SIMD, which DID
+/// win for that earlier ndjson.zig case) was worse still — a genuine
+/// quadratic blowup, not just slower: this fixture has zero backslashes
+/// anywhere, so a `\` search from any position scans forward to the end
+/// of the current ~1MB buffer EVERY time it's called, and it's called
+/// on every structural hit (every ~15 bytes) — roughly (buffer_size /
+/// 15) full-buffer scans per buffer, which never finished inside a 60s
+/// timeout on the real fixture. Both attempts logged in ROADMAP.md as a
+/// deliberate negative result, not silently dropped.
+fn walkJsonArrayObjectCloses(
+    file: std.fs.File,
+    file_size: u64,
+    comptime Ctx: type,
+    ctx: *Ctx,
+    comptime onClose: fn (*Ctx, u64) anyerror!void,
+) !void {
     var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
     var pos: u64 = 0;
-    var count: usize = 0;
     var started = false;
     var depth: usize = 0;
     var in_string = false;
@@ -253,7 +262,7 @@ fn countJsonArrayObjects(file: std.fs.File, file_size: u64) !usize {
         const to_read: usize = @intCast(@min(@as(u64, buf.len), remaining));
         const n = try file.pread(buf[0..to_read], pos);
         if (n == 0) break;
-        for (buf[0..n]) |c| {
+        for (buf[0..n], 0..) |c, off| {
             if (!started) {
                 if (c == '{') {
                     started = true;
@@ -278,14 +287,304 @@ fn countJsonArrayObjects(file: std.fs.File, file_size: u64) !usize {
             } else if (c == '}') {
                 depth -= 1;
                 if (depth == 0) {
-                    count += 1;
                     started = false;
+                    try onClose(ctx, pos + off + 1);
                 }
             }
         }
         pos += n;
     }
-    return count;
+}
+
+/// Sequential (NOT parallel — see doc comment below) top-level object
+/// count for a JSON-array file.
+///
+/// Why this isn't split across threads like the line-delimited path:
+/// a JSON array's Nth object boundary can only be found by tracking
+/// nesting depth from the START of the file — unlike a newline, which
+/// is self-describing at any byte offset, "is this `}` a top-level
+/// close or a nested one" depends on everything read so far. A correct
+/// parallel split would need a sequential pre-pass to find aligned
+/// boundaries anyway, and that pre-pass already IS the count (walking
+/// depth to find N boundaries costs the same as walking depth to find
+/// all of them) — so for bare counting specifically, splitting further
+/// buys nothing. It would start paying off for parallel WHERE-filtered
+/// scans or field extraction (the actually-expensive part per this
+/// session's NDJSON work), where per-object work dwarfs the boundary
+/// walk — that's exactly what findJsonArrayRanges() below is for.
+fn countJsonArrayObjects(file: std.fs.File, file_size: u64) !usize {
+    const CountCtx = struct { count: usize = 0 };
+    const onClose = struct {
+        fn f(c: *CountCtx, _: u64) !void {
+            c.count += 1;
+        }
+    }.f;
+    var ctx = CountCtx{};
+    try walkJsonArrayObjectCloses(file, file_size, CountCtx, &ctx, onClose);
+    return ctx.count;
+}
+
+/// Splits a JSON array's data region into up to `num_threads` disjoint,
+/// OBJECT-boundary-aligned ranges — makes WHERE-filtered parallel work
+/// possible, unlike countJsonArrayObjects() above (a bare count gets
+/// nothing from splitting further, since finding the boundaries costs
+/// the same as counting them; see that function's doc comment). The
+/// difference here: the per-object PARSE + predicate-match work this
+/// enables downstream is the expensive part (per this project's own
+/// NDJSON investigation — json_parser.parseObject() is not the
+/// optimized fast path), so paying a sequential O(file) boundary walk
+/// once, up front, to unlock parallel parsing on top of it is a real
+/// net win, not just moving the cost around.
+///
+/// Records a range boundary the first time a top-level object closes at
+/// or past each `i * file_size/num_threads` target, so ranges are
+/// roughly equal-sized without needing random access into the file
+/// (which JSON's nesting makes impossible — depth at an arbitrary byte
+/// offset depends on everything read before it).
+fn findJsonArrayRanges(allocator: Allocator, file: std.fs.File, file_size: u64, num_threads: usize) ![]Range {
+    const RangeCtx = struct {
+        allocator: Allocator,
+        ranges: std.ArrayListUnmanaged(Range) = .{},
+        range_start: u64 = 0,
+        next_target: u64,
+        approx_chunk: u64,
+        num_threads: usize,
+    };
+    const onClose = struct {
+        fn f(c: *RangeCtx, end_pos: u64) !void {
+            if (end_pos >= c.next_target and c.ranges.items.len + 1 < c.num_threads) {
+                try c.ranges.append(c.allocator, .{ .start = c.range_start, .end = end_pos });
+                c.range_start = end_pos;
+                c.next_target = end_pos + c.approx_chunk;
+            }
+        }
+    }.f;
+
+    const approx_chunk = file_size / num_threads;
+    var ctx = RangeCtx{ .allocator = allocator, .next_target = approx_chunk, .approx_chunk = approx_chunk, .num_threads = num_threads };
+    errdefer ctx.ranges.deinit(allocator);
+    try walkJsonArrayObjectCloses(file, file_size, RangeCtx, &ctx, onClose);
+    try ctx.ranges.append(allocator, .{ .start = ctx.range_start, .end = file_size });
+    return ctx.ranges.toOwnedSlice(allocator);
+}
+
+/// Walks every complete top-level JSON object in [range.start, range.end)
+/// of `file`, calling `body(ctx, object_text)` once per object — same
+/// chunk-boundary-carry shape as forEachLineInRange() (a `scratch` buffer
+/// catches an object whose bytes span two pread() calls), except the
+/// boundary being tracked is a balanced `{...}`, not a `\n`. Ranges from
+/// findJsonArrayRanges() are guaranteed to start/end exactly between two
+/// objects (or at file start/end), so this never begins or ends mid-object.
+fn forEachJsonObjectInRange(
+    allocator: Allocator,
+    file: std.fs.File,
+    range: Range,
+    comptime Ctx: type,
+    ctx: *Ctx,
+    comptime body: fn (*Ctx, []const u8) anyerror!void,
+) !void {
+    var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
+    var buf_len: usize = 0;
+    var buf_pos: usize = 0;
+    var file_pos: u64 = range.start;
+    var scratch: std.ArrayListUnmanaged(u8) = .{};
+    defer scratch.deinit(allocator);
+
+    while (true) {
+        var started = false;
+        var depth: usize = 0;
+        var in_string = false;
+        var escape = false;
+        var obj_start: usize = buf_pos;
+        scratch.clearRetainingCapacity();
+        var found: ?[]const u8 = null;
+
+        object_search: while (true) {
+            while (buf_pos < buf_len) {
+                const c = buf[buf_pos];
+                if (!started) {
+                    if (c == '{') {
+                        started = true;
+                        depth = 1;
+                        obj_start = buf_pos;
+                    }
+                    buf_pos += 1;
+                    continue;
+                }
+                buf_pos += 1;
+                if (in_string) {
+                    if (escape) {
+                        escape = false;
+                    } else if (c == '\\') {
+                        escape = true;
+                    } else if (c == '"') {
+                        in_string = false;
+                    }
+                } else if (c == '"') {
+                    in_string = true;
+                } else if (c == '{') {
+                    depth += 1;
+                } else if (c == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        const chunk_part = buf[obj_start..buf_pos];
+                        if (scratch.items.len == 0) {
+                            found = chunk_part;
+                        } else {
+                            try scratch.appendSlice(allocator, chunk_part);
+                            found = scratch.items;
+                        }
+                        break :object_search;
+                    }
+                }
+            }
+            // Buffer exhausted before a complete object was found —
+            // flush what we have (if an object is in progress) and try
+            // to read more, bounded by range.end.
+            if (started) {
+                try scratch.appendSlice(allocator, buf[obj_start..buf_pos]);
+            }
+            if (file_pos >= range.end) break :object_search; // no more data in this range
+            const remaining: u64 = range.end - file_pos;
+            const to_read: usize = @intCast(@min(@as(u64, buf.len), remaining));
+            const n = try file.pread(buf[0..to_read], file_pos);
+            if (n == 0) break :object_search;
+            buf_len = n;
+            buf_pos = 0;
+            obj_start = 0;
+            file_pos += n;
+        }
+
+        if (found) |obj| {
+            try body(ctx, obj);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Same "first record's keys become the header" rule buildNdjsonHeader()
+/// uses for line-delimited files, but finds the first top-level `{...}`
+/// object instead of the first line — JSON arrays have no newlines to
+/// rely on. Grows its read window (same doubling strategy as
+/// alignForwardToNewline()) only in the pathological case where the
+/// first object alone is bigger than one chunk.
+fn buildJsonArrayHeader(allocator: Allocator, file: std.fs.File, file_size: u64) !NdjsonHeader {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+
+    var window_size: usize = WORKER_CHUNK_SIZE;
+    while (true) {
+        const to_read: usize = @intCast(@min(@as(u64, window_size), file_size));
+        const buf = try allocator.alloc(u8, to_read);
+        defer allocator.free(buf);
+        const n = try file.pread(buf, 0);
+
+        var started = false;
+        var depth: usize = 0;
+        var in_string = false;
+        var escape = false;
+        var obj_start: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const c = buf[i];
+            if (!started) {
+                if (c == '{') {
+                    started = true;
+                    depth = 1;
+                    obj_start = i;
+                }
+                continue;
+            }
+            if (in_string) {
+                if (escape) {
+                    escape = false;
+                } else if (c == '\\') {
+                    escape = true;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '{') {
+                depth += 1;
+            } else if (c == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    const first_obj = try aa.dupe(u8, buf[obj_start .. i + 1]);
+                    const obj = try json_parser.parseObject(first_obj, aa);
+                    const header = try aa.alloc([]const u8, obj.fields.len);
+                    var index: std.StringHashMapUnmanaged(usize) = .{};
+                    try index.ensureTotalCapacity(aa, @intCast(obj.fields.len));
+                    for (obj.fields, 0..) |field, k| {
+                        header[k] = field.key;
+                        index.putAssumeCapacity(field.key, k);
+                    }
+                    return .{ .header = header, .index = index, .arena = arena };
+                }
+            }
+        }
+        if (@as(u64, window_size) >= file_size) return error.MalformedJsonArray;
+        window_size *= 2;
+    }
+}
+
+const JsonArrayFilterCtx = struct {
+    allocator: Allocator,
+    header_index: *const std.StringHashMapUnmanaged(usize),
+    predicates: []const query_mod.Predicate,
+    field_buf: [][]const u8,
+    arena: std.heap.ArenaAllocator,
+    count: usize = 0,
+
+    fn onObject(self: *JsonArrayFilterCtx, obj_text: []const u8) !void {
+        _ = self.arena.reset(.retain_capacity);
+        const obj = json_parser.parseObject(obj_text, self.arena.allocator()) catch return;
+        for (self.field_buf) |*f| f.* = "";
+        for (obj.fields) |field| {
+            const idx = self.header_index.get(field.key) orelse continue;
+            self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+        }
+        const scan = @import("root.zig");
+        if (query_mod.matches(scan.Row{ .fields = self.field_buf }, self.predicates)) self.count += 1;
+    }
+};
+
+const JsonArrayFilterWorker = struct {
+    allocator: Allocator,
+    file: std.fs.File,
+    range: Range,
+    header: [][]const u8,
+    header_index: *const std.StringHashMapUnmanaged(usize),
+    predicates: []const query_mod.Predicate,
+    result: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn jsonArrayFilterWorkerRun(w: *JsonArrayFilterWorker) void {
+    const field_buf = w.allocator.alloc([]const u8, w.header.len) catch |e| {
+        w.err = e;
+        return;
+    };
+    var ctx = JsonArrayFilterCtx{
+        .allocator = w.allocator,
+        .header_index = w.header_index,
+        .predicates = w.predicates,
+        .field_buf = field_buf,
+        .arena = std.heap.ArenaAllocator.init(w.allocator),
+    };
+    defer {
+        ctx.arena.deinit();
+        w.allocator.free(field_buf);
+    }
+    forEachJsonObjectInRange(w.allocator, w.file, w.range, JsonArrayFilterCtx, &ctx, JsonArrayFilterCtx.onObject) catch |e| {
+        w.err = e;
+        return;
+    };
+    w.result = ctx.count;
 }
 
 /// Row count — parallel equivalent of Query.count()'s no-WHERE fast
@@ -593,17 +892,16 @@ fn buildNdjsonHeader(allocator: Allocator, file: std.fs.File, file_size: u64) !N
 /// of Query.count()'s filtered (non-fast-path) branch. `predicates` use
 /// the same query_mod.Predicate shape (numeric column index, not name —
 /// resolve names via a throwaway Scanner/NdjsonScanner open first, same
-/// as Query.open()/the Python/Node bindings already do). CSV and NDJSON
-/// run the real parallel path (NDJSON via a shared, once-built
-/// header_index — see buildNdjsonHeader()). JSON arrays delegate to the
-/// existing single-threaded Query/NdjsonScanner path instead — not a
-/// missing feature, a deliberate non-duplication: a JSON array's Nth
-/// object boundary can only be found by walking brace depth from the
-/// start of the file (see countJsonArrayObjects()'s doc comment above),
-/// so a correct parallel split needs a sequential pre-pass that already
-/// costs as much as doing the filtering directly — reimplementing JSON-
-/// object parsing a third time in this file for zero speed benefit
-/// isn't worth the maintenance cost of a third copy of that logic.
+/// as Query.open()/the Python/Node bindings already do). All three
+/// formats now run genuinely in parallel: CSV and NDJSON split on line
+/// boundaries (NDJSON via a shared, once-built header_index — see
+/// buildNdjsonHeader()); JSON arrays split on OBJECT boundaries (see
+/// findJsonArrayRanges()) — unlike the no-WHERE fast path
+/// (parallelCountRows(), see countJsonArrayObjects()'s doc comment for
+/// why THAT one stays sequential), the per-object parse+match work here
+/// is expensive enough that paying a one-time sequential boundary walk
+/// to unlock parallel parsing on top of it is a real net win, not just
+/// moved cost.
 pub fn parallelCountRowsWhere(
     allocator: Allocator,
     path: []const u8,
@@ -619,13 +917,30 @@ pub fn parallelCountRowsWhere(
     if (file_size == 0) return ParallelError.EmptyFile;
 
     if (try sniffFormat(file, file_size) == .json_array) {
-        // Query.open() below opens its own handle — this function's
-        // `file` (and its `defer file.close()` above) still owns and
-        // closes the one used for sniffing; two independent read-only
-        // opens of the same path is safe on every platform.
-        var q = try query_mod.Query.open(allocator, path, .{ .where = predicates, .format = .ndjson });
-        defer q.deinit();
-        return q.count();
+        if (file_size == 0) return ParallelError.EmptyFile;
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        const requested = if (num_threads_in == 0) cpu_count else num_threads_in;
+        const num_threads = @max(1, @min(requested, file_size));
+
+        var hdr = try buildJsonArrayHeader(allocator, file, file_size);
+        defer hdr.deinit();
+        const ranges = try findJsonArrayRanges(allocator, file, file_size, num_threads);
+        defer allocator.free(ranges);
+
+        const workers = try allocator.alloc(JsonArrayFilterWorker, ranges.len);
+        defer allocator.free(workers);
+        const threads = try allocator.alloc(std.Thread, ranges.len);
+        defer allocator.free(threads);
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
+        for (0..ranges.len) |i| threads[i] = try std.Thread.spawn(.{}, jsonArrayFilterWorkerRun, .{&workers[i]});
+        for (threads) |t| t.join();
+
+        var total: usize = 0;
+        for (workers) |w| {
+            if (w.err) |e| return e;
+            total += w.result;
+        }
+        return total;
     }
 
     const is_csv = query_mod.inferFormat(path) == .csv;
