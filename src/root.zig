@@ -80,6 +80,10 @@ pub const OwnedRow = topk_mod.OwnedRow;
 pub const Entry = topk_mod.Entry;
 pub const topK = topk_mod.topK;
 
+const parallel_mod = @import("parallel.zig");
+pub const ParallelError = parallel_mod.ParallelError;
+pub const parallelCountRows = parallel_mod.parallelCountRows;
+
 test {
     _ = query_mod;
     _ = ndjson_mod;
@@ -87,6 +91,7 @@ test {
     _ = topk_mod;
     _ = json_parser_mod;
     _ = json_simd_mod;
+    _ = parallel_mod;
     _ = json_array_mod;
 }
 
