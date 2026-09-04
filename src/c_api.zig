@@ -605,18 +605,14 @@ export fn scanio_collect_close(cc: ?*CollectCtx) void {
 /// this function already allocated. No NUL terminators needed either
 /// (Arrow uses offsets, not termination) — one byte/field leaner than
 /// scanio_collect()'s format too.
-const ColumnBuf = struct {
-    data: std.ArrayListUnmanaged(u8) = .{},
-    /// offsets.items.len == n_rows + 1 always; offsets[0] == 0;
-    /// offsets[i] is the END (exclusive) byte position of row i-1's
-    /// value in `data` — i.e. row i's value is data[offsets[i]..offsets[i+1]].
-    offsets: std.ArrayListUnmanaged(u32) = .{},
-
-    fn deinit(self: *ColumnBuf) void {
-        self.data.deinit(c_allocator);
-        self.offsets.deinit(c_allocator);
-    }
-};
+/// Same type parallel.zig's parallelScanColumnar()/mergeColumnarWorkers()
+/// use — aliased, not redefined, so scanio_parallel_collect_columnar()
+/// below can wrap that function's output DIRECTLY with zero re-copy,
+/// which was the whole point of unifying the two. offsets.items.len ==
+/// n_rows + 1 always; offsets[0] == 0; offsets[i] is the END (exclusive)
+/// byte position of row i-1's value in `data` — i.e. row i's value is
+/// data[offsets[i]..offsets[i+1]].
+const ColumnBuf = scan.ColumnBuf;
 
 const CollectColumnarCtx = struct {
     columns: []ColumnBuf = &.{},
@@ -624,7 +620,7 @@ const CollectColumnarCtx = struct {
     n_cols: usize = 0,
 
     fn deinitAndFree(self: *CollectColumnarCtx) void {
-        for (self.columns) |*col| col.deinit();
+        for (self.columns) |*col| col.deinit(c_allocator);
         if (self.columns.len > 0) c_allocator.free(self.columns);
     }
 };
@@ -834,50 +830,29 @@ export fn scanio_parallel_collect_columnar(
         }
     }
 
-    var result = scan.parallelScan(c_allocator, std.mem.span(p), delimiter, predicates, num_threads) catch |e| {
+    // Straight to columnar via parallelScanColumnar() — NOT parallelScan()
+    // + a re-copy into ColumnBuf like this function used to do. That
+    // older version paid two real costs: parallelScan()'s OwnedRow does
+    // one allocator.dupe() call per FIELD (millions of tiny allocations
+    // for a large result — the same class of cost scan_bench.zig's own
+    // fix eliminated at smaller scope), and then this function copied
+    // AGAIN from OwnedRow into ColumnBuf. parallelScanColumnar()'s
+    // workers write directly into per-worker ColumnBuf (amortized
+    // ArrayList growth, no per-field allocations) and this function now
+    // just takes ownership of its output directly — zero re-copy, since
+    // CollectColumnarCtx.columns IS scan.ColumnBuf, not a
+    // separate type that needs converting.
+    var result = scan.parallelScanColumnar(c_allocator, std.mem.span(p), delimiter, predicates, num_threads) catch |e| {
         setError("parallel scan failed: {s}", .{@errorName(e)});
         return null;
     };
-    defer result.deinit();
 
     const cc = c_allocator.create(CollectColumnarCtx) catch {
         setError("out of memory allocating columnar collect context", .{});
+        result.deinit();
         return null;
     };
-    cc.* = .{};
-    if (result.rows.len == 0) return cc;
-
-    cc.n_rows = result.rows.len;
-    cc.n_cols = result.rows[0].fields.len;
-    cc.columns = c_allocator.alloc(ColumnBuf, cc.n_cols) catch {
-        setError("out of memory allocating columnar collect context", .{});
-        c_allocator.destroy(cc);
-        return null;
-    };
-    for (cc.columns) |*col| col.* = .{};
-    for (cc.columns) |*col| col.offsets.append(c_allocator, 0) catch {
-        setError("out of memory allocating columnar collect context", .{});
-        cc.deinitAndFree();
-        c_allocator.destroy(cc);
-        return null;
-    };
-
-    for (result.rows) |row| {
-        for (row.fields, 0..) |field, i| {
-            cc.columns[i].data.appendSlice(c_allocator, field) catch {
-                setError("out of memory collecting rows", .{});
-                cc.deinitAndFree();
-                c_allocator.destroy(cc);
-                return null;
-            };
-            cc.columns[i].offsets.append(c_allocator, @intCast(cc.columns[i].data.items.len)) catch {
-                setError("out of memory collecting rows", .{});
-                cc.deinitAndFree();
-                c_allocator.destroy(cc);
-                return null;
-            };
-        }
-    }
+    cc.* = .{ .columns = result.columns, .n_rows = result.n_rows, .n_cols = result.n_cols };
     return cc;
 }
 

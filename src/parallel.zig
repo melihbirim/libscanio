@@ -1231,6 +1231,312 @@ pub fn parallelScan(
     return .{ .allocator = allocator, .rows = try total_rows.toOwnedSlice(allocator) };
 }
 
+/// Per-column buffer pair — a concatenated `data` byte buffer plus a
+/// `u32` `offsets` array (offsets[i]..offsets[i+1] bounds row i's
+/// value), exactly Apache Arrow's own StringArray layout. Shared,
+/// public type: c_api.zig's C ABI wraps this directly (no re-copy) for
+/// scanio_parallel_collect_columnar() — see that function's doc comment
+/// for why this exists instead of routing through parallelScan()'s
+/// OwnedRow.
+pub const ColumnBuf = struct {
+    data: std.ArrayListUnmanaged(u8) = .{},
+    offsets: std.ArrayListUnmanaged(u32) = .{},
+
+    pub fn deinit(self: *ColumnBuf, allocator: Allocator) void {
+        self.data.deinit(allocator);
+        self.offsets.deinit(allocator);
+    }
+};
+
+pub const ColumnarScanResult = struct {
+    allocator: Allocator,
+    columns: []ColumnBuf,
+    n_rows: usize,
+    n_cols: usize,
+
+    pub fn deinit(self: *ColumnarScanResult) void {
+        for (self.columns) |*c| c.deinit(self.allocator);
+        if (self.columns.len > 0) self.allocator.free(self.columns);
+    }
+};
+
+fn newColumnBufs(allocator: Allocator, n_cols: usize) ![]ColumnBuf {
+    const columns = try allocator.alloc(ColumnBuf, n_cols);
+    for (columns) |*c| c.* = .{};
+    for (columns) |*c| try c.offsets.append(allocator, 0);
+    return columns;
+}
+
+fn deinitColumnBufs(allocator: Allocator, columns: []ColumnBuf) void {
+    for (columns) |*c| c.deinit(allocator);
+    if (columns.len > 0) allocator.free(columns);
+}
+
+const CsvScanColumnarCtx = struct {
+    allocator: Allocator,
+    delimiter: u8,
+    predicates: []const query_mod.Predicate,
+    field_buf: std.ArrayListUnmanaged([]const u8) = .{},
+    columns: []ColumnBuf,
+    n_rows: usize = 0,
+
+    fn onLine(self: *CsvScanColumnarCtx, line: []const u8) !void {
+        self.field_buf.clearRetainingCapacity();
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i <= line.len) : (i += 1) {
+            if (i == line.len or line[i] == self.delimiter) {
+                try self.field_buf.append(self.allocator, line[start..i]);
+                start = i + 1;
+            }
+        }
+        const scan = @import("root.zig");
+        const row = scan.Row{ .fields = self.field_buf.items };
+        if (!query_mod.matches(row, self.predicates)) return;
+        for (self.field_buf.items, 0..) |field, ci| {
+            if (ci >= self.columns.len) break; // wider row than the header — extra trailing fields ignored, same as row-major collect()
+            try self.columns[ci].data.appendSlice(self.allocator, field);
+            try self.columns[ci].offsets.append(self.allocator, @intCast(self.columns[ci].data.items.len));
+        }
+        self.n_rows += 1;
+    }
+};
+
+const CsvScanColumnarWorker = struct {
+    allocator: Allocator,
+    file: std.fs.File,
+    range: Range,
+    delimiter: u8,
+    predicates: []const query_mod.Predicate,
+    n_cols: usize,
+    columns: []ColumnBuf = &.{},
+    n_rows: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn csvScanColumnarWorkerRun(w: *CsvScanColumnarWorker) void {
+    const columns = newColumnBufs(w.allocator, w.n_cols) catch |e| {
+        w.err = e;
+        return;
+    };
+    var ctx = CsvScanColumnarCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates, .columns = columns };
+    defer ctx.field_buf.deinit(w.allocator);
+    forEachLineInRange(w.allocator, w.file, w.range, CsvScanColumnarCtx, &ctx, CsvScanColumnarCtx.onLine) catch |e| {
+        deinitColumnBufs(w.allocator, columns);
+        w.err = e;
+        return;
+    };
+    w.columns = columns;
+    w.n_rows = ctx.n_rows;
+}
+
+const NdjsonScanColumnarCtx = struct {
+    allocator: Allocator,
+    header_index: *const std.StringHashMapUnmanaged(usize),
+    predicates: []const query_mod.Predicate,
+    field_buf: [][]const u8,
+    arena: std.heap.ArenaAllocator,
+    columns: []ColumnBuf,
+    n_rows: usize = 0,
+
+    fn onLine(self: *NdjsonScanColumnarCtx, line: []const u8) !void {
+        if (line.len == 0) return;
+        _ = self.arena.reset(.retain_capacity);
+        const obj = json_parser.parseObject(line, self.arena.allocator()) catch return;
+        for (self.field_buf) |*f| f.* = "";
+        for (obj.fields) |field| {
+            const idx = self.header_index.get(field.key) orelse continue;
+            self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+        }
+        const scan = @import("root.zig");
+        const row = scan.Row{ .fields = self.field_buf };
+        if (!query_mod.matches(row, self.predicates)) return;
+        for (self.field_buf, 0..) |field, ci| {
+            try self.columns[ci].data.appendSlice(self.allocator, field);
+            try self.columns[ci].offsets.append(self.allocator, @intCast(self.columns[ci].data.items.len));
+        }
+        self.n_rows += 1;
+    }
+};
+
+const NdjsonScanColumnarWorker = struct {
+    allocator: Allocator,
+    file: std.fs.File,
+    range: Range,
+    header: [][]const u8,
+    header_index: *const std.StringHashMapUnmanaged(usize),
+    predicates: []const query_mod.Predicate,
+    columns: []ColumnBuf = &.{},
+    n_rows: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn ndjsonScanColumnarWorkerRun(w: *NdjsonScanColumnarWorker) void {
+    const field_buf = w.allocator.alloc([]const u8, w.header.len) catch |e| {
+        w.err = e;
+        return;
+    };
+    defer w.allocator.free(field_buf);
+    const columns = newColumnBufs(w.allocator, w.header.len) catch |e| {
+        w.err = e;
+        return;
+    };
+    var ctx = NdjsonScanColumnarCtx{
+        .allocator = w.allocator,
+        .header_index = w.header_index,
+        .predicates = w.predicates,
+        .field_buf = field_buf,
+        .arena = std.heap.ArenaAllocator.init(w.allocator),
+        .columns = columns,
+    };
+    defer ctx.arena.deinit();
+    forEachLineInRange(w.allocator, w.file, w.range, NdjsonScanColumnarCtx, &ctx, NdjsonScanColumnarCtx.onLine) catch |e| {
+        deinitColumnBufs(w.allocator, columns);
+        w.err = e;
+        return;
+    };
+    w.columns = columns;
+    w.n_rows = ctx.n_rows;
+}
+
+/// Merges N workers' per-worker ColumnBuf arrays into one final result —
+/// one bulk `appendSlice` per worker per column for `data` (cheap, a
+/// single memcpy-shaped operation, not per-field), one re-based integer
+/// append per ROW for `offsets` (n_rows total across all workers, not
+/// n_rows*n_cols). Still technically "two copies" of the bytes (worker-
+/// local buffer, then this merge), but the DOMINANT cost this whole fix
+/// exists for — OwnedRow's one-`allocator.dupe()`-per-FIELD pattern,
+/// millions of tiny allocations for a large result — is gone; workers
+/// only ever do amortized ArrayList growth, never per-field mallocs.
+/// A further step (workers writing directly into a single shared, pre-
+/// sized final buffer, avoiding this merge copy too) would need a
+/// two-pass-per-worker approach — a real, larger change (see
+/// scan_bench.zig's own two-pass fix for the same idea at smaller
+/// scope) not pursued here since the actual measured cost driver was
+/// the many-small-allocations pattern, not this merge step.
+fn mergeColumnarWorkers(allocator: Allocator, n_cols: usize, comptime WorkerT: type, workers: []const WorkerT) !ColumnarScanResult {
+    const final_columns = try newColumnBufs(allocator, n_cols);
+    errdefer deinitColumnBufs(allocator, final_columns);
+
+    var total_rows: usize = 0;
+    for (workers) |w| {
+        for (0..n_cols) |ci| {
+            const base: u32 = @intCast(final_columns[ci].data.items.len);
+            try final_columns[ci].data.appendSlice(allocator, w.columns[ci].data.items);
+            for (w.columns[ci].offsets.items[1..]) |off| {
+                try final_columns[ci].offsets.append(allocator, base + off);
+            }
+        }
+        total_rows += w.n_rows;
+    }
+    return .{ .allocator = allocator, .columns = final_columns, .n_rows = total_rows, .n_cols = n_cols };
+}
+
+/// Columnar equivalent of parallelScan() — same range-splitting/thread
+/// shape, but workers write directly into per-worker ColumnBuf arrays
+/// (see mergeColumnarWorkers()'s doc comment for why this exists: it's
+/// the real fix for a known, logged inefficiency — scanio_parallel_
+/// collect_columnar() used to build parallelScan()'s OwnedRow results
+/// first, THEN re-copy them into columnar buffers, paying both
+/// OwnedRow's per-field-allocation cost AND a second full copy). JSON
+/// arrays still delegate to the single-threaded Query path (same
+/// reasoning as parallelScan()/parallelCountRowsWhere() — see their own
+/// doc comments), but even there this builds columnar output directly
+/// from Query.next(), no OwnedRow intermediate either.
+pub fn parallelScanColumnar(
+    allocator: Allocator,
+    path: []const u8,
+    delimiter: u8,
+    predicates: []const query_mod.Predicate,
+    num_threads_in: usize,
+) !ColumnarScanResult {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const file_size = (try file.stat()).size;
+    if (file_size == 0) return ParallelError.EmptyFile;
+
+    if (try sniffFormat(file, file_size) == .json_array) {
+        const scan = @import("root.zig");
+        var q = try scan.Query.open(allocator, path, .{ .where = predicates, .format = .ndjson });
+        defer q.deinit();
+        const n_cols = q.header().len;
+        const columns = try newColumnBufs(allocator, n_cols);
+        errdefer deinitColumnBufs(allocator, columns);
+        var n_rows: usize = 0;
+        while (try q.next()) |row| {
+            for (row.fields, 0..) |field, ci| {
+                try columns[ci].data.appendSlice(allocator, field);
+                try columns[ci].offsets.append(allocator, @intCast(columns[ci].data.items.len));
+            }
+            n_rows += 1;
+        }
+        return .{ .allocator = allocator, .columns = columns, .n_rows = n_rows, .n_cols = n_cols };
+    }
+
+    const is_csv = query_mod.inferFormat(path) == .csv;
+    const data_start: u64 = if (is_csv) try alignForwardToNewline(file, allocator, 0, file_size) else 0;
+    if (data_start >= file_size) {
+        const columns = try newColumnBufs(allocator, 0);
+        return .{ .allocator = allocator, .columns = columns, .n_rows = 0, .n_cols = 0 };
+    }
+
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const requested = if (num_threads_in == 0) cpu_count else num_threads_in;
+    const data_len = file_size - data_start;
+    const num_threads = @max(1, @min(requested, data_len));
+
+    const ranges = try splitRangesFrom(allocator, file, data_start, file_size, num_threads);
+    defer allocator.free(ranges);
+
+    if (is_csv) {
+        var probe = try (@import("root.zig")).Scanner.open(allocator, path);
+        const n_cols = probe.header.len;
+        probe.deinit();
+
+        const workers = try allocator.alloc(CsvScanColumnarWorker, num_threads);
+        defer allocator.free(workers);
+        const threads = try allocator.alloc(std.Thread, num_threads);
+        defer allocator.free(threads);
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .n_cols = n_cols };
+        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, csvScanColumnarWorkerRun, .{&workers[i]});
+        for (threads) |t| t.join();
+
+        var first_err: ?anyerror = null;
+        for (workers) |w| {
+            if (w.err) |e| first_err = e;
+        }
+        if (first_err) |e| {
+            for (workers) |w| deinitColumnBufs(allocator, w.columns);
+            return e;
+        }
+        defer for (workers) |w| deinitColumnBufs(allocator, w.columns);
+        return mergeColumnarWorkers(allocator, n_cols, CsvScanColumnarWorker, workers);
+    } else {
+        var hdr = try buildNdjsonHeader(allocator, file, file_size);
+        defer hdr.deinit();
+        const n_cols = hdr.header.len;
+
+        const workers = try allocator.alloc(NdjsonScanColumnarWorker, num_threads);
+        defer allocator.free(workers);
+        const threads = try allocator.alloc(std.Thread, num_threads);
+        defer allocator.free(threads);
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
+        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, ndjsonScanColumnarWorkerRun, .{&workers[i]});
+        for (threads) |t| t.join();
+
+        var first_err: ?anyerror = null;
+        for (workers) |w| {
+            if (w.err) |e| first_err = e;
+        }
+        if (first_err) |e| {
+            for (workers) |w| deinitColumnBufs(allocator, w.columns);
+            return e;
+        }
+        defer for (workers) |w| deinitColumnBufs(allocator, w.columns);
+        return mergeColumnarWorkers(allocator, n_cols, NdjsonScanColumnarWorker, workers);
+    }
+}
+
 test "parallelCountRows matches single-thread count on a small file" {
     const allocator = std.testing.allocator;
     const path = "test_parallel_small.csv";
@@ -1652,4 +1958,124 @@ test "parallelScan: empty file returns EmptyFile" {
     defer std.fs.cwd().deleteFile(path) catch {};
 
     try std.testing.expectError(ParallelError.EmptyFile, parallelScan(allocator, path, ',', &.{}, 4));
+}
+
+fn columnarCellValue(result: ColumnarScanResult, col: usize, row: usize) []const u8 {
+    const c = result.columns[col];
+    return c.data.items[c.offsets.items[row]..c.offsets.items[row + 1]];
+}
+
+test "parallelScanColumnar: CSV matches parallelScan's OwnedRow output on a real multi-chunk file" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_columnar_csv.csv";
+
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "id,city,amount\n");
+    var i: usize = 0;
+    while (i < 50_000) : (i += 1) {
+        const city = if (i % 3 == 0) "Austin" else "Denver";
+        try data.writer(allocator).print("{d},{s},{d}\n", .{ i, city, i * 3 });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+
+    var rowResult = try parallelScan(allocator, path, ',', &predicates, 8);
+    defer rowResult.deinit();
+
+    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, 8);
+    defer colResult.deinit();
+
+    try std.testing.expectEqual(rowResult.rows.len, colResult.n_rows);
+    try std.testing.expectEqual(@as(usize, 3), colResult.n_cols);
+
+    // Order isn't guaranteed to match between the two (both concatenate
+    // worker ranges, but range boundaries can differ between the two
+    // independent range-split calls) — verify via id-column SET
+    // equality, same reasoning as the C ABI's own single-vs-parallel test.
+    var row_ids = std.AutoHashMap(u64, void).init(allocator);
+    defer row_ids.deinit();
+    for (rowResult.rows) |r| {
+        const id = try std.fmt.parseInt(u64, r.get(0).?, 10);
+        try row_ids.put(id, {});
+    }
+    var j: usize = 0;
+    while (j < colResult.n_rows) : (j += 1) {
+        const id = try std.fmt.parseInt(u64, columnarCellValue(colResult, 0, j), 10);
+        try std.testing.expect(row_ids.contains(id));
+        try std.testing.expectEqualStrings("Austin", columnarCellValue(colResult, 1, j));
+        const amount = try std.fmt.parseInt(u64, columnarCellValue(colResult, 2, j), 10);
+        try std.testing.expectEqual(id * 3, amount);
+    }
+}
+
+test "parallelScanColumnar: NDJSON matches expected count and field consistency" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_columnar_ndjson.ndjson";
+
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    var i: usize = 0;
+    while (i < 30_000) : (i += 1) {
+        const city = if (i % 4 == 0) "Austin" else "Denver";
+        try data.writer(allocator).print("{{\"id\":{d},\"city\":\"{s}\",\"amount\":{d}}}\n", .{ i, city, i * 5 });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const scan = @import("root.zig");
+    var q = try scan.Query.open(allocator, path, .{ .where = &.{scan.Predicate.init(1, .eq, "Austin")} });
+    defer q.deinit();
+    const expected_count = try q.count();
+
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, 8);
+    defer colResult.deinit();
+
+    try std.testing.expectEqual(expected_count, colResult.n_rows);
+    try std.testing.expectEqual(@as(usize, 7_500), colResult.n_rows);
+    var j: usize = 0;
+    while (j < colResult.n_rows) : (j += 1) {
+        try std.testing.expectEqualStrings("Austin", columnarCellValue(colResult, 1, j));
+        const id = try std.fmt.parseInt(u64, columnarCellValue(colResult, 0, j), 10);
+        const amount = try std.fmt.parseInt(u64, columnarCellValue(colResult, 2, j), 10);
+        try std.testing.expectEqual(id * 5, amount);
+    }
+}
+
+test "parallelScanColumnar: JSON array matches expected count" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_columnar_json_array.json";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "[{\"id\":1,\"city\":\"Austin\"},{\"id\":2,\"city\":\"Denver\"},{\"id\":3,\"city\":\"Austin\"}]" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
+    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, 4);
+    defer colResult.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), colResult.n_rows);
+    try std.testing.expectEqualStrings("1", columnarCellValue(colResult, 0, 0));
+    try std.testing.expectEqualStrings("3", columnarCellValue(colResult, 0, 1));
+}
+
+test "parallelScanColumnar: no predicates still scans every row" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_columnar_all.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id\n1\n2\n3\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var colResult = try parallelScanColumnar(allocator, path, ',', &.{}, 4);
+    defer colResult.deinit();
+    try std.testing.expectEqual(@as(usize, 3), colResult.n_rows);
+}
+
+test "parallelScanColumnar: empty file returns EmptyFile" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_columnar_empty.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    try std.testing.expectError(ParallelError.EmptyFile, parallelScanColumnar(allocator, path, ',', &.{}, 4));
 }

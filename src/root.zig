@@ -87,6 +87,9 @@ pub const parallelCountRows = parallel_mod.parallelCountRows;
 pub const parallelCountRowsWhere = parallel_mod.parallelCountRowsWhere;
 pub const parallelScan = parallel_mod.parallelScan;
 pub const ScannedRows = parallel_mod.ScannedRows;
+pub const parallelScanColumnar = parallel_mod.parallelScanColumnar;
+pub const ColumnarScanResult = parallel_mod.ColumnarScanResult;
+pub const ColumnBuf = parallel_mod.ColumnBuf;
 
 const order_mod = @import("order.zig");
 pub const OrderedRows = order_mod.OrderedRows;
