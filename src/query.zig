@@ -222,7 +222,7 @@ pub const Query = struct {
     }
 };
 
-fn matches(row: Row, predicates: []const Predicate) bool {
+pub fn matches(row: Row, predicates: []const Predicate) bool {
     for (predicates) |p| {
         const field = row.get(p.column) orelse return false;
         if (!evalOne(field, p)) return false;
