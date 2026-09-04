@@ -286,6 +286,39 @@ Named directly, not left implicit — asked for an outside-eye assessment of the
 
 Honest caveat, same discipline as the earlier `scan_bench` swap incident: at N=32, pyarrow's own combined RSS (~5.5GB) exceeded this machine's free RAM (~4.6GB), so real swap activity occurred on both reruns (12,760-194,780 pages swapped out) — not noise, a genuine consequence of pyarrow's own memory cost at that N on this host, reproducible across two runs (~5.5-5.6GB both times) despite the swap. Confirms the mechanism claim above with a second engine, not just DuckDB: pyarrow scales roughly linearly in memory with N (no flat per-process floor the way libscanio's chunked design has), and at N=32 that cost is large enough to induce real memory pressure where libscanio's isn't. Not yet done: profiling WHY pyarrow's per-process floor is what it is (Arrow's own memory pool/allocator behavior, similar mechanism question already raised for DuckDB) — measured the effect, not yet the cause.
 
+**The "naive read+filter" path isn't pyarrow's best foot forward — re-ran against `pyarrow.dataset` with filter pushdown (`ds.dataset(path, format="csv").to_table(filter=...)`), which streams/batches instead of fully materializing before filtering. Result is a genuine, reproducible crossover, reported as measured, not resolved into a clean story:**
+
+Same 500MB fixture, single call, 3 runs each:
+
+| | wall | peak RSS |
+|---|---|---|
+| libscanio `scan_table()` | 0.94-0.96s | 534-543MB |
+| pyarrow naive (read_csv + filter) | 0.62-0.77s | 1,509-1,513MB |
+| pyarrow.dataset (filter pushdown) | 2.03s | 298-315MB |
+
+Same 50MB fixture, single call, 3 runs each:
+
+| | wall | peak RSS |
+|---|---|---|
+| libscanio `scan_table()` | 0.18-0.20s | 94-96MB |
+| pyarrow naive | 0.28-0.29s | 253-260MB |
+| pyarrow.dataset | 0.21-0.22s | 165-175MB |
+
+At 500MB, `pyarrow.dataset` uses LESS memory than libscanio (298MB vs 538MB) but takes over 2x longer. At 50MB, libscanio wins both axes. The ordering flips between scales, confirmed reproducible on reruns — not measurement noise. Working theory, not yet confirmed: `pyarrow.dataset`'s batched scan carries fixed per-call overhead (batch sizing, file discovery, thread pool setup) that dominates at 50MB but amortizes at 500MB, while libscanio's memory scales more directly with matched-row byte volume — would need to be checked across more file sizes to find where the crossover actually sits, not just confirmed at two points.
+
+N-way concurrency sweep (50MB fixture, same harness) still favors libscanio at every N against BOTH pyarrow paths — `pyarrow.dataset`'s per-process floor is lower than the naive path's but still grows faster under concurrent load than libscanio's:
+
+| N | libscanio `scan_table()` | pyarrow naive | pyarrow.dataset |
+|---|---|---|---|
+| 1 | 0.31s / 101.6MB | 0.50-0.53s / 253-254MB | 0.75s / 166.1MB |
+| 2 | 0.33s / 178.4MB | 0.53-0.59s / 513-520MB | 0.75s / 343.1MB |
+| 4 | 0.46s / 291.5MB | 0.57-0.63s / 1,024-1,032MB | 0.77s / 670.7MB |
+| 8 | 0.74s / 679.5MB | 0.74-0.87s / 1,913-2,056MB | 0.87s / 1,338.5MB |
+| 16 | 1.36s / 1,315.3MB | 1.37-2.05s / 2,980-4,154MB | 1.57s / 2,664.4MB |
+| 32 | 2.71s / 1,968.3MB | 3.89-4.17s / 5,466-5,593MB | 3.18s / 4,578.9MB |
+
+Honest summary: libscanio's single-query advantage over pyarrow is NOT unconditional — `pyarrow.dataset` beats it on memory at 500MB. Its concurrency advantage held at every N tested against both pyarrow paths. The crossover point and its cause are open, not closed — logged as the next concrete thing to chase, not claimed as resolved.
+
 Outside-eye grading of this project as CS research landed at C+: solid engineering, well-understood techniques, no new algorithm or data structure — not a systems-novelty paper. The realistic path to a defensible A-/B+ isn't inventing new CS, it's turning the per-query-memory-under-concurrency angle (see the N-way concurrency experiment section above) into a rigorous evaluation/methodology contribution — the kind DaMoN and similar venues credit even without a new algorithm. Concrete, ordered work, not done yet:
 
 1. **Name and formally define the metric.** "Peak combined RSS under N-way concurrent load" isn't an established, citable benchmark dimension — every existing CSV/DB benchmark (including this project's own `docs/BENCHMARKS.md`) measures one query at a time. Write a precise definition and state exactly what single-query peak-RSS benchmarks structurally miss.
