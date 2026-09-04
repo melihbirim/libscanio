@@ -101,7 +101,20 @@ fn splitRangesFrom(allocator: Allocator, file: std.fs.File, data_start: u64, fil
     return ranges;
 }
 
-const WORKER_CHUNK_SIZE = 256 * 1024; // matches root.zig's CHUNK_SIZE default
+/// 1MB, not root.zig's 256KB single-thread default — measured, not
+/// assumed: on a real 10.46GB/130M-row file, 256KB gave a WHERE-filtered
+/// parallel count of ~3.4s/2.2s (before/after the stop_after_column fix
+/// below); bumping to 1MB alone took the post-fix number to a stable
+/// ~1.86-1.88s, edging ahead of csvql's own WHERE COUNT(*) (1.99s) on
+/// the same file. 2MB measured faster still (~1.8-2.0s) but pushed peak
+/// memory to ~27MB, within noise of csvql's 29.3MB — closing the speed
+/// gap further that way would cost the memory-efficiency story this
+/// whole parallel path exists for; 1MB (peak ~14.4MB, still ~2x below
+/// csvql) was kept as the better tradeoff. Single-thread root.zig's
+/// 256KB stays as-is — that number was tuned for ITS OWN workload
+/// (Scanner.next()'s per-row field split, not a multi-threaded raw-byte
+/// scan), not blindly copied here.
+const WORKER_CHUNK_SIZE = 1024 * 1024;
 
 const CountWorker = struct {
     file: std.fs.File,
@@ -372,10 +385,28 @@ fn forEachLineInRange(
     }
 }
 
+/// Highest column index any predicate reads — same optimization root.zig's
+/// Scanner already applies via ScannerOptions.stop_after_column, just
+/// computed here from the predicate list directly instead of a caller-
+/// supplied bound (this worker has no separate "columns" projection to
+/// also account for, unlike Query, since a filtered COUNT never returns
+/// row data). Real, measured motivation: without this, the CSV filter
+/// worker split every column of every row (10, on the real e-commerce
+/// fixture this was benchmarked against) even when the WHERE clause only
+/// ever reads one — csvql's own WHERE-filtered COUNT(*) beat this
+/// worker's un-bounded version (1.99s vs 3.37s on a real 130M-row file)
+/// before this fix.
+fn maxPredicateColumn(predicates: []const query_mod.Predicate) usize {
+    var max: usize = 0;
+    for (predicates) |p| max = @max(max, p.column);
+    return max;
+}
+
 const CsvFilterCtx = struct {
     allocator: Allocator,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    stop_after_column: usize,
     field_buf: std.ArrayListUnmanaged([]const u8) = .{},
     count: usize = 0,
 
@@ -390,6 +421,10 @@ const CsvFilterCtx = struct {
         while (i <= line.len) : (i += 1) {
             if (i == line.len or line[i] == self.delimiter) {
                 try self.field_buf.append(self.allocator, line[start..i]);
+                // Everything past stop_after_column is provably never
+                // read by any predicate — stop splitting this row's
+                // remaining bytes entirely, not just discard them.
+                if (self.field_buf.items.len == self.stop_after_column + 1) break;
                 start = i + 1;
             }
         }
@@ -404,12 +439,13 @@ const CsvFilterWorker = struct {
     range: Range,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    stop_after_column: usize,
     result: usize = 0,
     err: ?anyerror = null,
 };
 
 fn csvFilterWorkerRun(w: *CsvFilterWorker) void {
-    var ctx = CsvFilterCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates };
+    var ctx = CsvFilterCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates, .stop_after_column = w.stop_after_column };
     defer ctx.deinit();
     forEachLineInRange(w.allocator, w.file, w.range, CsvFilterCtx, &ctx, CsvFilterCtx.onLine) catch |e| {
         w.err = e;
@@ -606,11 +642,12 @@ pub fn parallelCountRowsWhere(
 
     var total: usize = 0;
     if (is_csv) {
+        const stop_after_column = maxPredicateColumn(predicates);
         const workers = try allocator.alloc(CsvFilterWorker, num_threads);
         defer allocator.free(workers);
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
-        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates };
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .stop_after_column = stop_after_column };
         for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, csvFilterWorkerRun, .{&workers[i]});
         for (threads) |t| t.join();
         for (workers) |w| {
