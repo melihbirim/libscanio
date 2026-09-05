@@ -58,29 +58,30 @@ jobs:
       - name: zig build python-test
         run: zig build python-test
 
-      # TEMPORARY: re-enabled on Windows to retest against koffi 3.2.1
-      # (upgraded from 3.2.0) — the changelog shows real Win64 stability
-      # fixes in 3.1.4/3.1.5 (register-clearing on bool args, a build
-      # revert), and the original crash was diagnosed against 3.2.0.
-      # See ROADMAP.md's M5b entry for the original crash details if
-      # this still fails.
+      # Node binding tests skipped on Windows — real, narrowed, unresolved
+      # koffi bug, not a libscanio one. Confirmed: koffi 3.2.1 doesn't fix
+      # it (retested, same crash). A diagnostic (node/test/windows_diag.js)
+      # isolated it precisely: a zero-arg str-returning call works fine;
+      # scanio_open(path, null) — a bare 2-arg call, second arg a raw
+      # NULL pointer, no struct involved at all — crashes at the exact
+      # same point (exit code 5, zero output right after koffi dispatches
+      # the call). That rules out struct marshaling entirely, which the
+      # earlier struct-layout theory assumed was the cause. Proof the bug
+      # isn't in libscanio's own code: examples/smoke_test.py calls
+      # scanio_open(path, None) via Python ctypes — the IDENTICAL shape —
+      # and it passes cleanly on this same Windows runner. The bug is
+      # isolated to koffi's own Windows FFI dispatch for this call shape
+      # (2 args, a pointer arg, void* return), not anything upstream of
+      # it. Real next step: file this as a minimal, reproducible upstream
+      # koffi issue (windows_diag.js IS that repro) rather than guess
+      # further blind — see ROADMAP.md's M5b entry.
       - name: npm install (node binding)
+        if: runner.os != 'Windows'
         working-directory: node
         run: npm install
 
-      # TEMPORARY diagnostic, Windows only — isolates whether koffi is
-      # broken for ANY call on this runner or specifically scanio_open()'s
-      # signature, and whether a real null pointer (vs the NO_OPTIONS
-      # struct) changes anything. Runs before the real suite so its
-      # output survives even if the real suite still crashes.
-      - name: windows koffi diagnostic
-        if: runner.os == 'Windows'
-        working-directory: node
-        run: node test/windows_diag.js
-        env:
-          LIBSCANIO_DEBUG: '1'
-
       - name: zig build node-test
+        if: runner.os != 'Windows'
         run: zig build node-test
         env:
           LIBSCANIO_DEBUG: '1'
