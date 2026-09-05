@@ -1,5 +1,6 @@
 zig-out/
 .zig-cache/
+node/binaries/
 *.tmp
 __pycache__/
 *.pyc
