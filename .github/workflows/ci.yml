@@ -68,6 +68,18 @@ jobs:
         working-directory: node
         run: npm install
 
+      # TEMPORARY diagnostic, Windows only — isolates whether koffi is
+      # broken for ANY call on this runner or specifically scanio_open()'s
+      # signature, and whether a real null pointer (vs the NO_OPTIONS
+      # struct) changes anything. Runs before the real suite so its
+      # output survives even if the real suite still crashes.
+      - name: windows koffi diagnostic
+        if: runner.os == 'Windows'
+        working-directory: node
+        run: node test/windows_diag.js
+        env:
+          LIBSCANIO_DEBUG: '1'
+
       - name: zig build node-test
         run: zig build node-test
         env:
