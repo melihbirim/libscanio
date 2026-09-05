@@ -1,6 +1,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Auto-detect the Node.js include directory by running `node` at build
+/// time — same approach as csvql's own build.zig (this project's
+/// sibling), the source of this whole N-API-instead-of-koffi pattern.
+fn detectNodeInclude(allocator: std.mem.Allocator) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "node", "-e",
+            "const p=require('path');process.stdout.write(p.join(process.execPath,'../../include/node'))",
+        },
+    }) catch return null;
+    allocator.free(result.stderr);
+    if (result.term != .Exited or result.term.Exited != 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    return result.stdout;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -66,6 +85,62 @@ pub fn build(b: *std.Build) void {
     // as the LAST command before benchmarking or measuring anything against
     // the .dylib/.so — don't assume a prior ReleaseFast build survived a
     // later `zig build` of anything else.
+
+    // Node.js N-API addon — zig build node -Doptimize=ReleaseFast
+    // Output: zig-out/lib/scanio.node — REPLACES the koffi-based node/
+    // package, see src/node_binding.zig's doc comment for why.
+    const node_include = b.option(
+        []const u8,
+        "node-include",
+        "Path to Node.js include dir containing node_api.h (auto-detected if omitted)",
+    ) orelse detectNodeInclude(b.allocator);
+
+    // Windows-only: node.lib, the import library that resolves napi_*
+    // symbols at link time — a Windows DLL must resolve every symbol at
+    // link time, unlike a POSIX .so/.dylib which may leave them for the
+    // dynamic loader. Without it the addon links with an "undefined
+    // symbol: napi_..." WARNING (not an error) and crashes on first call.
+    // See ci.yml's Windows job for where this actually gets fetched.
+    const node_lib = b.option(
+        []const u8,
+        "node-lib",
+        "Path to node.lib (Windows only — resolves napi_* at link time)",
+    );
+
+    if (node_include) |inc| {
+        const node_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/node_binding.zig"),
+        });
+        node_mod.addImport("scanio", scanio_mod);
+        const node_addon = b.addLibrary(.{
+            .name = "scanio_node",
+            .linkage = .dynamic,
+            .root_module = node_mod,
+        });
+        node_addon.linkLibC();
+        node_addon.addIncludePath(.{ .cwd_relative = inc });
+        // On POSIX, N-API symbols resolve at dlopen() time from the host
+        // process rather than at link time — Windows cannot do that, see
+        // the node_lib comment above.
+        node_addon.linker_allow_shlib_undefined = true;
+        if (node_lib) |nlib| {
+            node_addon.addObjectFile(.{ .cwd_relative = nlib });
+        }
+
+        const install_node = b.addInstallFileWithDir(
+            node_addon.getEmittedBin(),
+            .lib,
+            "scanio.node",
+        );
+
+        const node_step = b.step("node", "Build Node.js N-API addon (zig-out/lib/scanio.node)");
+        node_step.dependOn(&install_node.step);
+    } else {
+        const node_step = b.step("node", "Build Node.js N-API addon (requires node in PATH)");
+        _ = node_step;
+    }
 
     const example = b.addExecutable(.{
         .name = "scan_file",

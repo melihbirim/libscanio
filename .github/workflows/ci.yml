@@ -85,3 +85,64 @@ jobs:
         run: zig build node-test
         env:
           LIBSCANIO_DEBUG: '1'
+
+  # N-API addon — the koffi replacement (see src/node_binding.zig's doc
+  # comment for why: koffi has an unresolved, unfixable-from-this-side
+  # Windows crash, see the `test` job's Node-skip comment above). Windows
+  # listed FIRST in the matrix, deliberately: koffi's crash was only
+  # discovered after the Node binding had already been built and verified
+  # on macOS/Linux, at which point a Windows-only bug meant redoing the
+  # investigation from scratch. Catching a Windows regression on the
+  # FIRST platform checked, not the last, is the whole point this time.
+  node-napi:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Windows needs two things the Node toolcache doesn't ship: the C
+      # headers (node_api.h) and node.lib, the import library that
+      # resolves napi_* symbols at link time — a Windows DLL cannot leave
+      # symbols undefined the way a .so/.dylib can. Same approach as
+      # csvql's own ci.yml (this project's sibling, source of this whole
+      # N-API pattern).
+      - name: Fetch Node.js headers and node.lib (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          NODE_VER=$(node -e "console.log(process.versions.node)")
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-headers.tar.gz" -o node-headers.tar.gz
+          tar -xzf node-headers.tar.gz
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/win-x64/node.lib" -o node.lib
+          echo "NODE_INCLUDE=node-v${NODE_VER}/include/node" >> $GITHUB_ENV
+          echo "NODE_LIB=$(pwd)/node.lib" >> $GITHUB_ENV
+
+      - name: Build the addon
+        shell: bash
+        run: |
+          EXTRA=""
+          [ -n "$NODE_INCLUDE" ] && EXTRA="\"-Dnode-include=$NODE_INCLUDE\""
+          [ -n "$NODE_LIB" ] && EXTRA="$EXTRA \"-Dnode-lib=$NODE_LIB\""
+          eval zig build node -Doptimize=ReleaseFast $EXTRA 2>&1 | tee build.log
+          # An undefined napi_* symbol is only a WARNING to lld, not an
+          # error — it still produces a .node file, one that then crashes
+          # on first call. Treat it as fatal so it can never pass silently.
+          if grep -q "undefined symbol: napi_" build.log; then
+            echo "FAIL: addon linked with undefined N-API symbols — it will crash at runtime"
+            exit 1
+          fi
+
+      - name: Run N-API binding tests
+        shell: bash
+        run: node node_napi/test.js

@@ -45,7 +45,7 @@ fn clearError() void {
     last_error = null;
 }
 
-export fn scanio_last_error() ?[*:0]const u8 {
+pub export fn scanio_last_error() ?[*:0]const u8 {
     const msg = last_error orelse return null;
     // Re-render into a NUL-terminated copy on demand rather than keeping
     // every setError() call NUL-terminated up front.
@@ -120,7 +120,7 @@ const Ctx = struct {
     }
 };
 
-export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
+pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
     clearError();
     const p = path orelse {
         setError("path is null", .{});
@@ -225,13 +225,13 @@ export fn scanio_column_index(ctx: ?*Ctx, name: ?[*:0]const u8) usize {
 }
 
 /// Number of columns in the header.
-export fn scanio_n_columns(ctx: ?*Ctx) usize {
+pub export fn scanio_n_columns(ctx: ?*Ctx) usize {
     const c = ctx orelse return 0;
     return c.header_cstrs.len;
 }
 
 /// Column name at `index`, or NULL if out of range.
-export fn scanio_column_name(ctx: ?*Ctx, index: usize) ?[*:0]const u8 {
+pub export fn scanio_column_name(ctx: ?*Ctx, index: usize) ?[*:0]const u8 {
     const c = ctx orelse return null;
     if (index >= c.header_cstrs.len) return null;
     return c.header_cstrs[index].ptr;
@@ -845,7 +845,7 @@ export fn scanio_parallel_collect_columnar(
     return cc;
 }
 
-export fn scanio_close(ctx: ?*Ctx) void {
+pub export fn scanio_close(ctx: ?*Ctx) void {
     const c = ctx orelse return;
     c.query.deinit();
     for (c.field_cstrs) |buf| {
