@@ -6,12 +6,17 @@
   "scripts": {
     "test": "node test/test.js"
   },
-  "keywords": ["csv", "ndjson", "scan", "streaming"],
+  "keywords": [
+    "csv",
+    "ndjson",
+    "scan",
+    "streaming"
+  ],
   "license": "Apache-2.0",
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "koffi": "^3.2.0"
+    "koffi": "^3.2.1"
   }
 }

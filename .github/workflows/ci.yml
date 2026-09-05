@@ -58,24 +58,17 @@ jobs:
       - name: zig build python-test
         run: zig build python-test
 
-      # Node binding tests skipped on Windows, deliberately, not silently:
-      # koffi crashes scanio_open() outright there (zero output, exit
-      # code 5) regardless of what's passed for the options struct —
-      # traced to this exact call via LIBSCANIO_DEBUG logging, tried two
-      # different targeted fixes (a struct-layout theory and a
-      # null-pointer theory), neither changed the outcome. Root cause is
-      # still unknown and this stopped being a quick fix. Everything else
-      # on Windows (Zig tests, C ABI, Python binding, all via the SAME
-      # dlopen()-style loading koffi also does) verifies clean — this is
-      # specifically a koffi-on-Windows problem, not a libscanio one. See
-      # ROADMAP.md's M5b entry.
+      # TEMPORARY: re-enabled on Windows to retest against koffi 3.2.1
+      # (upgraded from 3.2.0) — the changelog shows real Win64 stability
+      # fixes in 3.1.4/3.1.5 (register-clearing on bool args, a build
+      # revert), and the original crash was diagnosed against 3.2.0.
+      # See ROADMAP.md's M5b entry for the original crash details if
+      # this still fails.
       - name: npm install (node binding)
-        if: runner.os != 'Windows'
         working-directory: node
         run: npm install
 
       - name: zig build node-test
-        if: runner.os != 'Windows'
         run: zig build node-test
         env:
           LIBSCANIO_DEBUG: '1'
