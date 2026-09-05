@@ -1,30 +1,21 @@
-//! Node.js N-API binding for libscanio — replaces the koffi-based
-//! `node/` package, not a second binding alongside it.
+//! Node.js N-API binding for libscanio — the only Node binding this
+//! project ships.
 //!
-//! Why: koffi's Windows FFI dispatch crashes on `scanio_open()` (exit
-//! code 5, zero output) for a call shape isolated down to "2 arguments,
-//! one a pointer, void* return" — confirmed NOT a libscanio bug (the
-//! identical shape passes cleanly through Python's ctypes on the same
-//! Windows runner), confirmed NOT fixed by upgrading koffi to its
-//! latest version, confirmed NOT about struct marshaling (a bare
-//! `scanio_open(path, null)` with zero structs involved crashes the
-//! same way). See ROADMAP.md's M5b entry for the full investigation.
-//! That bug lives inside koffi's own Windows trampoline generation —
-//! out of this project's reach to patch. An N-API addon compiled
-//! directly against Node's own `node_api.h` has no such dynamic-FFI
-//! layer at all — this file calls the SAME Zig core (`Query`,
+//! Compiled directly against Node's own `node_api.h`, no dynamic-FFI
+//! layer at all: this file calls the SAME Zig core (`Query`,
 //! `aggregate`, `topK`, `orderBy`, `parallelScanColumnar`) every other
 //! binding uses, directly, not through c_api.zig's C-struct boundary —
 //! there is no struct marshaling to have a bug in at all, in either
-//! language.
+//! language. See ROADMAP.md's M5b entry for the history of why this
+//! design was chosen.
 //!
 //! Every exported function is JSON/plain-string in, JSON/plain-value
 //! out (same "text in, text out" shape csvql's own N-API addon uses,
 //! this project's sibling and the source of this whole pattern) —
 //! WHERE clauses are parsed HERE in Zig (parseWhereString below),
-//! mirroring the same "col OP val [AND col OP val ...]" / "col IN
-//! (a,b,c)" grammar the koffi-based node/lib/index.js parsed in JS,
-//! now done once, in one language, reusable by any future binding.
+//! mirroring a simple "col OP val [AND col OP val ...]" / "col IN
+//! (a,b,c)" grammar, done once, in one language, reusable by any
+//! future binding.
 //!
 //! Modeled directly on csvql's own `src/node_binding.zig` (this
 //! project's sibling, same author) — same author already solved the
@@ -50,126 +41,18 @@ const napi = @cImport(@cInclude("node_api.h"));
 const c_allocator = std.heap.c_allocator;
 const worker_stack_size = 16 * 1024 * 1024;
 
-// ── WHERE-string parsing ────────────────────────────────────────────
-// "col OP val [AND col OP val ...]" / "col IN (a, b, c)" — same grammar
-// the koffi-based JS binding parsed with regex; ported mechanically,
-// not redesigned.
-
-fn resolveColumn(header: []const []const u8, name: []const u8) !usize {
-    for (header, 0..) |h, i| {
-        if (std.mem.eql(u8, h, name)) return i;
-    }
-    return error.UnknownColumn;
-}
-
-fn opFromString(s: []const u8) ?Op {
-    if (std.mem.eql(u8, s, "=")) return .eq;
-    if (std.mem.eql(u8, s, "!=")) return .neq;
-    if (std.mem.eql(u8, s, ">=")) return .gte;
-    if (std.mem.eql(u8, s, "<=")) return .lte;
-    if (std.mem.eql(u8, s, ">")) return .gt;
-    if (std.mem.eql(u8, s, "<")) return .lt;
-    return null;
-}
-
-/// Parses one AND-joined WHERE string into a predicate list. Column
-/// names resolved against `header`. Returned slice AND every IN
-/// predicate's owned values slice are allocated with `allocator` —
-/// caller frees both (see freePredicates below).
-fn parseWhereString(allocator: std.mem.Allocator, header: []const []const u8, where: []const u8) ![]Predicate {
-    var predicates: std.ArrayListUnmanaged(Predicate) = .{};
-    errdefer predicates.deinit(allocator);
-
-    var it = std.mem.splitSequence(u8, where, " AND ");
-    while (it.next()) |raw_part| {
-        const part = std.mem.trim(u8, raw_part, " \t");
-        if (part.len == 0) continue;
-
-        // "col IN (a, b, c)"
-        if (std.mem.indexOf(u8, part, " IN ")) |in_pos| {
-            const col_name = std.mem.trim(u8, part[0..in_pos], " \t");
-            const rest = std.mem.trim(u8, part[in_pos + 4 ..], " \t");
-            if (rest.len < 2 or rest[0] != '(' or rest[rest.len - 1] != ')') return error.InvalidWhere;
-            const inner = rest[1 .. rest.len - 1];
-            const col = try resolveColumn(header, col_name);
-
-            var vals: std.ArrayListUnmanaged([]const u8) = .{};
-            defer vals.deinit(allocator);
-            var vit = std.mem.splitScalar(u8, inner, ',');
-            while (vit.next()) |v| {
-                const trimmed = std.mem.trim(u8, v, " \t");
-                if (trimmed.len > 0) try vals.append(allocator, try allocator.dupe(u8, trimmed));
-            }
-            if (vals.items.len == 0) return error.InvalidWhere;
-            const owned_vals = try vals.toOwnedSlice(allocator);
-            try predicates.append(allocator, Predicate.initIn(col, owned_vals));
-            continue;
-        }
-
-        // "col OP val" — find the operator by scanning for one of the
-        // known symbols; longest match first (>= before >, etc.).
-        const ops = [_][]const u8{ ">=", "<=", "!=", "=", ">", "<" };
-        var found_op: ?[]const u8 = null;
-        var op_pos: usize = 0;
-        for (ops) |op_str| {
-            if (std.mem.indexOf(u8, part, op_str)) |pos| {
-                if (found_op == null or pos < op_pos) {
-                    found_op = op_str;
-                    op_pos = pos;
-                }
-            }
-        }
-        const op_str = found_op orelse return error.InvalidWhere;
-        const col_name = std.mem.trim(u8, part[0..op_pos], " \t");
-        const val = std.mem.trim(u8, part[op_pos + op_str.len ..], " \t");
-        const col = try resolveColumn(header, col_name);
-        const op = opFromString(op_str) orelse return error.InvalidWhere;
-        try predicates.append(allocator, Predicate.init(col, op, try allocator.dupe(u8, val)));
-    }
-    return predicates.toOwnedSlice(allocator);
-}
-
-fn freePredicates(allocator: std.mem.Allocator, predicates: []Predicate) void {
-    for (predicates) |p| {
-        if (p.op == .in_list) {
-            for (p.values) |v| allocator.free(@constCast(v));
-            allocator.free(@constCast(p.values));
-        } else {
-            allocator.free(@constCast(p.value));
-        }
-    }
-    allocator.free(predicates);
-}
-
-/// Resolves a JSON array of column-name strings into indices against
-/// `header`. Null input (no projection requested) returns null.
-fn parseColumnsJson(allocator: std.mem.Allocator, header: []const []const u8, columns_json: ?[]const u8) !?[]usize {
-    const cj = columns_json orelse return null;
-    if (cj.len == 0) return null;
-    const parsed = try std.json.parseFromSlice([]const []const u8, allocator, cj, .{});
-    defer parsed.deinit();
-    var out = try allocator.alloc(usize, parsed.value.len);
-    for (parsed.value, 0..) |name, i| out[i] = try resolveColumn(header, name);
-    return out;
-}
-
-/// Opens a throwaway Query (no predicates) just to read the header,
-/// then closes it — same two-open pattern every existing binding
-/// already uses (resolve names/predicates against a probe, then open
-/// for real with them applied).
-fn probeHeader(allocator: std.mem.Allocator, path: []const u8) ![][]const u8 {
-    var probe = try Query.open(allocator, path, .{});
-    defer probe.deinit();
-    const h = probe.header();
-    const out = try allocator.alloc([]const u8, h.len);
-    for (h, 0..) |name, i| out[i] = try allocator.dupe(u8, name);
-    return out;
-}
-
-fn freeHeader(allocator: std.mem.Allocator, header: [][]const u8) void {
-    for (header) |h| allocator.free(@constCast(h));
-    allocator.free(header);
-}
+// WHERE-string parsing, column resolution, and header probing live in
+// where_parser.zig — split out specifically so they're testable via
+// plain `zig build test`, without needing Node's headers the way this
+// file's own `@cImport(@cInclude("node_api.h"))` does. See that file's
+// own doc comment and its adversarial test coverage.
+const where_parser = @import("where_parser.zig");
+const resolveColumn = where_parser.resolveColumn;
+const parseWhereString = where_parser.parseWhereString;
+const freePredicates = where_parser.freePredicates;
+const parseColumnsJson = where_parser.parseColumnsJson;
+const probeHeader = where_parser.probeHeader;
+const freeHeader = where_parser.freeHeader;
 
 // ── N-API helpers ────────────────────────────────────────────────────
 
@@ -312,7 +195,14 @@ fn countWork(path: [:0]const u8, where: ?[:0]const u8, out: *CountResult) void {
         };
     }
 
-    var q = Query.open(c_allocator, path, .{ .where = predicates }) catch |e| {
+    var q = Query.open(c_allocator, path, .{
+        .where = predicates,
+        // count() never returns field data — always safe to bound to
+        // just the WHERE predicates' columns. Real, measured win: ~7x
+        // faster on this fixture's WHERE-filtered count (330ms -> ~45ms)
+        // once this bound was wired up (see ROADMAP.md's M5b follow-up).
+        .stop_after_column = where_parser.maxPredicateColumn(predicates, null),
+    }) catch |e| {
         out.err = e;
         return;
     };
@@ -360,7 +250,12 @@ fn aggregateWork(path: [:0]const u8, column_name: [:0]const u8, where: ?[:0]cons
         };
     }
 
-    var q = Query.open(c_allocator, path, .{ .where = predicates }) catch |e| {
+    var q = Query.open(c_allocator, path, .{
+        .where = predicates,
+        // aggregate() only ever reads `column` — safe to bound to
+        // max(predicate columns, column).
+        .stop_after_column = where_parser.maxPredicateColumn(predicates, column),
+    }) catch |e| {
         out.err = e;
         return;
     };
@@ -671,6 +566,44 @@ const ScanHandle = struct {
     columns: ?[]usize,
 };
 
+/// Registry of open scan handles, keyed by a small monotonic ID — NOT
+/// the raw pointer address. A raw pointer exposed to JS as a plain
+/// number is an arbitrary-memory-dereference risk the moment a caller
+/// passes a stale, garbage, or off-by-one handle value: nextRowJson()/
+/// closeScan() would `@ptrFromInt` it and read/write through it with
+/// zero validation. Looking the ID up here first means an invalid
+/// handle fails with a normal JS error instead of a native crash or
+/// memory corruption. Mutex guards it because N-API addons can be
+/// loaded into `worker_threads`, not just the main JS thread — this
+/// registry has no reason to assume single-threaded access even though
+/// today's callers happen to be single-threaded.
+var handle_registry: std.AutoHashMapUnmanaged(u64, *ScanHandle) = .{};
+var handle_registry_mutex: std.Thread.Mutex = .{};
+var next_handle_id: u64 = 1;
+
+fn registerHandle(handle: *ScanHandle) !u64 {
+    handle_registry_mutex.lock();
+    defer handle_registry_mutex.unlock();
+    const id = next_handle_id;
+    next_handle_id += 1;
+    try handle_registry.put(c_allocator, id, handle);
+    return id;
+}
+
+fn lookupHandle(id: u64) ?*ScanHandle {
+    handle_registry_mutex.lock();
+    defer handle_registry_mutex.unlock();
+    return handle_registry.get(id);
+}
+
+fn unregisterHandle(id: u64) ?*ScanHandle {
+    handle_registry_mutex.lock();
+    defer handle_registry_mutex.unlock();
+    const handle = handle_registry.get(id) orelse return null;
+    _ = handle_registry.remove(id);
+    return handle;
+}
+
 fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, out: *OpenScanResult) void {
     const header = probeHeader(c_allocator, path) catch |e| {
         out.err = e;
@@ -733,7 +666,16 @@ fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]con
         return;
     };
     handle.* = .{ .query = q, .header = header, .predicates = predicates, .columns = columns };
-    out.handle = @intCast(@intFromPtr(handle));
+    const id = registerHandle(handle) catch {
+        handle.query.deinit();
+        freeHeader(c_allocator, handle.header);
+        if (handle.predicates.len > 0) freePredicates(c_allocator, handle.predicates);
+        if (handle.columns) |c| c_allocator.free(c);
+        c_allocator.destroy(handle);
+        out.err = error.OutOfMemory;
+        return;
+    };
+    out.handle = @intCast(id);
 }
 
 fn napiOpenScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -758,9 +700,10 @@ fn napiOpenScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) 
 }
 
 fn napiNextRow(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
-    const handle_addr = getIntArg(env, info, 0, i64, 0);
-    if (handle_addr == 0) return napiFail(env, "nextRowJson(handle): invalid handle");
-    const handle: *ScanHandle = @ptrFromInt(@as(usize, @intCast(handle_addr)));
+    const handle_id = getIntArg(env, info, 0, i64, 0);
+    if (handle_id <= 0) return napiFail(env, "nextRowJson(handle): invalid handle");
+    const handle = lookupHandle(@intCast(handle_id)) orelse
+        return napiFail(env, "nextRowJson(handle): unknown or already-closed handle");
 
     const row = handle.query.next() catch |e| return failErr(env, e);
     const r = row orelse {
@@ -784,11 +727,15 @@ fn napiNextRow(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) n
 }
 
 fn napiCloseScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
-    const handle_addr = getIntArg(env, info, 0, i64, 0);
+    const handle_id = getIntArg(env, info, 0, i64, 0);
     var undef: napi.napi_value = undefined;
     _ = napi.napi_get_undefined(env, &undef);
-    if (handle_addr == 0) return undef;
-    const handle: *ScanHandle = @ptrFromInt(@as(usize, @intCast(handle_addr)));
+    if (handle_id <= 0) return undef;
+    // Double-close is a silent no-op, not an error — unregisterHandle()
+    // removes the entry, so a second close() on the same ID finds
+    // nothing and returns early, same as the old raw-pointer version's
+    // implicit behavior (a double-free there was instead a real bug).
+    const handle = unregisterHandle(@intCast(handle_id)) orelse return undef;
     handle.query.deinit();
     freeHeader(c_allocator, handle.header);
     if (handle.predicates.len > 0) freePredicates(c_allocator, handle.predicates);

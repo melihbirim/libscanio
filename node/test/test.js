@@ -1,10 +1,10 @@
 'use strict';
 
-// Tests for libscanio's Node binding — the actual dlopen() path via
-// koffi, same reasoning as the Python binding's tests: passing Zig
-// tests does not prove the built shared library works for a real
-// consumer. No test framework dependency — plain asserts, same
-// convention as the Python binding's test_scan.py.
+// Tests for libscanio's Node binding — the real compiled N-API addon,
+// same reasoning as the Python binding's tests: passing Zig tests does
+// not prove the built addon works for a real consumer. No test
+// framework dependency — plain asserts, same convention as the Python
+// binding's test_scan.py.
 
 const assert = require('assert');
 const fs = require('fs');
@@ -166,11 +166,10 @@ async function main() {
     check('profile: numeric column has real aggregate', prof.numericColumns.revenue.sum, 4500);
 
     // Regression test mirroring the Python binding's real use-after-free
-    // catch: force allocator churn between repeated FFI calls to make
-    // sure the WHERE predicate memory genuinely survives the whole scan,
-    // not just a lucky first call. Verified koffi handles this safely
-    // (see the session's koffi_test4.js investigation) but keep this as
-    // a permanent regression guard, same reasoning as the Python side.
+    // catch: force allocator churn between repeated calls to make sure
+    // the WHERE predicate memory genuinely survives the whole scan, not
+    // just a lucky first call. Permanent regression guard, same
+    // reasoning as the Python side.
     const bigPath = path.join(os.tmpdir(), `libscanio_test_big_${process.pid}.csv`);
     let bigData = 'id,category\n';
     for (let i = 0; i < 500; i++) bigData += `${i},${i % 2 === 0 ? 'even' : 'odd'}\n`;
@@ -202,12 +201,12 @@ async function main() {
     fs.unlinkSync(P);
   }
 
-  // NDJSON and JSON-array coverage — real gap until now: format
-  // inference (.ndjson/.jsonl/.json -> the NDJSON scanner, sniffed from
-  // content for .json specifically) happens at the C ABI level with no
-  // format option exposed to Node at all, so this was "should work, per
-  // the Zig-level tests" rather than actually verified through koffi.
-  // Same fixture shape as the CSV tests above, for direct comparison.
+  // NDJSON and JSON-array coverage — format inference (.ndjson/.jsonl/
+  // .json -> the NDJSON scanner, sniffed from content for .json
+  // specifically) happens inside Query.open() itself, with no format
+  // option exposed to Node at all — verified end-to-end here, not just
+  // assumed from the Zig-level tests. Same fixture shape as the CSV
+  // tests above, for direct comparison.
   const ND = path.join(os.tmpdir(), `libscanio_test_${process.pid}.ndjson`);
   fs.writeFileSync(
     ND,

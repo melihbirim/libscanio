@@ -61,24 +61,15 @@ jobs:
       # Node binding tested in the separate node-napi job below, not here
       # — it needs Windows-specific setup (node.lib fetch) that job
       # already has, and duplicating it here would just be two copies of
-      # the same setup. koffi (this project's OLD Node binding) is gone
-      # entirely — it had a real, unresolved, unfixable-from-this-side
-      # Windows crash (see ROADMAP.md's M5b entry for the full
-      # investigation: isolated to koffi's own Windows FFI dispatch,
-      # confirmed not a libscanio bug, confirmed not fixed by koffi's
-      # latest version). Replaced with a real N-API addon compiled
-      # directly against node_api.h, same pattern csvql (this project's
-      # sibling) already uses — no dynamic FFI layer, so there's no
-      # struct-marshaling boundary for that class of bug to hide in.
+      # the same setup.
 
-  # N-API addon — the koffi replacement (see src/node_binding.zig's doc
-  # comment for why: koffi has an unresolved, unfixable-from-this-side
-  # Windows crash, see the `test` job's Node-skip comment above). Windows
-  # listed FIRST in the matrix, deliberately: koffi's crash was only
-  # discovered after the Node binding had already been built and verified
-  # on macOS/Linux, at which point a Windows-only bug meant redoing the
-  # investigation from scratch. Catching a Windows regression on the
-  # FIRST platform checked, not the last, is the whole point this time.
+  # N-API addon — see src/node_binding.zig's doc comment and ROADMAP.md's
+  # M5b entry for the design history. Windows listed FIRST in the matrix,
+  # deliberately: a past Node-binding bug on this project was only
+  # discovered after being built and verified on macOS/Linux first, at
+  # which point a Windows-only issue meant redoing the investigation from
+  # scratch. Catching a Windows regression on the FIRST platform checked,
+  # not the last, is the whole point this time.
   node-napi:
     strategy:
       fail-fast: false

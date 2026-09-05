@@ -1,9 +1,6 @@
 // Real, comprehensive test for the N-API addon — no mocks, exercises
 // every exported function directly against the compiled zig-out
-// binary. This is the replacement path for the koffi-based node/
-// package (see src/node_binding.zig's doc comment for why) — same
-// fixture shape as node/test/test.js so results are directly
-// comparable to the koffi binding's own known-correct output.
+// binary. Same fixture shape as node/test/test.js.
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -111,6 +108,33 @@ try {
   while ((row = addon.nextRowJson(s2.handle)) !== null) rows2.push(JSON.parse(row));
   check('openScan: projected + limited', rows2, [['Alice'], ['Bob']]);
   addon.closeScan(s2.handle);
+
+  // Handle-validation regression guard: a garbage/stale/negative handle
+  // must fail cleanly (a normal JS exception), not dereference arbitrary
+  // memory. Real risk with the earlier raw-pointer-as-number design —
+  // see src/node_binding.zig's handle_registry doc comment.
+  checkThrows('nextRowJson: garbage handle throws instead of crashing', () => addon.nextRowJson(999999999));
+  checkThrows('nextRowJson: negative handle throws instead of crashing', () => addon.nextRowJson(-1));
+  total++;
+  try {
+    addon.closeScan(999999999); // unknown handle: silent no-op, not a crash
+    console.log('PASS  closeScan: unknown handle is a silent no-op, not a crash');
+    passed++;
+  } catch (e) {
+    console.log(`FAIL  closeScan: unknown handle is a silent no-op, not a crash\n    threw: ${e.message}`);
+  }
+
+  total++;
+  const s3 = addon.openScan(P, null, null, 1);
+  addon.closeScan(s3.handle);
+  try {
+    addon.closeScan(s3.handle); // double-close: same no-op contract
+    console.log('PASS  closeScan: double-close on the same handle is a silent no-op');
+    passed++;
+  } catch (e) {
+    console.log(`FAIL  closeScan: double-close on the same handle is a silent no-op\n    threw: ${e.message}`);
+  }
+  checkThrows('nextRowJson after close throws instead of using freed memory', () => addon.nextRowJson(s3.handle));
 } finally {
   fs.unlinkSync(P);
 }

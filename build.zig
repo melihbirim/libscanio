@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 /// Auto-detect the Node.js include directory by running `node` at build
 /// time — same approach as csvql's own build.zig (this project's
-/// sibling), the source of this whole N-API-instead-of-koffi pattern.
+/// sibling), the source of this N-API pattern.
 fn detectNodeInclude(allocator: std.mem.Allocator) ?[]const u8 {
     const result = std.process.Child.run(.{
         .allocator = allocator,
@@ -59,6 +59,20 @@ pub fn build(b: *std.Build) void {
     const run_c_api_tests = b.addRunArtifact(c_api_tests);
     test_step.dependOn(&run_c_api_tests.step);
 
+    // WHERE-string parsing for the N-API Node binding — its own module
+    // (not node_binding.zig itself, which needs node_api.h available to
+    // even compile) so `zig build test` covers it without needing Node
+    // headers at all.
+    const where_parser_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/where_parser.zig"),
+    });
+    where_parser_mod.addImport("scanio", scanio_mod);
+    const where_parser_tests = b.addTest(.{ .root_module = where_parser_mod });
+    const run_where_parser_tests = b.addRunArtifact(where_parser_tests);
+    test_step.dependOn(&run_where_parser_tests.step);
+
     const c_lib = b.addLibrary(.{
         .name = "scanio",
         .linkage = .dynamic,
@@ -87,8 +101,15 @@ pub fn build(b: *std.Build) void {
     // later `zig build` of anything else.
 
     // Node.js N-API addon — zig build node -Doptimize=ReleaseFast
-    // Output: zig-out/lib/scanio.node — REPLACES the koffi-based node/
-    // package, see src/node_binding.zig's doc comment for why.
+    // SAME GOTCHA AS c-lib ABOVE, bitten a third time: benchmarked this
+    // addon once with a plain `zig build node` (Debug, no flag) and got
+    // a real, false "7x slower than expected" result — it was purely a
+    // Debug-vs-ReleaseFast difference, not a real regression (see
+    // ROADMAP.md's M5b follow-up for the full story). Always pass
+    // -Doptimize=ReleaseFast when building this for anything other than
+    // a quick compile-check.
+    // Output: zig-out/lib/scanio.node, see src/node_binding.zig's doc
+    // comment for the design.
     const node_include = b.option(
         []const u8,
         "node-include",
@@ -336,11 +357,9 @@ pub fn build(b: *std.Build) void {
     const python_test_step = b.step("python-test", "Run the Python binding test suite (needs python3)");
     python_test_step.dependOn(&python_test.step);
 
-    // Node binding — N-API addon, not koffi (see src/node_binding.zig's
-    // doc comment for why: koffi has an unresolved, unfixable-from-this-
-    // side Windows crash). `zig build node` must have already produced
-    // zig-out/lib/scanio.node; these tests load it directly, no `npm
-    // install` needed at all (zero runtime dependencies).
+    // Node binding — N-API addon. `zig build node` must have already
+    // produced zig-out/lib/scanio.node; these tests load it directly,
+    // no `npm install` needed at all (zero runtime dependencies).
     const node_addon_test = b.addSystemCommand(&.{ "node", "node/test/addon_test.js" });
     if (node_install_step) |s| node_addon_test.step.dependOn(s);
     const node_wrapper_test = b.addSystemCommand(&.{ "node", "node/test/test.js" });

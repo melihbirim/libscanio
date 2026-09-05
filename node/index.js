@@ -3,12 +3,9 @@
 /**
  * libscanio — scan huge CSV files without loading them into memory.
  *
- * N-API binding (no koffi, no dynamic FFI layer at all) — replaces the
- * koffi-based `node/` package. See src/node_binding.zig's doc comment
- * for why: koffi has a real, unresolved, unfixable-from-this-side
- * crash on Windows (ROADMAP.md's M5b entry). Same public API as the
- * koffi binding — this is meant as a drop-in replacement, not a
- * different interface.
+ * N-API binding — compiled directly against Node's own headers, no
+ * dynamic FFI layer at all. See src/node_binding.zig's doc comment for
+ * the design, and ROADMAP.md's M5b entry for the history.
  *
  *   const libscanio = require('libscanio');
  *
