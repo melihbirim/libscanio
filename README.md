@@ -80,7 +80,7 @@ zig build test                           # run the test suite
 zig build c-lib -Doptimize=ReleaseFast   # -> zig-out/lib/libscanio.{dylib,so,dll}
 zig build smoke-test                     # dlopen()s the built library via Python ctypes — the real path
 zig build python-test                    # Python binding suite against the real built library
-zig build node-test                      # Node binding suite (needs `npm install` in node/ first)
+zig build node-test                      # Node binding suite — N-API addon, zero runtime dependencies, no npm install needed
 ```
 
 ## Non-goals

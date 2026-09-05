@@ -20,7 +20,7 @@ process.on('unhandledRejection', (e) => {
   process.exit(1);
 });
 
-const libscanio = require('../lib/index');
+const libscanio = require('../index');
 
 let passed = 0;
 let total = 0;

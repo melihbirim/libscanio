@@ -58,33 +58,18 @@ jobs:
       - name: zig build python-test
         run: zig build python-test
 
-      # Node binding tests skipped on Windows — real, narrowed, unresolved
-      # koffi bug, not a libscanio one. Confirmed: koffi 3.2.1 doesn't fix
-      # it (retested, same crash). A diagnostic (node/test/windows_diag.js)
-      # isolated it precisely: a zero-arg str-returning call works fine;
-      # scanio_open(path, null) — a bare 2-arg call, second arg a raw
-      # NULL pointer, no struct involved at all — crashes at the exact
-      # same point (exit code 5, zero output right after koffi dispatches
-      # the call). That rules out struct marshaling entirely, which the
-      # earlier struct-layout theory assumed was the cause. Proof the bug
-      # isn't in libscanio's own code: examples/smoke_test.py calls
-      # scanio_open(path, None) via Python ctypes — the IDENTICAL shape —
-      # and it passes cleanly on this same Windows runner. The bug is
-      # isolated to koffi's own Windows FFI dispatch for this call shape
-      # (2 args, a pointer arg, void* return), not anything upstream of
-      # it. Real next step: file this as a minimal, reproducible upstream
-      # koffi issue (windows_diag.js IS that repro) rather than guess
-      # further blind — see ROADMAP.md's M5b entry.
-      - name: npm install (node binding)
-        if: runner.os != 'Windows'
-        working-directory: node
-        run: npm install
-
-      - name: zig build node-test
-        if: runner.os != 'Windows'
-        run: zig build node-test
-        env:
-          LIBSCANIO_DEBUG: '1'
+      # Node binding tested in the separate node-napi job below, not here
+      # — it needs Windows-specific setup (node.lib fetch) that job
+      # already has, and duplicating it here would just be two copies of
+      # the same setup. koffi (this project's OLD Node binding) is gone
+      # entirely — it had a real, unresolved, unfixable-from-this-side
+      # Windows crash (see ROADMAP.md's M5b entry for the full
+      # investigation: isolated to koffi's own Windows FFI dispatch,
+      # confirmed not a libscanio bug, confirmed not fixed by koffi's
+      # latest version). Replaced with a real N-API addon compiled
+      # directly against node_api.h, same pattern csvql (this project's
+      # sibling) already uses — no dynamic FFI layer, so there's no
+      # struct-marshaling boundary for that class of bug to hide in.
 
   # N-API addon — the koffi replacement (see src/node_binding.zig's doc
   # comment for why: koffi has an unresolved, unfixable-from-this-side
@@ -146,5 +131,5 @@ jobs:
       - name: Run N-API binding tests
         shell: bash
         run: |
-          node node_napi/test/addon_test.js
-          node node_napi/test/test.js
+          node node/test/addon_test.js
+          node node/test/test.js

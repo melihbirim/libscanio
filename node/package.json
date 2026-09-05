@@ -1,10 +1,15 @@
 {
   "name": "libscanio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Scan huge CSV/NDJSON/JSON files without loading them into memory",
-  "main": "lib/index.js",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "binaries/"
+  ],
   "scripts": {
-    "test": "node test/test.js"
+    "build": "cd .. && zig build node -Doptimize=ReleaseFast && mkdir -p node/binaries && cp zig-out/lib/scanio.node node/binaries/$(node -p \"process.platform + '-' + process.arch\").node",
+    "test": "node test/addon_test.js && node test/test.js"
   },
   "keywords": [
     "csv",
@@ -13,10 +18,15 @@
     "streaming"
   ],
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/melihbirim/libscanio.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "engines": {
     "node": ">=18"
-  },
-  "dependencies": {
-    "koffi": "^3.2.1"
   }
 }

@@ -107,6 +107,7 @@ pub fn build(b: *std.Build) void {
         "Path to node.lib (Windows only — resolves napi_* at link time)",
     );
 
+    var node_install_step: ?*std.Build.Step = null;
     if (node_include) |inc| {
         const node_mod = b.createModule(.{
             .target = target,
@@ -137,6 +138,7 @@ pub fn build(b: *std.Build) void {
 
         const node_step = b.step("node", "Build Node.js N-API addon (zig-out/lib/scanio.node)");
         node_step.dependOn(&install_node.step);
+        node_install_step = &install_node.step;
     } else {
         const node_step = b.step("node", "Build Node.js N-API addon (requires node in PATH)");
         _ = node_step;
@@ -334,8 +336,15 @@ pub fn build(b: *std.Build) void {
     const python_test_step = b.step("python-test", "Run the Python binding test suite (needs python3)");
     python_test_step.dependOn(&python_test.step);
 
-    const node_test = b.addSystemCommand(&.{ "node", "node/test/test.js" });
-    node_test.step.dependOn(c_lib_step);
-    const node_test_step = b.step("node-test", "Run the Node binding test suite (needs node + `npm install` in node/)");
-    node_test_step.dependOn(&node_test.step);
+    // Node binding — N-API addon, not koffi (see src/node_binding.zig's
+    // doc comment for why: koffi has an unresolved, unfixable-from-this-
+    // side Windows crash). `zig build node` must have already produced
+    // zig-out/lib/scanio.node; these tests load it directly, no `npm
+    // install` needed at all (zero runtime dependencies).
+    const node_addon_test = b.addSystemCommand(&.{ "node", "node/test/addon_test.js" });
+    if (node_install_step) |s| node_addon_test.step.dependOn(s);
+    const node_wrapper_test = b.addSystemCommand(&.{ "node", "node/test/test.js" });
+    node_wrapper_test.step.dependOn(&node_addon_test.step);
+    const node_test_step = b.step("node-test", "Run the Node binding test suite (builds the N-API addon first)");
+    node_test_step.dependOn(&node_wrapper_test.step);
 }
