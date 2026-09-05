@@ -81,20 +81,30 @@ fn napiInt64(env: napi.napi_env, v: i64) napi.napi_value {
     return out;
 }
 
-fn getStringArg(env: napi.napi_env, info: napi.napi_callback_info, index: usize, allocator: std.mem.Allocator) ![:0]u8 {
+/// Shared by every getXArg() below: fetches all call args once and
+/// returns the one at `index`, or null if it wasn't passed at all (or
+/// was passed as JS `null`/`undefined`, treated the same as "not
+/// passed" throughout this file's optional-argument convention). Used
+/// to be duplicated — the argc/args array setup and null/undefined
+/// check were copy-pasted into getStringArg/getIntArg/getBoolArg
+/// separately before this was pulled out.
+fn getRawArg(env: napi.napi_env, info: napi.napi_callback_info, index: usize) ?napi.napi_value {
     var argc: usize = 6;
     var args: [6]napi.napi_value = undefined;
     _ = napi.napi_get_cb_info(env, info, &argc, &args, null, null);
-    if (argc <= index) return error.MissingArgument;
-
+    if (argc <= index) return null;
     var value_type: napi.napi_valuetype = undefined;
     _ = napi.napi_typeof(env, args[index], &value_type);
-    if (value_type == napi.napi_null or value_type == napi.napi_undefined) return error.MissingArgument;
+    if (value_type == napi.napi_null or value_type == napi.napi_undefined) return null;
+    return args[index];
+}
 
+fn getStringArg(env: napi.napi_env, info: napi.napi_callback_info, index: usize, allocator: std.mem.Allocator) ![:0]u8 {
+    const arg = getRawArg(env, info, index) orelse return error.MissingArgument;
     var len: usize = 0;
-    _ = napi.napi_get_value_string_utf8(env, args[index], null, 0, &len);
+    _ = napi.napi_get_value_string_utf8(env, arg, null, 0, &len);
     const buf = try allocator.allocSentinel(u8, len, 0);
-    _ = napi.napi_get_value_string_utf8(env, args[index], buf.ptr, len + 1, &len);
+    _ = napi.napi_get_value_string_utf8(env, arg, buf.ptr, len + 1, &len);
     return buf;
 }
 
@@ -106,28 +116,16 @@ fn getOptionalStringArg(env: napi.napi_env, info: napi.napi_callback_info, index
 }
 
 fn getIntArg(env: napi.napi_env, info: napi.napi_callback_info, index: usize, comptime T: type, default: T) T {
-    var argc: usize = 6;
-    var args: [6]napi.napi_value = undefined;
-    _ = napi.napi_get_cb_info(env, info, &argc, &args, null, null);
-    if (argc <= index) return default;
-    var value_type: napi.napi_valuetype = undefined;
-    _ = napi.napi_typeof(env, args[index], &value_type);
-    if (value_type == napi.napi_null or value_type == napi.napi_undefined) return default;
+    const arg = getRawArg(env, info, index) orelse return default;
     var v: i64 = 0;
-    _ = napi.napi_get_value_int64(env, args[index], &v);
+    _ = napi.napi_get_value_int64(env, arg, &v);
     return @intCast(v);
 }
 
 fn getBoolArg(env: napi.napi_env, info: napi.napi_callback_info, index: usize, default: bool) bool {
-    var argc: usize = 6;
-    var args: [6]napi.napi_value = undefined;
-    _ = napi.napi_get_cb_info(env, info, &argc, &args, null, null);
-    if (argc <= index) return default;
-    var value_type: napi.napi_valuetype = undefined;
-    _ = napi.napi_typeof(env, args[index], &value_type);
-    if (value_type == napi.napi_null or value_type == napi.napi_undefined) return default;
+    const arg = getRawArg(env, info, index) orelse return default;
     var v: bool = default;
-    _ = napi.napi_get_value_bool(env, args[index], &v);
+    _ = napi.napi_get_value_bool(env, arg, &v);
     return v;
 }
 

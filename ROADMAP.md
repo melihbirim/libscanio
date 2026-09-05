@@ -394,6 +394,16 @@ Outside-eye grading of this project as CS research landed at C+: solid engineeri
 
 Not started except the mechanism reasoning above (item 4), which is real analysis, not a placeholder. Real remaining cost: weeks of evaluation-design and multi-host measurement work, not a quick follow-up — logged here so it isn't lost, not because it's imminent.
 
+## Repo-wide over-engineering audit — one real cut, one real non-cut
+
+A `ponytail-audit` pass (scans the whole tree for redundancy/unused flexibility, not a diff review) flagged `examples/`'s bench binaries as likely leftover duplication. Checked before acting, not acted on blind — the checking itself found a real distinction worth recording so this doesn't get re-litigated.
+
+**First flagged as redundant, then found to be load-bearing, NOT touched:** `scan_bench.zig`, `parallel_bench.zig`, `collect_bench.zig`, `tokenizer_bench.zig`, `parser_bench.zig` all stayed separate files. Each is individually cited by name in `docs/BENCHMARKS.md`'s "Reproducing" section or explicitly called "a permanent, reusable comparison tool, not a throwaway script" elsewhere in this file — they're the actual reproduction commands behind this project's own published numbers, not accidental clutter. Collapsing them would have broken documented, external-facing commands to fix a cosmetic shape.
+
+**Actually cut, after that distinction was made:** `scan_file.zig`, `mem_check.zig`, `count_bench.zig`, `filter_bench.zig` — four ~25-30 line files that were genuinely just argv-parse + open + loop + timer + print, differing only in which single call got timed, with no external doc citing them individually by filename (only by their `zig build <step>` name, which is preserved). Consolidated into one `examples/bench_tool.zig` with a mode dispatch; `build.zig` bakes each mode into its own step (`scan`/`mem-check`/`count-bench`/`filter-bench`) so the documented CLI (`zig build mem-check -Doptimize=ReleaseFast -- <file>`, cited verbatim in `docs/BENCHMARKS.md`) is byte-for-byte unchanged — verified by actually running all four commands after the change, not assumed. Also consolidated `node_binding.zig`'s three near-identical N-API argument-parsing helpers (`getStringArg`/`getIntArg`/`getBoolArg` each re-implemented the same argc/null-check dance) into one shared `getRawArg()`.
+
+Full suite reverified green after (Zig, C ABI, Python, Node) — this was a shape cleanup, not a behavior change, and was checked to actually be one.
+
 ## Relationship to csvql
 
 csvql should eventually sit on top of libscanio (SQL parser/planner → libscanio → CSV/NDJSON) rather than duplicating scan logic. Extraction happens gradually, one primitive at a time, each step gated by csvql's existing correctness/fuzz/benchmark suite so it's provably zero-behavior-change before the next step starts. csvql remains the SQL product; libscanio is the reusable engine underneath it.

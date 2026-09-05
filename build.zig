@@ -165,56 +165,39 @@ pub fn build(b: *std.Build) void {
         _ = node_step;
     }
 
-    const example = b.addExecutable(.{
-        .name = "scan_file",
+    // scan-file/mem-check/count-bench/filter-bench share ONE compiled
+    // binary (examples/bench_tool.zig) with a mode dispatch — these four
+    // used to be four separate files, each just argv-parse + open + loop
+    // + timer + print with no meaningfully different scaffolding. Each
+    // step below bakes its own mode in as the first real arg, so the
+    // documented CLI (`zig build mem-check -- <file>`, cited verbatim in
+    // docs/BENCHMARKS.md) is unchanged — callers never type the mode.
+    const bench_tool = b.addExecutable(.{
+        .name = "bench_tool",
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
-            .root_source_file = b.path("examples/scan_file.zig"),
+            .root_source_file = b.path("examples/bench_tool.zig"),
         }),
     });
-    example.root_module.addImport("scanio", scanio_mod);
-    example.linkLibC();
-    const install_example = b.addInstallArtifact(example, .{});
-    const run_example = b.addRunArtifact(example);
-    run_example.step.dependOn(&install_example.step);
-    if (b.args) |args| run_example.addArgs(args);
-    const example_step = b.step("scan", "Run the scan_file example");
-    example_step.dependOn(&run_example.step);
+    bench_tool.root_module.addImport("scanio", scanio_mod);
+    bench_tool.linkLibC();
+    const install_bench_tool = b.addInstallArtifact(bench_tool, .{});
 
-    const mem_check = b.addExecutable(.{
-        .name = "mem_check",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("examples/mem_check.zig"),
-        }),
-    });
-    mem_check.root_module.addImport("scanio", scanio_mod);
-    mem_check.linkLibC();
-    const install_mem_check = b.addInstallArtifact(mem_check, .{});
-    const run_mem_check = b.addRunArtifact(mem_check);
-    run_mem_check.step.dependOn(&install_mem_check.step);
-    if (b.args) |args| run_mem_check.addArgs(args);
-    const mem_check_step = b.step("mem-check", "Run the format-aware Query scan (for memory/throughput comparison)");
-    mem_check_step.dependOn(&run_mem_check.step);
-
-    const count_bench = b.addExecutable(.{
-        .name = "count_bench",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("examples/count_bench.zig"),
-        }),
-    });
-    count_bench.root_module.addImport("scanio", scanio_mod);
-    count_bench.linkLibC();
-    const install_count_bench = b.addInstallArtifact(count_bench, .{});
-    const run_count_bench = b.addRunArtifact(count_bench);
-    run_count_bench.step.dependOn(&install_count_bench.step);
-    if (b.args) |args| run_count_bench.addArgs(args);
-    const count_bench_step = b.step("count-bench", "Run Query.count()'s no-WHERE fast path (for xan count comparison)");
-    count_bench_step.dependOn(&run_count_bench.step);
+    const bench_tool_modes = [_]struct { mode: []const u8, step: []const u8, desc: []const u8 }{
+        .{ .mode = "scan-file", .step = "scan", .desc = "Run the raw Scanner.next() loop example" },
+        .{ .mode = "mem-check", .step = "mem-check", .desc = "Run the format-aware Query scan (for memory/throughput comparison)" },
+        .{ .mode = "count-bench", .step = "count-bench", .desc = "Run Query.count()'s no-WHERE fast path (for xan count comparison)" },
+        .{ .mode = "filter-bench", .step = "filter-bench", .desc = "Run a WHERE-filtered scan, counting matches (for grep comparison)" },
+    };
+    for (bench_tool_modes) |m| {
+        const run = b.addRunArtifact(bench_tool);
+        run.step.dependOn(&install_bench_tool.step);
+        run.addArg(m.mode);
+        if (b.args) |args| run.addArgs(args);
+        const step = b.step(m.step, m.desc);
+        step.dependOn(&run.step);
+    }
 
     const scan_bench = b.addExecutable(.{
         .name = "scan_bench",
@@ -249,23 +232,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_parallel_bench.addArgs(args);
     const parallel_bench_step = b.step("parallel-bench", "Run parallelCountRows(Where) (for multi-threaded comparison)");
     parallel_bench_step.dependOn(&run_parallel_bench.step);
-
-    const filter_bench = b.addExecutable(.{
-        .name = "filter_bench",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("examples/filter_bench.zig"),
-        }),
-    });
-    filter_bench.root_module.addImport("scanio", scanio_mod);
-    filter_bench.linkLibC();
-    const install_filter_bench = b.addInstallArtifact(filter_bench, .{});
-    const run_filter_bench = b.addRunArtifact(filter_bench);
-    run_filter_bench.step.dependOn(&install_filter_bench.step);
-    if (b.args) |args| run_filter_bench.addArgs(args);
-    const filter_bench_step = b.step("filter-bench", "Run a WHERE-filtered scan, counting matches (for grep comparison)");
-    filter_bench_step.dependOn(&run_filter_bench.step);
 
     const collect_bench = b.addExecutable(.{
         .name = "collect_bench",
