@@ -41,8 +41,12 @@ CSV_NAME="$(basename "$CSV")"
 command -v docker >/dev/null || { echo "docker not found on PATH"; exit 1; }
 [ -f "$CSV" ] || { echo "CSV not found: $CSV"; exit 1; }
 
-echo "Building $IMAGE (arm64 — see Dockerfile comment for x86_64)..."
-docker build -f "$SCRIPT_DIR/Dockerfile" -t "$IMAGE" "$ROOT" --platform linux/arm64 >/dev/null
+# No --platform flag: builds natively for whatever host runs this,
+# via the Dockerfile's own TARGETARCH auto-detection. Deliberately not
+# hardcoded — see the Dockerfile's own comment for the incident that
+# taught this the hard way.
+echo "Building $IMAGE (native arch)..."
+docker build -f "$SCRIPT_DIR/Dockerfile" -t "$IMAGE" "$ROOT" >/dev/null
 
 # Correctness first, unconstrained, before trusting any tier's timing.
 echo
