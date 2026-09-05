@@ -774,20 +774,37 @@ const NdjsonFilterCtx = struct {
     field_buf: [][]const u8,
     arena: std.heap.ArenaAllocator,
     count: usize = 0,
+    // Reused across every line — see NdjsonScanColumnarCtx's own
+    // parse_fields doc comment for the full reasoning (ported from
+    // ndjson.zig's NdjsonScanner.next(), which already proved this out)
+    // and the owned_strings gotcha it must keep matching exactly. This
+    // is the "worth revisiting if parallel WHERE-filtered NDJSON scans
+    // turn out to be parse-bound" case the doc comment above predicted.
+    parse_fields: std.ArrayList(json_parser.JsonObject.Field) = .{},
 
     fn deinit(self: *NdjsonFilterCtx) void {
         self.arena.deinit();
+        self.parse_fields.deinit(self.allocator);
         self.allocator.free(self.field_buf);
     }
 
     fn onLine(self: *NdjsonFilterCtx, line: []const u8) !void {
         if (line.len == 0) return; // blank trailing line, not a record
-        _ = self.arena.reset(.retain_capacity);
-        const obj = json_parser.parseObject(line, self.arena.allocator()) catch return; // malformed line: never matches, matches Query's own "no field, no match" behavior
-        for (self.field_buf) |*f| f.* = "";
-        for (obj.fields) |field| {
-            const idx = self.header_index.get(field.key) orelse continue;
-            self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+        if (!json_parser.tryFastRow(line, self.header, self.field_buf)) {
+            _ = self.arena.reset(.retain_capacity);
+            var owned_strings: std.ArrayList([]u8) = .{};
+            const obj = json_parser.parseObjectReuse(
+                line,
+                self.allocator,
+                self.arena.allocator(),
+                &self.parse_fields,
+                &owned_strings,
+            ) catch return; // malformed line: never matches, matches Query's own "no field, no match" behavior
+            for (self.field_buf) |*f| f.* = "";
+            for (obj.fields) |field| {
+                const idx = self.header_index.get(field.key) orelse continue;
+                self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+            }
         }
         const scan = @import("root.zig");
         if (query_mod.matches(scan.Row{ .fields = self.field_buf }, self.predicates)) self.count += 1;
@@ -1051,20 +1068,34 @@ fn csvScanWorkerRun(w: *CsvScanWorker) void {
 
 const NdjsonScanCtx = struct {
     allocator: Allocator,
+    header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
     field_buf: [][]const u8,
     arena: std.heap.ArenaAllocator,
     rows: std.ArrayListUnmanaged(OwnedRow) = .{},
+    // Reused across every line — see NdjsonScanColumnarCtx's own
+    // parse_fields doc comment for the full reasoning and the
+    // owned_strings gotcha this must keep matching exactly.
+    parse_fields: std.ArrayList(json_parser.JsonObject.Field) = .{},
 
     fn onLine(self: *NdjsonScanCtx, line: []const u8) !void {
         if (line.len == 0) return;
-        _ = self.arena.reset(.retain_capacity);
-        const obj = json_parser.parseObject(line, self.arena.allocator()) catch return;
-        for (self.field_buf) |*f| f.* = "";
-        for (obj.fields) |field| {
-            const idx = self.header_index.get(field.key) orelse continue;
-            self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+        if (!json_parser.tryFastRow(line, self.header, self.field_buf)) {
+            _ = self.arena.reset(.retain_capacity);
+            var owned_strings: std.ArrayList([]u8) = .{};
+            const obj = json_parser.parseObjectReuse(
+                line,
+                self.allocator,
+                self.arena.allocator(),
+                &self.parse_fields,
+                &owned_strings,
+            ) catch return;
+            for (self.field_buf) |*f| f.* = "";
+            for (obj.fields) |field| {
+                const idx = self.header_index.get(field.key) orelse continue;
+                self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+            }
         }
         const scan = @import("root.zig");
         const row = scan.Row{ .fields = self.field_buf };
@@ -1092,6 +1123,7 @@ fn ndjsonScanWorkerRun(w: *NdjsonScanWorker) void {
     };
     var ctx = NdjsonScanCtx{
         .allocator = w.allocator,
+        .header = w.header,
         .header_index = w.header_index,
         .predicates = w.predicates,
         .field_buf = field_buf,
@@ -1099,6 +1131,7 @@ fn ndjsonScanWorkerRun(w: *NdjsonScanWorker) void {
     };
     defer {
         ctx.arena.deinit();
+        ctx.parse_fields.deinit(w.allocator);
         w.allocator.free(field_buf);
     }
     forEachLineInRange(w.allocator, w.file, w.range, NdjsonScanCtx, &ctx, NdjsonScanCtx.onLine) catch |e| {
@@ -1332,21 +1365,44 @@ fn csvScanColumnarWorkerRun(w: *CsvScanColumnarWorker) void {
 
 const NdjsonScanColumnarCtx = struct {
     allocator: Allocator,
+    header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
     field_buf: [][]const u8,
     arena: std.heap.ArenaAllocator,
     columns: []ColumnBuf,
     n_rows: usize = 0,
+    // Reused across every line in this worker's range instead of a fresh
+    // ArrayList per line — real, measured win, ported from ndjson.zig's
+    // NdjsonScanner.next() (see its own parse_fields doc comment for the
+    // full reasoning and the owned_strings gotcha this must match
+    // exactly: owned_strings can NOT be persisted the same way, since
+    // json_parser grows it using `arena.allocator()`, and freeing an
+    // arena-backed array later via a non-arena allocator segfaults).
+    // Grown via `allocator` (persists for this worker's whole range, not
+    // reset per row); freed explicitly in ndjsonScanColumnarWorkerRun.
+    parse_fields: std.ArrayList(json_parser.JsonObject.Field) = .{},
 
     fn onLine(self: *NdjsonScanColumnarCtx, line: []const u8) !void {
         if (line.len == 0) return;
-        _ = self.arena.reset(.retain_capacity);
-        const obj = json_parser.parseObject(line, self.arena.allocator()) catch return;
-        for (self.field_buf) |*f| f.* = "";
-        for (obj.fields) |field| {
-            const idx = self.header_index.get(field.key) orelse continue;
-            self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+        // Same-key-order fast path first (see json_parser.tryFastRow's
+        // doc comment) — zero allocation, no hashing, resolves the
+        // common case without ever touching the generic parser below.
+        if (!json_parser.tryFastRow(line, self.header, self.field_buf)) {
+            _ = self.arena.reset(.retain_capacity);
+            var owned_strings: std.ArrayList([]u8) = .{};
+            const obj = json_parser.parseObjectReuse(
+                line,
+                self.allocator,
+                self.arena.allocator(),
+                &self.parse_fields,
+                &owned_strings,
+            ) catch return;
+            for (self.field_buf) |*f| f.* = "";
+            for (obj.fields) |field| {
+                const idx = self.header_index.get(field.key) orelse continue;
+                self.field_buf[idx] = renderJsonValue(field.value) catch continue;
+            }
         }
         const scan = @import("root.zig");
         const row = scan.Row{ .fields = self.field_buf };
@@ -1383,6 +1439,7 @@ fn ndjsonScanColumnarWorkerRun(w: *NdjsonScanColumnarWorker) void {
     };
     var ctx = NdjsonScanColumnarCtx{
         .allocator = w.allocator,
+        .header = w.header,
         .header_index = w.header_index,
         .predicates = w.predicates,
         .field_buf = field_buf,
@@ -1390,6 +1447,7 @@ fn ndjsonScanColumnarWorkerRun(w: *NdjsonScanColumnarWorker) void {
         .columns = columns,
     };
     defer ctx.arena.deinit();
+    defer ctx.parse_fields.deinit(w.allocator);
     forEachLineInRange(w.allocator, w.file, w.range, NdjsonScanColumnarCtx, &ctx, NdjsonScanColumnarCtx.onLine) catch |e| {
         deinitColumnBufs(w.allocator, columns);
         w.err = e;

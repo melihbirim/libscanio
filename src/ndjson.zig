@@ -252,7 +252,7 @@ pub const NdjsonScanner = struct {
         // reordered/extra/missing keys, escapes, nested values, malformed
         // JSON. Correctness therefore never depends on the fast path
         // succeeding — only speed does.
-        if (try self.tryFastRow(line)) {
+        if (json_parser.tryFastRow(line, self.header, self.field_buf)) {
             return Row{ .fields = self.field_buf[0..self.header.len] };
         }
 
@@ -294,76 +294,6 @@ pub const NdjsonScanner = struct {
             self.field_buf[idx] = try render(field.value);
         }
         return Row{ .fields = self.field_buf[0..self.header.len] };
-    }
-
-    /// Single-pass byte scan straight into field_buf, matching CSV's own
-    /// nextLine()-splitting approach instead of building generic JSON
-    /// structures (Token array, Field-struct array, JsonValue tags) for
-    /// data this scanner only ever reads back as raw text. Returns false
-    /// (leaving field_buf in a partially-written, about-to-be-overwritten
-    /// state — the caller always re-derives from the full generic parser
-    /// on false, so this is safe) the instant anything doesn't match the
-    /// fast shape: a header-order/name mismatch, an escaped string, a
-    /// nested value, or anything malformed. Never the source of truth for
-    /// correctness — only ever a speed shortcut the caller can discard.
-    /// Vectorized quote search (std.mem.indexOfScalar, SIMD-backed) plus a
-    /// cheap backward escape-check only on an actual hit — the string
-    /// equivalent of CSV's comma search, instead of json_parser's manual
-    /// per-byte escape-tracking loop (findStringEnd), which was the real
-    /// remaining cost once the SIMD tokenizer pass itself was skipped.
-    /// Unescaped strings (the fixture's — and most real NDJSON's — common
-    /// case) resolve on the FIRST indexOfScalar hit, so the backward scan
-    /// almost never runs more than the single "is there a backslash right
-    /// before this quote" check. Only finds where the string ENDS — the
-    /// caller still separately checks hasJsonEscape on the resulting span,
-    /// since a legitimately-unescaped closing quote can still follow an
-    /// interior escape sequence (`"foo\nbar"`) that needs real decoding.
-    fn findQuoteEnd(line: []const u8, start: usize) ?usize {
-        var idx = start;
-        while (std.mem.indexOfScalarPos(u8, line, idx, '"')) |q| {
-            if (!json_parser.isEscapedAt(line, q)) return q;
-            idx = q + 1;
-        }
-        return null;
-    }
-
-    fn tryFastRow(self: *NdjsonScanner, line: []const u8) !bool {
-        var pos: usize = std.mem.indexOfScalar(u8, line, '{') orelse return false;
-        pos += 1;
-
-        for (self.header, 0..) |want_key, k| {
-            while (pos < line.len and (line[pos] == ' ' or line[pos] == ',')) : (pos += 1) {}
-            if (pos >= line.len or line[pos] != '"') return false;
-            const key_start = pos + 1;
-            const key_end = findQuoteEnd(line, key_start) orelse return false;
-            const key = line[key_start..key_end];
-            if (json_parser.hasJsonEscape(key)) return false;
-            if (!std.mem.eql(u8, key, want_key)) return false;
-            pos = key_end + 1;
-
-            while (pos < line.len and line[pos] == ' ') : (pos += 1) {}
-            if (pos >= line.len or line[pos] != ':') return false;
-            pos += 1;
-            while (pos < line.len and line[pos] == ' ') : (pos += 1) {}
-            if (pos >= line.len) return false;
-
-            if (line[pos] == '"') {
-                const val_start = pos + 1;
-                const val_end = findQuoteEnd(line, val_start) orelse return false;
-                const raw = line[val_start..val_end];
-                if (json_parser.hasJsonEscape(raw)) return false;
-                self.field_buf[k] = raw;
-                pos = val_end + 1;
-            } else if (line[pos] == '{' or line[pos] == '[') {
-                return false; // nested — fall back to the generic path, which errors correctly
-            } else {
-                const val_start = pos;
-                while (pos < line.len and line[pos] != ',' and line[pos] != '}' and line[pos] != ' ') : (pos += 1) {}
-                if (pos == val_start) return false;
-                self.field_buf[k] = line[val_start..pos];
-            }
-        }
-        return true;
     }
 
     /// Newline-only (line_delimited) or object-count-only (json_array)

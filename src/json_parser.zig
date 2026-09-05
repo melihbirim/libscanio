@@ -476,6 +476,81 @@ pub fn hasJsonEscape(raw: []const u8) bool {
     return std.mem.indexOfScalar(u8, raw, '\\') != null;
 }
 
+/// Vectorized quote search (`std.mem.indexOfScalarPos`, SIMD-backed)
+/// plus a cheap backward escape-check only on an actual hit — the
+/// string equivalent of CSV's comma search, instead of a manual
+/// per-byte escape-tracking loop. Unescaped strings (the common case)
+/// resolve on the FIRST hit, so the backward scan almost never runs
+/// more than the single "is there a backslash right before this quote"
+/// check. Only finds where the string ENDS — callers still separately
+/// check `hasJsonEscape` on the resulting span, since a legitimately-
+/// unescaped closing quote can still follow an interior escape
+/// sequence (`"foo\nbar"`) that needs real decoding.
+pub fn findQuoteEnd(line: []const u8, start: usize) ?usize {
+    var idx = start;
+    while (std.mem.indexOfScalarPos(u8, line, idx, '"')) |q| {
+        if (!isEscapedAt(line, q)) return q;
+        idx = q + 1;
+    }
+    return null;
+}
+
+/// Single-pass byte scan straight into `field_buf`, matching CSV's own
+/// comma-splitting approach instead of building generic JSON structures
+/// (Token array, Field-struct array, JsonValue tags) for data callers
+/// only ever read back as raw text. Real NDJSON files overwhelmingly
+/// keep the same key order every row (same producer, same struct/
+/// schema) — when `header[k]` matches the row's k-th key, this resolves
+/// with zero allocation and no hashing at all. Returns `false` (leaving
+/// `field_buf` in a partially-written, about-to-be-overwritten state —
+/// callers always re-derive from the full generic parser on `false`, so
+/// this is safe) the instant anything doesn't match the fast shape: a
+/// header-order/name mismatch, an escaped string, a nested value, or
+/// anything malformed. Never the source of truth for correctness — only
+/// ever a speed shortcut the caller can discard. Originally private to
+/// `NdjsonScanner` (ndjson.zig); pulled out here so `parallel.zig`'s
+/// worker contexts can use the identical fast path instead of always
+/// paying full generic-parser cost (see ROADMAP.md for the measured win
+/// this closed).
+pub fn tryFastRow(line: []const u8, header: []const []const u8, field_buf: [][]const u8) bool {
+    var pos: usize = std.mem.indexOfScalar(u8, line, '{') orelse return false;
+    pos += 1;
+
+    for (header, 0..) |want_key, k| {
+        while (pos < line.len and (line[pos] == ' ' or line[pos] == ',')) : (pos += 1) {}
+        if (pos >= line.len or line[pos] != '"') return false;
+        const key_start = pos + 1;
+        const key_end = findQuoteEnd(line, key_start) orelse return false;
+        const key = line[key_start..key_end];
+        if (hasJsonEscape(key)) return false;
+        if (!std.mem.eql(u8, key, want_key)) return false;
+        pos = key_end + 1;
+
+        while (pos < line.len and line[pos] == ' ') : (pos += 1) {}
+        if (pos >= line.len or line[pos] != ':') return false;
+        pos += 1;
+        while (pos < line.len and line[pos] == ' ') : (pos += 1) {}
+        if (pos >= line.len) return false;
+
+        if (line[pos] == '"') {
+            const val_start = pos + 1;
+            const val_end = findQuoteEnd(line, val_start) orelse return false;
+            const raw = line[val_start..val_end];
+            if (hasJsonEscape(raw)) return false;
+            field_buf[k] = raw;
+            pos = val_end + 1;
+        } else if (line[pos] == '{' or line[pos] == '[') {
+            return false; // nested — fall back to the generic path, which errors correctly
+        } else {
+            const val_start = pos;
+            while (pos < line.len and line[pos] != ',' and line[pos] != '}' and line[pos] != ' ') : (pos += 1) {}
+            if (pos == val_start) return false;
+            field_buf[k] = line[val_start..pos];
+        }
+    }
+    return true;
+}
+
 fn decodeOwnedJsonString(raw: []const u8, allocator: Allocator) ParseError![]u8 {
     var out = std.ArrayList(u8){};
     errdefer out.deinit(allocator);
