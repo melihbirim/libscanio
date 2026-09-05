@@ -145,4 +145,6 @@ jobs:
 
       - name: Run N-API binding tests
         shell: bash
-        run: node node_napi/test.js
+        run: |
+          node node_napi/test/addon_test.js
+          node node_napi/test/test.js

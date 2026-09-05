@@ -8,7 +8,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
-const addonPath = path.join(__dirname, '..', 'zig-out', 'lib', 'scanio.node');
+const addonPath = path.join(__dirname, '..', '..', 'zig-out', 'lib', 'scanio.node');
 const addon = require(addonPath);
 
 let passed = 0;
