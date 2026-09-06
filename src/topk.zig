@@ -147,7 +147,11 @@ pub fn topK(allocator: Allocator, q: *Query, column: usize, k: usize, descending
     errdefer heap.deinit();
     while (try q.next()) |row| {
         const field = row.get(column) orelse continue;
-        const v = std.fmt.parseFloat(f64, field) catch continue;
+        // Skipped rather than parsed as a real NaN/inf: isBetter and
+        // isWorse are both false against NaN, so a NaN key that reached
+        // the heap root could never be evicted and permanently held a
+        // slot a real value should have won.
+        const v = scan.parseNumeric(field) orelse continue;
         if (!heap.wouldAccept(v)) continue;
         const owned = try copyRow(allocator, row);
         heap.insert(v, owned);
@@ -220,4 +224,24 @@ test "topk: composes with WHERE" {
     const sorted = heap.getSorted();
     try std.testing.expectEqual(@as(usize, 1), sorted.len);
     try std.testing.expectEqualStrings("3", sorted[0].row.get(0).?);
+}
+
+test "topk: a 'nan' key cannot squat in the heap" {
+    // isBetter/isWorse are both false against NaN, so a NaN key that
+    // reached the root was unevictable and cost a real row its slot.
+    const allocator = std.testing.allocator;
+    const path = "test_topk_nan.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,nan\n2,50\n3,900\n4,10\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{});
+    defer q.deinit();
+
+    var heap = try topK(allocator, &q, 1, 2, true);
+    defer heap.deinit();
+    const sorted = heap.getSorted();
+
+    try std.testing.expectEqual(@as(usize, 2), sorted.len);
+    try std.testing.expectEqual(@as(f64, 900), sorted[0].key);
+    try std.testing.expectEqual(@as(f64, 50), sorted[1].key);
 }

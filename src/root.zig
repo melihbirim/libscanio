@@ -58,6 +58,7 @@ pub const Query = query_mod.Query;
 pub const QueryOptions = query_mod.QueryOptions;
 pub const Predicate = query_mod.Predicate;
 pub const Op = query_mod.Op;
+pub const parseNumeric = query_mod.parseNumeric;
 
 const ndjson_mod = @import("ndjson.zig");
 pub const NdjsonScanner = ndjson_mod.NdjsonScanner;

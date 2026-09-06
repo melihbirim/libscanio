@@ -42,12 +42,26 @@ pub fn parseWhereString(allocator: std.mem.Allocator, header: []const []const u8
         const part = std.mem.trim(u8, raw_part, " \t");
         if (part.len == 0) continue;
 
-        // "col IN (a, b, c)"
-        if (std.mem.indexOf(u8, part, " IN ")) |in_pos| {
-            const col_name = std.mem.trim(u8, part[0..in_pos], " \t");
+        // "col IN (a, b, c)" — but only when what follows " IN " really
+        // is a parenthesised list. The check used to be "contains ' IN '"
+        // alone, which claimed any clause whose VALUE happened to contain
+        // that substring: `name = Mine IN Town` sliced "name = Mine" off
+        // as the column name and failed with UnknownColumn instead of
+        // parsing as name = "Mine IN Town". A non-parenthesised tail now
+        // falls through to the operator scan below, where such a clause
+        // belongs.
+        const in_clause: ?struct { col: []const u8, inner: []const u8 } = blk: {
+            const in_pos = std.mem.indexOf(u8, part, " IN ") orelse break :blk null;
             const rest = std.mem.trim(u8, part[in_pos + 4 ..], " \t");
-            if (rest.len < 2 or rest[0] != '(' or rest[rest.len - 1] != ')') return error.InvalidWhere;
-            const inner = rest[1 .. rest.len - 1];
+            if (rest.len < 2 or rest[0] != '(' or rest[rest.len - 1] != ')') break :blk null;
+            break :blk .{
+                .col = std.mem.trim(u8, part[0..in_pos], " \t"),
+                .inner = rest[1 .. rest.len - 1],
+            };
+        };
+        if (in_clause) |ic| {
+            const col_name = ic.col;
+            const inner = ic.inner;
             const col = try resolveColumn(header, col_name);
 
             var vals: std.ArrayListUnmanaged([]const u8) = .{};
@@ -327,4 +341,29 @@ test "maxPredicateColumn: a predicate's column can exceed the extra column" {
     const preds = try parseWhereString(testing.allocator, &header, "c = 1");
     defer freePredicates(testing.allocator, preds);
     try testing.expectEqual(@as(?usize, 2), maxPredicateColumn(preds, 0));
+}
+
+test "parseWhereString: a value containing ' IN ' is not mistaken for an IN clause" {
+    // The IN branch used to fire on the substring alone, slicing
+    // "name = Mine" off as the column name.
+    const header = [_][]const u8{ "id", "name" };
+    const preds = try parseWhereString(testing.allocator, &header, "name = Mine IN Town");
+    defer freePredicates(testing.allocator, preds);
+
+    try testing.expectEqual(@as(usize, 1), preds.len);
+    try testing.expectEqual(@as(usize, 1), preds[0].column);
+    try testing.expectEqual(Op.eq, preds[0].op);
+    try testing.expectEqualStrings("Mine IN Town", preds[0].value);
+}
+
+test "parseWhereString: a real IN clause still parses" {
+    const header = [_][]const u8{ "id", "name" };
+    const preds = try parseWhereString(testing.allocator, &header, "name IN (Ann, Bob)");
+    defer freePredicates(testing.allocator, preds);
+
+    try testing.expectEqual(@as(usize, 1), preds.len);
+    try testing.expectEqual(Op.in_list, preds[0].op);
+    try testing.expectEqual(@as(usize, 2), preds[0].values.len);
+    try testing.expectEqualStrings("Ann", preds[0].values[0]);
+    try testing.expectEqualStrings("Bob", preds[0].values[1]);
 }

@@ -24,6 +24,26 @@ const Row = scan.Row;
 
 pub const Op = enum { eq, neq, gt, gte, lt, lte, in_list };
 
+/// The one place that decides whether a field is "a number" for every
+/// comparison, ordering, and aggregate in this library.
+///
+/// std.fmt.parseFloat alone is not that test: it happily accepts the
+/// literal text "nan", "inf" and "-inf", and the f64 it returns then
+/// poisons everything downstream. NaN compares false against every
+/// value including itself, so a single such cell made min/max stick
+/// forever (aggregate.zig), turned sort order non-transitive
+/// (order.zig's compareField returned .eq for a NaN against every row),
+/// and let a NaN key sit in the top-K heap that nothing could ever
+/// evict (topk.zig). Non-finite text is data, not arithmetic — treated
+/// as non-numeric here, which is exactly the "skip what isn't a usable
+/// number / fall back to a string compare" rule all four callers
+/// already meant to implement.
+pub fn parseNumeric(s: []const u8) ?f64 {
+    const v = std.fmt.parseFloat(f64, s) catch return null;
+    if (!std.math.isFinite(v)) return null;
+    return v;
+}
+
 pub const Format = enum { csv, ndjson };
 
 pub const Predicate = struct {
@@ -37,7 +57,7 @@ pub const Predicate = struct {
     numeric_value: ?f64 = null,
 
     pub fn init(column: usize, op: Op, value: []const u8) Predicate {
-        return .{ .column = column, .op = op, .value = value, .numeric_value = std.fmt.parseFloat(f64, value) catch null };
+        return .{ .column = column, .op = op, .value = value, .numeric_value = parseNumeric(value) };
     }
 
     /// col IN (a, b, c) — matches if the field equals ANY of `values`.
@@ -200,12 +220,34 @@ pub const Query = struct {
     /// buffer. With a WHERE clause, rows still have to be split and
     /// matched, but never projected or returned.
     pub fn count(self: *Query) !usize {
-        if (self.where.len == 0) {
+        // Remaining budget under this Query's limit, sharing next()'s
+        // meaning of `returned` so count() and next() can't disagree
+        // about how much of the limit is left. count() used to ignore
+        // `limit` entirely on BOTH branches below — a Query opened with
+        // .limit = 2 over a 5-row file counted 5.
+        const remaining: ?usize = if (self.limit) |lim|
+            (if (self.returned >= lim) return 0 else lim - self.returned)
+        else
+            null;
+
+        // The never-split-a-field fast path is only valid when nothing
+        // can stop the scan early: no filter to test and no limit to
+        // reach. With a limit, the generic loop below is the cheaper
+        // answer anyway for the case that matters (a small limit stops
+        // after a few rows instead of counting record boundaries through
+        // the whole file).
+        if (self.where.len == 0 and remaining == null) {
             return self.source.countFastPath();
         }
+
         var n: usize = 0;
         while (try self.source.next()) |row| {
-            if (matches(row, self.where)) n += 1;
+            if (!matches(row, self.where)) continue;
+            n += 1;
+            self.returned += 1;
+            if (remaining) |r| {
+                if (n >= r) break;
+            }
         }
         return n;
     }
@@ -233,8 +275,8 @@ pub fn matches(row: Row, predicates: []const Predicate) bool {
 fn evalOne(field: []const u8, p: Predicate) bool {
     if (p.op == .in_list) {
         for (p.values) |v| {
-            if (std.fmt.parseFloat(f64, v) catch null) |pv| {
-                if (std.fmt.parseFloat(f64, field) catch null) |fv| {
+            if (parseNumeric(v)) |pv| {
+                if (parseNumeric(field)) |fv| {
                     if (fv == pv) return true;
                     continue;
                 }
@@ -244,7 +286,7 @@ fn evalOne(field: []const u8, p: Predicate) bool {
         return false;
     }
     if (p.numeric_value) |pv| {
-        if (std.fmt.parseFloat(f64, field) catch null) |fv| {
+        if (parseNumeric(field)) |fv| {
             return switch (p.op) {
                 .eq => fv == pv,
                 .neq => fv != pv,
@@ -544,4 +586,53 @@ test "json array: count() fast path still applies (each element becomes one line
     var q = try Query.open(allocator, path, .{});
     defer q.deinit();
     try std.testing.expectEqual(@as(usize, 3), try q.count());
+}
+
+test "count: respects limit on both the fast path and the filtered path" {
+    // count() used to bypass the limit entirely: the no-WHERE branch
+    // counted every record boundary in the file and the WHERE branch
+    // counted every match, neither stopping at the limit next() honours.
+    const allocator = std.testing.allocator;
+    const path = "test_query_count_limit.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,50\n2,1500\n3,2500\n4,20\n5,3000\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    {
+        var q = try Query.open(allocator, path, .{ .limit = 2 });
+        defer q.deinit();
+        try std.testing.expectEqual(@as(usize, 2), try q.count());
+    }
+    {
+        var q = try Query.open(allocator, path, .{});
+        defer q.deinit();
+        try std.testing.expectEqual(@as(usize, 5), try q.count());
+    }
+    {
+        const preds = [_]Predicate{Predicate.init(1, .gt, "1000")};
+        var q = try Query.open(allocator, path, .{ .where = &preds, .limit = 1 });
+        defer q.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try q.count());
+    }
+    {
+        const preds = [_]Predicate{Predicate.init(1, .gt, "1000")};
+        var q = try Query.open(allocator, path, .{ .where = &preds });
+        defer q.deinit();
+        try std.testing.expectEqual(@as(usize, 3), try q.count());
+    }
+    // A limit already spent by next() leaves nothing for count().
+    {
+        var q = try Query.open(allocator, path, .{ .limit = 1 });
+        defer q.deinit();
+        _ = try q.next();
+        try std.testing.expectEqual(@as(usize, 0), try q.count());
+    }
+}
+
+test "parseNumeric: non-finite text is data, not arithmetic" {
+    try std.testing.expectEqual(@as(?f64, 42.5), parseNumeric("42.5"));
+    try std.testing.expectEqual(@as(?f64, null), parseNumeric("nan"));
+    try std.testing.expectEqual(@as(?f64, null), parseNumeric("inf"));
+    try std.testing.expectEqual(@as(?f64, null), parseNumeric("-inf"));
+    try std.testing.expectEqual(@as(?f64, null), parseNumeric("Infinity"));
+    try std.testing.expectEqual(@as(?f64, null), parseNumeric("hello"));
 }
