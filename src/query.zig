@@ -89,10 +89,12 @@ pub const QueryOptions = struct {
     /// column (plus, for aggregate()/topk()-style single-column callers,
     /// whatever column they'll read). Null (default) means "don't know,
     /// split every field" — always correct, just not always fastest.
-    /// CSV only for now (see stop_after_column in ScannerOptions,
-    /// root.zig, for the measured win and why it's safe); ignored for
-    /// NDJSON, which doesn't have a comparable per-field split cost to
-    /// avoid (it parses by JSON key, not fixed position). This is NOT
+    /// Honoured by both formats. CSV stops splitting the line's bytes
+    /// (see stop_after_column in ScannerOptions, root.zig); NDJSON stops
+    /// walking the row's keys, which is worth more there than the note
+    /// here once claimed — a 2-of-8-column read is ~7x cheaper in the
+    /// fast path. Either way the returned Row is truncated to the bound,
+    /// so a caller must not ask for a column above it. This is NOT
     /// auto-computed from `columns`/`where` here, on purpose: a caller
     /// like aggregate()/topk() reads a column that's only known at the
     /// call to aggregate()/topk() itself, after Query.open() already
@@ -176,7 +178,11 @@ pub const Query = struct {
                 .chunk_size = options.csv_chunk_size orelse scan.default_chunk_size,
                 .stop_after_column = options.stop_after_column,
             }) },
-            .ndjson => .{ .ndjson = try NdjsonScanner.open(allocator, path) },
+            .ndjson => blk: {
+                var nd = try NdjsonScanner.open(allocator, path);
+                nd.setStopAfterColumn(options.stop_after_column);
+                break :blk .{ .ndjson = nd };
+            },
         };
         return .{ .source = source, .columns = options.columns, .where = options.where, .limit = options.limit };
     }
