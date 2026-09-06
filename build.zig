@@ -184,6 +184,30 @@ pub fn build(b: *std.Build) void {
         _ = node_step;
     }
 
+    // `scanio` — the user-facing CLI. Installed by the default `zig
+    // build`, unlike the examples/ benchmarks, because this one is a
+    // shipped artifact rather than a diagnostic: it exists so a one-shot
+    // query costs ~2ms of process instead of ~15ms through Python or
+    // ~130ms through pyarrow. See src/cli.zig's doc comment.
+    const cli_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/cli.zig"),
+    });
+    cli_mod.addImport("scanio", scanio_mod);
+    const cli_exe = b.addExecutable(.{ .name = "scanio", .root_module = cli_mod });
+    cli_exe.linkLibC();
+    b.installArtifact(cli_exe);
+    const cli_step = b.step("cli", "Build the scanio CLI (zig-out/bin/scanio)");
+    cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+
+    // The CLI's argument parsing and column resolution are plain logic —
+    // covered by `zig build test` alongside everything else, no process
+    // spawning needed.
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    test_step.dependOn(&run_cli_tests.step);
+
     // scan-file/mem-check/count-bench/filter-bench share ONE compiled
     // binary (examples/bench_tool.zig) with a mode dispatch — these four
     // used to be four separate files, each just argv-parse + open + loop

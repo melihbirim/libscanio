@@ -1,0 +1,318 @@
+//! `scanio` — the command-line front door to the same Query the Python,
+//! Node and C ABI bindings use.
+//!
+//! This exists because of a measured gap, not for completeness. The
+//! whole library's advantage on small-to-medium files is that it does
+//! almost nothing before it starts scanning — a 1MB filtered scan takes
+//! ~2ms of actual work. Reaching it through Python costs ~15ms of
+//! interpreter and module startup before a single byte is read, and
+//! through pyarrow's Table constructor ~130ms. Neither is this library's
+//! cost, but both are paid by a caller who just wants one query answered
+//! and the process gone. A binary skips all of it: no interpreter, no
+//! dynamic-language import graph, no FFI marshalling.
+//!
+//! Streaming by design, like `Query` itself — rows are written out as
+//! they are found and never collected, so peak memory tracks the read
+//! buffer rather than the result size. `--count` doesn't even split
+//! fields (see Query.count()'s no-WHERE fast path).
+const std = @import("std");
+const scanio = @import("scanio");
+const where_parser = @import("where_parser.zig");
+
+const usage =
+    \\usage: scanio <file> [options]
+    \\
+    \\  --where <clause>    "col OP val [AND col OP val ...]" or "col IN (a, b)"
+    \\                      OP is one of = != > >= < <=
+    \\  --columns <a,b,c>   only these columns, in this order
+    \\  --limit <n>         stop after n matching rows
+    \\  --count             print just the number of matching rows
+    \\  --format <fmt>      csv (default) or ndjson
+    \\  --help
+    \\
+    \\Reads CSV, NDJSON and JSON arrays; the format is inferred from the
+    \\file extension. Output streams as it is found, so memory stays flat
+    \\regardless of how much matches.
+    \\
+;
+
+pub const Format = enum { csv, ndjson };
+
+/// Everything the CLI accepts, parsed but not yet resolved against a
+/// file's header — kept separate from main() so it is testable without
+/// a filesystem or a process.
+pub const Args = struct {
+    path: []const u8 = "",
+    where: ?[]const u8 = null,
+    columns: ?[]const u8 = null,
+    limit: ?usize = null,
+    count_only: bool = false,
+    format: Format = .csv,
+    help: bool = false,
+};
+
+pub const ArgError = error{
+    MissingValue,
+    UnknownFlag,
+    UnknownFormat,
+    BadLimit,
+    MissingPath,
+};
+
+pub fn parseArgs(argv: []const []const u8) ArgError!Args {
+    var a = Args{};
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            a.help = true;
+            return a;
+        } else if (std.mem.eql(u8, arg, "--count")) {
+            a.count_only = true;
+        } else if (std.mem.eql(u8, arg, "--where")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            a.where = argv[i];
+        } else if (std.mem.eql(u8, arg, "--columns")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            a.columns = argv[i];
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            a.limit = std.fmt.parseInt(usize, argv[i], 10) catch return ArgError.BadLimit;
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            if (std.mem.eql(u8, argv[i], "csv")) {
+                a.format = .csv;
+            } else if (std.mem.eql(u8, argv[i], "ndjson")) {
+                a.format = .ndjson;
+            } else return ArgError.UnknownFormat;
+        } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
+            return ArgError.UnknownFlag;
+        } else if (a.path.len == 0) {
+            a.path = arg;
+        } else return ArgError.UnknownFlag;
+    }
+    if (a.path.len == 0) return ArgError.MissingPath;
+    return a;
+}
+
+/// Resolves a "a,b,c" column list against a header. Returns null for no
+/// projection, which Query reads as "every column".
+fn resolveColumns(allocator: std.mem.Allocator, header: []const []const u8, spec: ?[]const u8) !?[]usize {
+    const s = spec orelse return null;
+    var n: usize = 1;
+    for (s) |c| {
+        if (c == ',') n += 1;
+    }
+    const out = try allocator.alloc(usize, n);
+    errdefer allocator.free(out);
+    var it = std.mem.splitScalar(u8, s, ',');
+    var i: usize = 0;
+    while (it.next()) |raw| : (i += 1) {
+        out[i] = try where_parser.resolveColumn(header, std.mem.trim(u8, raw, " \t"));
+    }
+    return out;
+}
+
+fn writeRow(out: *std.io.Writer, row: scanio.Row, names: []const []const u8, format: Format) !void {
+    switch (format) {
+        .csv => {
+            for (row.fields, 0..) |f, i| {
+                if (i > 0) try out.writeByte(',');
+                try out.writeAll(f);
+            }
+        },
+        .ndjson => {
+            try out.writeByte('{');
+            for (row.fields, 0..) |f, i| {
+                if (i > 0) try out.writeByte(',');
+                // Keys can run past `names` if a row has more fields
+                // than the header did — emit a positional key rather
+                // than dropping the value or indexing out of bounds.
+                if (i < names.len) {
+                    try std.json.Stringify.value(names[i], .{}, out);
+                } else {
+                    try out.print("\"col{d}\"", .{i});
+                }
+                try out.writeByte(':');
+                try std.json.Stringify.value(f, .{}, out);
+            }
+            try out.writeByte('}');
+        },
+    }
+    try out.writeByte('\n');
+}
+
+pub fn main() !u8 {
+    // c_allocator, matching every other binding — see ndjson.zig's doc
+    // comment for the measured reason this is not a GeneralPurposeAllocator.
+    const allocator = std.heap.c_allocator;
+
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+
+    var stderr_buf: [1024]u8 = undefined;
+    var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+    const err_out = &stderr_w.interface;
+
+    const args = parseArgs(@ptrCast(argv[1..])) catch |e| {
+        try err_out.print("scanio: {s}\n\n{s}", .{ @errorName(e), usage });
+        try err_out.flush();
+        return 2;
+    };
+    if (args.help) {
+        try err_out.writeAll(usage);
+        try err_out.flush();
+        return 0;
+    }
+
+    // Probe the header first so --where/--columns can be resolved by
+    // name, the same two-open pattern every other binding uses.
+    var probe = scanio.Query.open(allocator, args.path, .{}) catch |e| {
+        try err_out.print("scanio: cannot open {s}: {s}\n", .{ args.path, @errorName(e) });
+        try err_out.flush();
+        return 1;
+    };
+    const header = probe.header();
+    var owned_header = try allocator.alloc([]const u8, header.len);
+    defer {
+        for (owned_header) |h| allocator.free(@constCast(h));
+        allocator.free(owned_header);
+    }
+    for (header, 0..) |h, i| owned_header[i] = try allocator.dupe(u8, h);
+    probe.deinit();
+
+    const predicates = if (args.where) |w|
+        where_parser.parseWhereString(allocator, owned_header, w) catch |e| {
+            try err_out.print("scanio: bad --where: {s}\n", .{@errorName(e)});
+            try err_out.flush();
+            return 2;
+        }
+    else
+        &[_]scanio.Predicate{};
+    defer if (predicates.len > 0) where_parser.freePredicates(allocator, @constCast(predicates));
+
+    const columns = resolveColumns(allocator, owned_header, args.columns) catch |e| {
+        try err_out.print("scanio: bad --columns: {s}\n", .{@errorName(e)});
+        try err_out.flush();
+        return 2;
+    };
+    defer if (columns) |c| allocator.free(c);
+
+    // Highest column anything will read — lets both the CSV splitter and
+    // the NDJSON key walk stop early (see QueryOptions.stop_after_column).
+    var max_col: ?usize = where_parser.maxPredicateColumn(predicates, null);
+    if (columns) |cols| {
+        for (cols) |c| {
+            if (max_col == null or c > max_col.?) max_col = c;
+        }
+    } else {
+        max_col = null; // no projection: every column is read
+    }
+
+    var q = scanio.Query.open(allocator, args.path, .{
+        .where = predicates,
+        .columns = columns,
+        .limit = args.limit,
+        .stop_after_column = max_col,
+    }) catch |e| {
+        try err_out.print("scanio: cannot open {s}: {s}\n", .{ args.path, @errorName(e) });
+        try err_out.flush();
+        return 1;
+    };
+    defer q.deinit();
+
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+    const out = &stdout_w.interface;
+
+    if (args.count_only) {
+        const n = q.count() catch |e| {
+            try err_out.print("scanio: scan failed: {s}\n", .{@errorName(e)});
+            try err_out.flush();
+            return 1;
+        };
+        try out.print("{d}\n", .{n});
+        try out.flush();
+        return 0;
+    }
+
+    // Projected output needs the projected names, in the projected order.
+    var out_names = owned_header;
+    var projected_names: ?[][]const u8 = null;
+    defer if (projected_names) |p| allocator.free(p);
+    if (columns) |cols| {
+        const p = try allocator.alloc([]const u8, cols.len);
+        for (cols, 0..) |c, i| p[i] = if (c < owned_header.len) owned_header[c] else "";
+        projected_names = p;
+        out_names = p;
+    }
+
+    while (q.next() catch |e| {
+        try err_out.print("scanio: scan failed: {s}\n", .{@errorName(e)});
+        try err_out.flush();
+        return 1;
+    }) |row| {
+        try writeRow(out, row, out_names, args.format);
+    }
+    try out.flush();
+    return 0;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "parseArgs: path only" {
+    const a = try parseArgs(&.{"data.csv"});
+    try testing.expectEqualStrings("data.csv", a.path);
+    try testing.expect(a.where == null);
+    try testing.expect(a.columns == null);
+    try testing.expect(a.limit == null);
+    try testing.expect(!a.count_only);
+    try testing.expectEqual(Format.csv, a.format);
+}
+
+test "parseArgs: every option, in any order" {
+    const a = try parseArgs(&.{ "--where", "a = 1", "data.ndjson", "--columns", "x,y", "--limit", "5", "--format", "ndjson", "--count" });
+    try testing.expectEqualStrings("data.ndjson", a.path);
+    try testing.expectEqualStrings("a = 1", a.where.?);
+    try testing.expectEqualStrings("x,y", a.columns.?);
+    try testing.expectEqual(@as(usize, 5), a.limit.?);
+    try testing.expectEqual(Format.ndjson, a.format);
+    try testing.expect(a.count_only);
+}
+
+test "parseArgs: a flag's value is never mistaken for the path" {
+    // "--where" swallowing its argument is what keeps `--where data.csv`
+    // from silently scanning nothing.
+    try testing.expectError(ArgError.MissingPath, parseArgs(&.{ "--where", "a = 1" }));
+    try testing.expectError(ArgError.MissingValue, parseArgs(&.{ "f.csv", "--where" }));
+    try testing.expectError(ArgError.MissingValue, parseArgs(&.{ "f.csv", "--limit" }));
+}
+
+test "parseArgs: rejects what it cannot honour rather than ignoring it" {
+    try testing.expectError(ArgError.UnknownFlag, parseArgs(&.{ "f.csv", "--nope" }));
+    try testing.expectError(ArgError.UnknownFormat, parseArgs(&.{ "f.csv", "--format", "parquet" }));
+    try testing.expectError(ArgError.BadLimit, parseArgs(&.{ "f.csv", "--limit", "many" }));
+    try testing.expectError(ArgError.MissingPath, parseArgs(&.{}));
+    try testing.expectError(ArgError.UnknownFlag, parseArgs(&.{ "a.csv", "b.csv" }));
+}
+
+test "parseArgs: --help short-circuits, even with a bad tail" {
+    const a = try parseArgs(&.{ "--help", "--nonsense" });
+    try testing.expect(a.help);
+}
+
+test "resolveColumns: names resolve to indices in the order given" {
+    const header = [_][]const u8{ "id", "name", "revenue" };
+    const cols = (try resolveColumns(testing.allocator, &header, "revenue, id")).?;
+    defer testing.allocator.free(cols);
+    try testing.expectEqualSlices(usize, &.{ 2, 0 }, cols);
+
+    try testing.expectEqual(@as(?[]usize, null), try resolveColumns(testing.allocator, &header, null));
+    try testing.expectError(error.UnknownColumn, resolveColumns(testing.allocator, &header, "id,nope"));
+}
