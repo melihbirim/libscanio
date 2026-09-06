@@ -169,3 +169,44 @@ zig build filter-bench -Doptimize=ReleaseFast -- <file> <col> <val>  # WHERE eq 
 ```
 
 Both print `matches=N time=Xs`; wrap in `/usr/bin/time -l` for RSS.
+
+## Code placement moves the CSV numbers by up to 30%
+
+The CSV scan benchmarks are alignment-sensitive to a degree that makes
+small deltas meaningless. Appending N no-op exported functions to
+`src/root.zig` — code the CSV path never calls, deterministic ReleaseFast
+builds each time, medians of 7 interleaved runs on the 166MB fixture —
+moves `scan-file` like this:
+
+| no-op fns added | 0 | 2 | 4 | 6 | 8 | 10 |
+|---|---|---|---|---|---|---|
+| scan-file | 0.214s | 0.184s | 0.167s | 0.174s | 0.217s | 0.182s |
+
+Nothing about the CSV scanner changed across those six builds. The hot
+loop's address moves, and with it which side of a cache line its backward
+branch lands on.
+
+This is not theoretical: an NDJSON-only change (fusing the fast path's two
+per-string scans, which CSV never executes) appeared to make CSV 22%
+slower, purely because HEAD happened to land on an unlucky offset while
+its parent landed on a lucky one.
+
+**So when reading a CSV delta here, a difference under ~30% between two
+single builds is not a result.** Before believing one:
+
+1. Build each revision straight from git (`git checkout <rev> -- src`),
+   never from a working tree that experiments have touched — stale
+   binaries from a dirty tree caused exactly this confusion once already.
+2. Interleave the runs of the two binaries rather than running all of A
+   then all of B; the machine drifts.
+3. For anything below ~30%, re-measure with 2-3 layout perturbations (the
+   no-op-function trick above) and compare the ranges, not two points.
+
+NDJSON and the parallel paths are far less sensitive — their deltas track
+real changes and reproduce across perturbations.
+
+Forcing the issue with `align(64)` on `Scanner.next`/`nextLine`/
+`splitInto` does collapse the spread to under 2% — but it pins the loop at
+0.216s, the slow end of its own range, versus 0.165s at `align(32)`. A
+permanent ~25% cost to make a benchmark tidy is the wrong trade, so the
+code is deliberately left unaligned and the caveat lives here instead.
