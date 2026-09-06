@@ -109,16 +109,56 @@ const Ctx = struct {
     /// and fixed-size, unlike row fields, so no reuse/grow logic needed.
     header_cstrs: [][:0]u8 = &.{},
 
-    fn ensureFieldCapacity(self: *Ctx, n: usize) void {
-        if (n <= self.field_cstrs.len) return;
-        const old_len = self.field_cstrs.len;
-        const grown_cstrs = c_allocator.realloc(self.field_cstrs, n) catch return;
-        self.field_cstrs = grown_cstrs;
-        for (self.field_cstrs[old_len..]) |*slot| slot.* = &.{};
-        const grown_ptrs = c_allocator.realloc(self.field_ptrs, n) catch return;
-        self.field_ptrs = grown_ptrs;
-    }
 };
+
+/// Grows the reused per-field buffers (`field_cstrs`/`field_ptrs`) to
+/// hold at least `n` fields. Returns false if a growth allocation
+/// failed.
+///
+/// Callers MUST bail out on false. The three copies of this that used to
+/// live on Ctx/TopkCtx/OrderByCtx returned void and simply left the old,
+/// smaller arrays in place on OOM — and every caller then went straight
+/// on to index field_cstrs[i]/field_ptrs[i] up to the row's field count,
+/// i.e. an out-of-bounds heap write on exactly the path that was
+/// supposed to be handling the failure.
+///
+/// Each array is grown independently and re-checked on entry, so a
+/// partial success (cstrs grown, ptrs not) can't be mistaken for "big
+/// enough" by the next call.
+fn growFieldBuffers(field_cstrs: *[][]u8, field_ptrs: *[][*:0]const u8, n: usize) bool {
+    if (n > field_cstrs.len) {
+        const old_len = field_cstrs.len;
+        const grown = c_allocator.realloc(field_cstrs.*, n) catch return false;
+        field_cstrs.* = grown;
+        for (field_cstrs.*[old_len..]) |*slot| slot.* = &.{};
+    }
+    if (n > field_ptrs.len) {
+        const grown = c_allocator.realloc(field_ptrs.*, n) catch return false;
+        field_ptrs.* = grown;
+    }
+    return true;
+}
+
+/// Undoes everything scanio_open() allocated before it built its Ctx.
+/// Every one of open()'s failure paths needs exactly this pair, and
+/// several of them used to free `predicates` alone and leak all the
+/// IN-value copies.
+fn freeOpenPredicates(predicates: []Predicate, in_values: [][]const []const u8) void {
+    if (predicates.len > 0) c_allocator.free(predicates);
+    freeInValues(in_values);
+}
+
+/// Frees the owned IN-predicate value copies built by scanio_open() —
+/// the per-value dupes, each predicate's value array, and the outer
+/// array. Shared by scanio_close() and open()'s own failure paths, which
+/// used to free `predicates` but silently leak all of this.
+fn freeInValues(in_values: [][]const []const u8) void {
+    for (in_values) |vals| {
+        for (vals) |v| c_allocator.free(@constCast(v));
+        if (vals.len > 0) c_allocator.free(@constCast(vals));
+    }
+    if (in_values.len > 0) c_allocator.free(in_values);
+}
 
 pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
     clearError();
@@ -150,15 +190,23 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
                     const cvals = cp.values.?[0..cp.n_values];
                     const owned = c_allocator.alloc([]const u8, cvals.len) catch {
                         setError("out of memory allocating IN values", .{});
+                        freeOpenPredicates(predicates, in_values);
                         return null;
                     };
+                    // Zeroed and handed to in_values BEFORE it's filled:
+                    // that makes a half-built `owned` (a dupe below
+                    // failing partway) freeable by the same one-line
+                    // cleanup as everything else, instead of the silent
+                    // leak of every already-duplicated value it was.
+                    @memset(owned, &.{});
+                    in_values[i] = owned;
                     for (cvals, 0..) |cv, j| {
                         owned[j] = c_allocator.dupe(u8, std.mem.span(cv)) catch {
                             setError("out of memory allocating IN values", .{});
+                            freeOpenPredicates(predicates, in_values);
                             return null;
                         };
                     }
-                    in_values[i] = owned;
                     predicates[i] = Predicate.initIn(cp.column, owned);
                     continue;
                 }
@@ -182,6 +230,7 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
 
     const ctx = c_allocator.create(Ctx) catch {
         setError("out of memory allocating scanner context", .{});
+        freeOpenPredicates(predicates, in_values);
         return null;
     };
     ctx.* = .{
@@ -193,7 +242,7 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
         }) catch |e| {
             setError("open failed: {s}", .{@errorName(e)});
             c_allocator.destroy(ctx);
-            if (predicates.len > 0) c_allocator.free(predicates);
+            freeOpenPredicates(predicates, in_values);
             return null;
         },
         .predicates = predicates,
@@ -205,13 +254,22 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
         setError("out of memory allocating header", .{});
         ctx.query.deinit();
         c_allocator.destroy(ctx);
-        if (predicates.len > 0) c_allocator.free(predicates);
+        freeOpenPredicates(predicates, in_values);
         return null;
     };
     for (header, 0..) |name, i| {
         ctx.header_cstrs[i] = c_allocator.allocSentinel(u8, name.len, 0) catch {
             setError("out of memory allocating header", .{});
-            return null; // ctx now partially initialized; leaked on this rare OOM path, not worth the extra bookkeeping.
+            // Unwinding by hand rather than via scanio_close(): the
+            // header_cstrs entries past `i` are still uninitialized, so
+            // close()'s "free every entry" loop would free garbage
+            // pointers. (This path used to just leak the whole Ctx.)
+            for (ctx.header_cstrs[0..i]) |buf| c_allocator.free(buf);
+            c_allocator.free(ctx.header_cstrs);
+            ctx.query.deinit();
+            freeOpenPredicates(predicates, in_values);
+            c_allocator.destroy(ctx);
+            return null;
         };
         @memcpy(ctx.header_cstrs[i], name);
     }
@@ -248,7 +306,10 @@ export fn scanio_next(ctx: ?*Ctx, out_fields: ?*[*]const [*:0]const u8, out_n: ?
         return -1;
     } orelse return 0;
 
-    c.ensureFieldCapacity(row.fields.len);
+    if (!growFieldBuffers(&c.field_cstrs, &c.field_ptrs, row.fields.len)) {
+        setError("out of memory growing field buffers", .{});
+        return -1;
+    }
     for (row.fields, 0..) |field, i| {
         if (c.field_cstrs[i].len < field.len + 1) {
             const grown = c_allocator.realloc(c.field_cstrs[i], field.len + 1) catch {
@@ -331,15 +392,6 @@ const TopkCtx = struct {
     field_cstrs: [][]u8 = &.{},
     field_ptrs: [][*:0]const u8 = &.{},
 
-    fn ensureFieldCapacity(self: *TopkCtx, n: usize) void {
-        if (n <= self.field_cstrs.len) return;
-        const old_len = self.field_cstrs.len;
-        const grown_cstrs = c_allocator.realloc(self.field_cstrs, n) catch return;
-        self.field_cstrs = grown_cstrs;
-        for (self.field_cstrs[old_len..]) |*slot| slot.* = &.{};
-        const grown_ptrs = c_allocator.realloc(self.field_ptrs, n) catch return;
-        self.field_ptrs = grown_ptrs;
-    }
 };
 
 /// Runs top-K over the REST of ctx's rows (same drains-the-query
@@ -380,7 +432,10 @@ export fn scanio_topk_next(tctx: ?*TopkCtx, out_fields: ?*[*]const [*:0]const u8
     const entry = t.sorted[t.index];
     t.index += 1;
 
-    t.ensureFieldCapacity(entry.row.fields.len);
+    if (!growFieldBuffers(&t.field_cstrs, &t.field_ptrs, entry.row.fields.len)) {
+        setError("out of memory growing field buffers", .{});
+        return -1;
+    }
     for (entry.row.fields, 0..) |field, i| {
         if (t.field_cstrs[i].len < field.len + 1) {
             const grown = c_allocator.realloc(t.field_cstrs[i], field.len + 1) catch {
@@ -421,15 +476,6 @@ const OrderByCtx = struct {
     field_cstrs: [][]u8 = &.{},
     field_ptrs: [][*:0]const u8 = &.{},
 
-    fn ensureFieldCapacity(self: *OrderByCtx, n: usize) void {
-        if (n <= self.field_cstrs.len) return;
-        const old_len = self.field_cstrs.len;
-        const grown_cstrs = c_allocator.realloc(self.field_cstrs, n) catch return;
-        self.field_cstrs = grown_cstrs;
-        for (self.field_cstrs[old_len..]) |*slot| slot.* = &.{};
-        const grown_ptrs = c_allocator.realloc(self.field_ptrs, n) catch return;
-        self.field_ptrs = grown_ptrs;
-    }
 };
 
 /// Runs ORDER BY over the REST of ctx's rows (same drains-the-query
@@ -472,7 +518,10 @@ export fn scanio_order_by_next(octx: ?*OrderByCtx, out_fields: ?*[*]const [*:0]c
     const row = o.result.rows[o.index];
     o.index += 1;
 
-    o.ensureFieldCapacity(row.fields.len);
+    if (!growFieldBuffers(&o.field_cstrs, &o.field_ptrs, row.fields.len)) {
+        setError("out of memory growing field buffers", .{});
+        return -1;
+    }
     for (row.fields, 0..) |field, i| {
         if (o.field_cstrs[i].len < field.len + 1) {
             const grown = c_allocator.realloc(o.field_cstrs[i], field.len + 1) catch {
@@ -854,11 +903,7 @@ pub export fn scanio_close(ctx: ?*Ctx) void {
     if (c.field_cstrs.len > 0) c_allocator.free(c.field_cstrs);
     if (c.field_ptrs.len > 0) c_allocator.free(c.field_ptrs);
     if (c.predicates.len > 0) c_allocator.free(c.predicates);
-    for (c.in_values) |vals| {
-        for (vals) |v| c_allocator.free(@constCast(v));
-        if (vals.len > 0) c_allocator.free(@constCast(vals));
-    }
-    if (c.in_values.len > 0) c_allocator.free(c.in_values);
+    freeInValues(c.in_values);
     for (c.header_cstrs) |buf| c_allocator.free(buf);
     if (c.header_cstrs.len > 0) c_allocator.free(c.header_cstrs);
     c_allocator.destroy(c);

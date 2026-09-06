@@ -81,6 +81,12 @@ try {
   check('topkJson: keys are the sort values', tk.keys, [2500, 1500]);
   const tkAsc = JSON.parse(addon.topkJson(P, 'revenue', 1, null, false));
   check('topkJson: ascending', tkAsc.rows.map((r) => r[1]), ['Alice']);
+  // A negative k used to be @intCast straight to usize: a panic in a
+  // safety-checked build, a wrapped ~2^64 k in ReleaseFast — either way
+  // it took the whole Node process down rather than throwing.
+  checkThrows('topkJson: negative k throws instead of crashing', () => addon.topkJson(P, 'revenue', -1));
+  const tkZero = JSON.parse(addon.topkJson(P, 'revenue', 0));
+  check('topkJson: k=0 returns no rows', tkZero.rows, []);
 
   // orderBy
   const ob = JSON.parse(addon.orderByJson(P, 'revenue'));

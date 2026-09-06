@@ -455,7 +455,14 @@ fn napiTopk(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi
     defer c_allocator.free(path);
     const column = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "topkJson(path, column, k): column required");
     defer c_allocator.free(column);
-    const k: usize = @intCast(getIntArg(env, info, 2, i64, 10));
+    // Sign-checked before the cast, the same way `limit` is everywhere
+    // else in this file: @intCast of a negative i64 straight from JS is a
+    // panic in a safety-checked build and a wrapped, enormous usize in
+    // ReleaseFast — `topkJson(path, col, -1)` reached scan.topK() as a
+    // ~2^64 k and took the whole Node process down either way.
+    const k_arg = getIntArg(env, info, 2, i64, 10);
+    if (k_arg < 0) return napiFail(env, "topkJson(path, column, k): k must not be negative");
+    const k: usize = @intCast(k_arg);
     const where = getOptionalStringArg(env, info, 3, c_allocator) catch null;
     defer if (where) |w| c_allocator.free(w);
     const descending = getBoolArg(env, info, 4, true);
@@ -562,6 +569,12 @@ const ScanHandle = struct {
     // after open() returns the way the single-shot functions above do.
     predicates: []Predicate,
     columns: ?[]usize,
+    /// Set for the duration of a nextRowJson() call. Both flags are
+    /// guarded by handle_registry_mutex, never touched outside it.
+    in_use: bool = false,
+    /// closeScan() came in while in_use — the in-flight nextRowJson()
+    /// destroys the handle on its way out instead.
+    close_requested: bool = false,
 };
 
 /// Registry of open scan handles, keyed by a small monotonic ID — NOT
@@ -588,18 +601,59 @@ fn registerHandle(handle: *ScanHandle) !u64 {
     return id;
 }
 
-fn lookupHandle(id: u64) ?*ScanHandle {
-    handle_registry_mutex.lock();
-    defer handle_registry_mutex.unlock();
-    return handle_registry.get(id);
+/// Frees everything a ScanHandle owns, including the handle itself.
+/// Never call it on a handle still reachable through the registry.
+fn destroyHandle(handle: *ScanHandle) void {
+    handle.query.deinit();
+    freeHeader(c_allocator, handle.header);
+    if (handle.predicates.len > 0) freePredicates(c_allocator, handle.predicates);
+    if (handle.columns) |c| c_allocator.free(c);
+    c_allocator.destroy(handle);
 }
 
-fn unregisterHandle(id: u64) ?*ScanHandle {
+/// Looks a handle up and marks it busy, so a concurrent closeScan()
+/// cannot free it out from under the caller.
+///
+/// The mutex used to guard the lookup ONLY, which left a real
+/// use-after-free between the two calls that are supposed to be safe
+/// under `worker_threads` (the whole reason this registry exists):
+/// thread A gets the pointer from the map, thread B closes the same
+/// handle and frees it, then thread A dereferences freed memory.
+/// Returns null for an unknown, already-closed, or already-busy handle —
+/// all three are caller errors that must surface as a JS exception
+/// rather than as memory corruption.
+fn acquireHandle(id: u64) ?*ScanHandle {
     handle_registry_mutex.lock();
     defer handle_registry_mutex.unlock();
     const handle = handle_registry.get(id) orelse return null;
-    _ = handle_registry.remove(id);
+    if (handle.in_use) return null;
+    handle.in_use = true;
     return handle;
+}
+
+/// Ends the borrow started by acquireHandle(), destroying the handle if
+/// a closeScan() arrived in the meantime.
+fn releaseHandle(handle: *ScanHandle) void {
+    handle_registry_mutex.lock();
+    handle.in_use = false;
+    const now_dead = handle.close_requested;
+    handle_registry_mutex.unlock();
+    if (now_dead) destroyHandle(handle);
+}
+
+/// Removes a handle from the registry — the ID is invalid from here on
+/// either way, which is what makes double-close a silent no-op. Returns
+/// the handle to free, or null if an in-flight nextRowJson() still holds
+/// it (that call frees it when it releases) or the ID was never valid.
+fn unregisterHandle(id: u64) ?*ScanHandle {
+    handle_registry_mutex.lock();
+    defer handle_registry_mutex.unlock();
+    const entry = handle_registry.fetchRemove(id) orelse return null;
+    if (entry.value.in_use) {
+        entry.value.close_requested = true;
+        return null;
+    }
+    return entry.value;
 }
 
 fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, out: *OpenScanResult) void {
@@ -638,6 +692,18 @@ fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]con
     // them for the scan's lifetime — NOT freed here, freed in
     // closeScanWork alongside the rest of the handle.
 
+    // Everything from here on has to undo `q` too, not just the header
+    // and predicates: every failure path below used to return with the
+    // Query — and the open file handle inside it — still live.
+    var q_mut = q;
+    var opened_ok = false;
+    defer if (!opened_ok) {
+        q_mut.deinit();
+        freeHeader(c_allocator, header);
+        if (predicates.len > 0) freePredicates(c_allocator, predicates);
+        if (columns) |c| c_allocator.free(c);
+    };
+
     const proj = columns orelse blk: {
         const idx = c_allocator.alloc(usize, header.len) catch {
             out.err = error.OutOfMemory;
@@ -646,33 +712,50 @@ fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]con
         for (idx, 0..) |*v, i| v.* = i;
         break :blk idx;
     };
+    defer if (columns == null) c_allocator.free(proj);
 
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeByte('[') catch return;
+    w.writeByte('[') catch {
+        out.err = error.OutOfMemory;
+        return;
+    };
     for (proj, 0..) |ci, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch {
+            out.err = error.OutOfMemory;
+            return;
+        };
         jsonEscapedString(w, header[ci]);
     }
-    w.writeByte(']') catch return;
-    if (columns == null) c_allocator.free(proj);
-    out.names_json = aw.toOwnedSlice() catch return;
+    w.writeByte(']') catch {
+        out.err = error.OutOfMemory;
+        return;
+    };
+    const names_json = aw.toOwnedSlice() catch {
+        out.err = error.OutOfMemory;
+        return;
+    };
+    errdefer c_allocator.free(names_json);
 
     const handle = c_allocator.create(ScanHandle) catch {
+        c_allocator.free(names_json);
         out.err = error.OutOfMemory;
         return;
     };
-    handle.* = .{ .query = q, .header = header, .predicates = predicates, .columns = columns };
+    handle.* = .{ .query = q_mut, .header = header, .predicates = predicates, .columns = columns };
     const id = registerHandle(handle) catch {
-        handle.query.deinit();
-        freeHeader(c_allocator, handle.header);
-        if (handle.predicates.len > 0) freePredicates(c_allocator, handle.predicates);
-        if (handle.columns) |c| c_allocator.free(c);
-        c_allocator.destroy(handle);
+        destroyHandle(handle);
+        c_allocator.free(names_json);
+        // The handle owns (and just freed) all of it — don't let the
+        // defer above free the same memory a second time.
+        opened_ok = true;
         out.err = error.OutOfMemory;
         return;
     };
+    // Ownership has moved into the registered handle; closeScan frees it.
+    opened_ok = true;
+    out.names_json = names_json;
     out.handle = @intCast(id);
 }
 
@@ -700,8 +783,9 @@ fn napiOpenScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) 
 fn napiNextRow(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
     const handle_id = getIntArg(env, info, 0, i64, 0);
     if (handle_id <= 0) return napiFail(env, "nextRowJson(handle): invalid handle");
-    const handle = lookupHandle(@intCast(handle_id)) orelse
-        return napiFail(env, "nextRowJson(handle): unknown or already-closed handle");
+    const handle = acquireHandle(@intCast(handle_id)) orelse
+        return napiFail(env, "nextRowJson(handle): unknown, already-closed, or concurrently-in-use handle");
+    defer releaseHandle(handle);
 
     const row = handle.query.next() catch |e| return failErr(env, e);
     const r = row orelse {
@@ -734,11 +818,7 @@ fn napiCloseScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c)
     // nothing and returns early, same as the old raw-pointer version's
     // implicit behavior (a double-free there was instead a real bug).
     const handle = unregisterHandle(@intCast(handle_id)) orelse return undef;
-    handle.query.deinit();
-    freeHeader(c_allocator, handle.header);
-    if (handle.predicates.len > 0) freePredicates(c_allocator, handle.predicates);
-    if (handle.columns) |c| c_allocator.free(c);
-    c_allocator.destroy(handle);
+    destroyHandle(handle);
     return undef;
 }
 
