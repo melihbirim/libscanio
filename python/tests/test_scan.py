@@ -374,5 +374,34 @@ try:
 finally:
     os.unlink(ST_DTBAD_P)
 
+# ---------------------------------------------------------------------
+# A row with MORE fields than the header used to raise IndexError out of
+# scan(), killing the iteration. Real files hit this: ragged CSV, or a
+# delimiter inside a quoted field (quotes are not grouping here — see the
+# README's CSV note). Extra fields get a positional colN key, which is
+# what the Node client and the scanio CLI emit for the same row.
+RAGGED_P = "_test_ragged.csv"
+with open(RAGGED_P, "w") as f:
+    f.write("id,name,city\n1,Smith,London,EXTRA\n2,Alice,Paris\n3,Bo\n")
+try:
+    rows = list(libscanio.scan(RAGGED_P))
+    check("scan: a row longer than the header does not raise", len(rows), 3)
+    check("scan: the extra field is kept under a positional key", rows[0].get("col3"), "EXTRA")
+    check("scan: header columns of that row are still correct",
+          [rows[0]["id"], rows[0]["name"], rows[0]["city"]], ["1", "Smith", "London"])
+    check("scan: a row shorter than the header just omits the missing key",
+          sorted(rows[2].keys()), ["id", "name"])
+    check("scan: normal rows are untouched", rows[1], {"id": "2", "name": "Alice", "city": "Paris"})
+
+    arr = libscanio.scan_array(RAGGED_P, as_dict=True)
+    check("scan_array(as_dict): ragged row does not raise", len(arr), 3)
+    check("scan_array(as_dict): header columns still correct", arr[0]["city"], "London")
+
+    check("count: unaffected by ragged rows", libscanio.count(RAGGED_P), 3)
+    check("order_by: ragged row does not raise",
+          len(libscanio.order_by(RAGGED_P, "id")), 3)
+finally:
+    os.unlink(RAGGED_P)
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

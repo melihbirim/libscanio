@@ -54,9 +54,17 @@ function call(fn, ...args) {
   }
 }
 
+// A row can legitimately carry MORE fields than the header: ragged CSV,
+// or a delimiter inside a quoted field (this scanner splits on the
+// delimiter and does not treat quotes as grouping — see the README's CSV
+// note). Looping to names.length silently DROPPED those values, while
+// scanArray() (which returns raw arrays) kept them — the same file gave
+// two different answers depending on which function you called. Extra
+// fields now get a positional `colN` key, matching the Python client and
+// the `scanio` CLI.
 function zipRow(names, values) {
   const row = {};
-  for (let i = 0; i < names.length; i++) row[names[i]] = values[i];
+  for (let i = 0; i < values.length; i++) row[i < names.length ? names[i] : `col${i}`] = values[i];
   return row;
 }
 

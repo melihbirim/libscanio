@@ -289,6 +289,32 @@ async function main() {
     fs.unlinkSync(ALNUM_P);
   }
 
+  // A row with MORE fields than the header: zipRow() looped to
+  // names.length and silently DROPPED the extras, while scanArray()
+  // (raw arrays) kept them — the same file answered differently
+  // depending on which function you called. A row with FEWER fields
+  // than the header crashed the columnar path in Zig, which the Python
+  // client surfaced as an IndexError.
+  const raggedPath = path.join(os.tmpdir(), `libscanio_ragged_${process.pid}.csv`);
+  fs.writeFileSync(raggedPath, 'a,b,c\n1,2,3\n4,5\n6\n7,8,9,EXTRA\n');
+  try {
+    const ragged = [];
+    for await (const r of libscanio.scan(raggedPath)) ragged.push(r);
+    check('scan: ragged file yields every row', ragged.length, 4);
+    check('scan: a field past the header is kept under a positional key', ragged[3].col3, 'EXTRA');
+    check('scan: header columns of that row are still correct',
+      [ragged[3].a, ragged[3].b, ragged[3].c], ['7', '8', '9']);
+    check('scan: a short row simply omits the missing keys', Object.keys(ragged[2]), ['a']);
+    check('scan: normal rows are untouched', ragged[0], { a: '1', b: '2', c: '3' });
+    check('scanArray: ragged rows keep their natural width',
+      libscanio.scanArray(raggedPath), [['1', '2', '3'], ['4', '5'], ['6'], ['7', '8', '9', 'EXTRA']]);
+    check('scanArray(asObjects): agrees with scan()', libscanio.scanArray(raggedPath, { asObjects: true })[3], ragged[3]);
+    check('count: unaffected by ragged rows', libscanio.count(raggedPath), 4);
+    check('orderBy: ragged file does not throw', libscanio.orderBy(raggedPath, 'a').length, 4);
+  } finally {
+    fs.unlinkSync(raggedPath);
+  }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }

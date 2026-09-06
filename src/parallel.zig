@@ -1378,6 +1378,21 @@ const CsvScanColumnarCtx = struct {
             try self.columns[ci].data.appendSlice(self.allocator, field);
             try self.columns[ci].offsets.append(self.allocator, @intCast(self.columns[ci].data.items.len));
         }
+        // A row NARROWER than the header still has to advance EVERY
+        // column, as an empty value. Without this the trailing columns
+        // accumulate fewer offsets than n_rows says there are, and every
+        // consumer trusts n_rows: Python's scan_array() raised
+        // IndexError reading offsets[i + 1], and scan_table() built a
+        // zero-copy Arrow array of n_rows over a too-short offsets
+        // buffer — an out-of-bounds read, not an exception. Ragged CSV
+        // is explicitly supported elsewhere (Scanner returns the short
+        // row; Row.get() past the end is null), so this path has to
+        // tolerate it too. NdjsonScanColumnarCtx never had the bug: its
+        // field_buf is fixed at header width and defaults to "".
+        var pad = self.field_buf.items.len;
+        while (pad < self.columns.len) : (pad += 1) {
+            try self.columns[pad].offsets.append(self.allocator, @intCast(self.columns[pad].data.items.len));
+        }
         self.n_rows += 1;
     }
 };
@@ -2340,4 +2355,35 @@ test "threadsFor: tiny inputs stay single-threaded, real ones parallelise" {
     try std.testing.expectEqual(@as(usize, 8), threadsFor(8, 64 * 1024 * 1024));
     // Never more threads than the caller asked for.
     try std.testing.expectEqual(@as(usize, 2), threadsFor(2, 64 * 1024 * 1024));
+}
+
+test "parallelScanColumnar: ragged CSV keeps every column's offsets in step with n_rows" {
+    // A row shorter than the header used to advance only the columns it
+    // had values for, leaving the trailing columns with fewer offsets
+    // than n_rows — which every consumer trusts. Python's scan_array()
+    // raised IndexError on offsets[i+1]; scan_table() read past the end
+    // of the offsets buffer through a zero-copy Arrow array.
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_columnar_ragged.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b,c\n1,2,3\n4,5\n6\n7,8,9,EXTRA\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var res = try parallelScanColumnar(allocator, path, ',', &.{}, 1);
+    defer res.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), res.n_rows);
+    try std.testing.expectEqual(@as(usize, 3), res.n_cols);
+    // The invariant the consumers rely on: one offset per row, plus the
+    // leading zero, in EVERY column.
+    for (res.columns) |c| {
+        try std.testing.expectEqual(res.n_rows + 1, c.offsets.items.len);
+    }
+    // Missing values read back as empty, present ones unchanged.
+    const c2 = res.columns[2];
+    const row1 = c2.data.items[c2.offsets.items[0]..c2.offsets.items[1]];
+    const row2 = c2.data.items[c2.offsets.items[1]..c2.offsets.items[2]];
+    const row4 = c2.data.items[c2.offsets.items[3]..c2.offsets.items[4]];
+    try std.testing.expectEqualStrings("3", row1);
+    try std.testing.expectEqualStrings("", row2);
+    try std.testing.expectEqualStrings("9", row4);
 }

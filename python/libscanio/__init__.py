@@ -127,6 +127,29 @@ def _parse_where(
     return predicates, keepalive
 
 
+def _zip_row(names: "Sequence[str]", values: list) -> dict:
+    """Map a row's field values onto the header names.
+
+    A row can legitimately carry MORE fields than the header: ragged CSV,
+    or a delimiter inside a quoted field (this scanner splits on the
+    delimiter and does not treat quotes as grouping — see the README's
+    CSV note). Indexing `names[i]` for those raised IndexError and killed
+    the whole iteration mid-scan; they now get a positional `colN` key,
+    so the data survives and matches what the `scanio` CLI emits for the
+    same row. Fewer fields than the header stays as it was: the missing
+    trailing keys are simply absent.
+
+    The common case goes through dict(zip(...)) untouched — this is on
+    the per-row path of scan().
+    """
+    if len(values) <= len(names):
+        return dict(zip(names, values))
+    row = dict(zip(names, values))
+    for i in range(len(names), len(values)):
+        row[f"col{i}"] = values[i]
+    return row
+
+
 def scan(
     path: str,
     columns: Optional[Sequence[str]] = None,
@@ -163,7 +186,7 @@ def scan(
                 return
             if rc < 0:
                 _raise_last_error(lib, "scan failed")
-            yield {names[i]: fields[i].decode() for i in range(n.value)}
+            yield _zip_row(names, [fields[i].decode() for i in range(n.value)])
     finally:
         lib.scanio_close(ctx)
 
@@ -318,7 +341,7 @@ def _scan_array_single_threaded(
             # (parts[i*n_cols:(i+1)*n_cols] per row) for this row count.
             rows = zip(*[iter(parts)] * n_cols)
             if as_dict:
-                return [dict(zip(names, row)) for row in rows]
+                return [_zip_row(names, row) for row in rows]
             return list(rows)
         finally:
             lib.scanio_collect_close(cc)
@@ -361,7 +384,7 @@ def _scan_array_parallel(lib: ctypes.CDLL, path: str, where: Optional[str], as_d
 
         rows = list(zip(*columns_data))
         if as_dict:
-            return [dict(zip(names, row)) for row in rows]
+            return [_zip_row(names, row) for row in rows]
         return rows
     finally:
         lib.scanio_collect_columnar_close(cc)
@@ -675,7 +698,7 @@ def topk(
                     return results
                 if rc < 0:
                     _raise_last_error(lib, "topk failed")
-                row = {names[i]: fields[i].decode() for i in range(n.value)}
+                row = _zip_row(names, [fields[i].decode() for i in range(n.value)])
                 row["_key"] = key.value
                 results.append(row)
         finally:
@@ -713,7 +736,7 @@ def order_by(
                     return results
                 if rc < 0:
                     _raise_last_error(lib, "order_by failed")
-                results.append({names[i]: fields[i].decode() for i in range(n.value)})
+                results.append(_zip_row(names, [fields[i].decode() for i in range(n.value)]))
         finally:
             lib.scanio_order_by_close(octx)
     finally:
