@@ -161,6 +161,29 @@ fn countRange(file: std.fs.File, range: Range) !usize {
 /// exposed publicly: a real caller almost always wants the header-
 /// excluded row count, same as Scanner.countRemaining()'s post-header
 /// semantics.
+/// How many worker threads are worth spawning for `data_len` bytes.
+///
+/// `@min(requested, data_len)` alone only stopped the absurd case (more
+/// threads than bytes); it still handed a 5KB file one thread per core.
+/// Measured on this fixture shape, splitting tiny inputs costs far more
+/// than it saves — spawn+join and the per-worker setup dominate when
+/// each worker gets a few KB:
+///
+///     5KB    1 thread 0.07ms   4 threads 0.45ms   (6.4x worse)
+///    20KB    1 thread 0.11ms   4 threads 0.27ms
+///   100KB    1 thread 0.34ms   auto      0.56ms
+///   400KB    1 thread 1.03ms   auto      0.57ms   (threads now win)
+///     1MB    1 thread 2.85ms   auto      1.12ms
+///
+/// so the crossover sits between 100KB and 400KB. A 64KB floor picks
+/// the fastest option at every size measured above, and changes nothing
+/// from ~256KB up, where the parallel path was already the right call.
+fn threadsFor(requested: usize, data_len: usize) usize {
+    const min_bytes_per_thread = 64 * 1024;
+    const useful = @max(1, data_len / min_bytes_per_thread);
+    return @max(1, @min(requested, useful));
+}
+
 /// Spawn one thread per worker, run them all, and join every one before
 /// returning — the only way any worker pool in this file is started.
 ///
@@ -198,7 +221,7 @@ fn parallelCountLines(allocator: Allocator, path: []const u8, num_threads_in: us
     const requested = if (num_threads_in == 0) cpu_count else num_threads_in;
     // Never split into more pieces than there are bytes — a range needs
     // at least 1 byte to mean anything.
-    const num_threads = @max(1, @min(requested, file_size));
+    const num_threads = threadsFor(requested, file_size);
 
     if (num_threads <= 1) {
         return countRange(file, .{ .start = 0, .end = file_size });
@@ -961,7 +984,7 @@ pub fn parallelCountRowsWhere(
         if (file_size == 0) return ParallelError.EmptyFile;
         const cpu_count = std.Thread.getCpuCount() catch 1;
         const requested = if (num_threads_in == 0) cpu_count else num_threads_in;
-        const num_threads = @max(1, @min(requested, file_size));
+        const num_threads = threadsFor(requested, file_size);
 
         var hdr = try buildJsonArrayHeader(allocator, file, file_size);
         defer hdr.deinit();
@@ -990,7 +1013,7 @@ pub fn parallelCountRowsWhere(
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const requested = if (num_threads_in == 0) cpu_count else num_threads_in;
     const data_len = file_size - data_start;
-    const num_threads = @max(1, @min(requested, data_len));
+    const num_threads = threadsFor(requested, data_len);
 
     const ranges = try splitRangesFrom(allocator, file, data_start, file_size, num_threads);
     defer allocator.free(ranges);
@@ -1219,7 +1242,7 @@ pub fn parallelScan(
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const requested = if (num_threads_in == 0) cpu_count else num_threads_in;
     const data_len = file_size - data_start;
-    const num_threads = @max(1, @min(requested, data_len));
+    const num_threads = threadsFor(requested, data_len);
 
     const ranges = try splitRangesFrom(allocator, file, data_start, file_size, num_threads);
     defer allocator.free(ranges);
@@ -1605,7 +1628,7 @@ pub fn parallelScanColumnar(
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const requested = if (num_threads_in == 0) cpu_count else num_threads_in;
     const data_len = file_size - data_start;
-    const num_threads = @max(1, @min(requested, data_len));
+    const num_threads = threadsFor(requested, data_len);
 
     const ranges = try splitRangesFrom(allocator, file, data_start, file_size, num_threads);
     defer allocator.free(ranges);
@@ -2301,4 +2324,20 @@ test "mergeColumnarWorkers: every allocation-failure point frees each worker exa
             try std.testing.expectEqual(error.OutOfMemory, err);
         }
     }
+}
+
+test "threadsFor: tiny inputs stay single-threaded, real ones parallelise" {
+    // Splitting a few KB across cores measured 6x SLOWER than not
+    // splitting at all (see threadsFor's own comment for the numbers);
+    // `@min(requested, data_len)` on its own never caught that because a
+    // 5KB file still has more bytes than cores.
+    try std.testing.expectEqual(@as(usize, 1), threadsFor(8, 0));
+    try std.testing.expectEqual(@as(usize, 1), threadsFor(8, 5 * 1024));
+    try std.testing.expectEqual(@as(usize, 1), threadsFor(8, 100 * 1024));
+    // From ~256KB the parallel path was already the right call, and this
+    // guard must not change it.
+    try std.testing.expectEqual(@as(usize, 4), threadsFor(4, 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 8), threadsFor(8, 64 * 1024 * 1024));
+    // Never more threads than the caller asked for.
+    try std.testing.expectEqual(@as(usize, 2), threadsFor(2, 64 * 1024 * 1024));
 }

@@ -7,10 +7,14 @@ Search order:
   3. Directories listed in the LIBSCANIO_LIB_PATH environment variable
 """
 
+# os.path, not pathlib: pathlib pulls in urllib.parse and costs ~3.7ms
+# of import time, which is a large slice of the total latency of a small
+# query (the Zig scan of a 1MB file takes ~2ms).
+from __future__ import annotations
+
 import ctypes
 import os
 import sys
-from pathlib import Path
 
 _lib_cache: ctypes.CDLL | None = None
 
@@ -23,23 +27,28 @@ def _lib_name() -> str:
     return "libscanio.so"
 
 
-def _candidate_dirs() -> list[Path]:
-    dirs: list[Path] = [Path(__file__).parent]
+def _candidate_dirs() -> list[str]:
+    here = os.path.realpath(__file__)
+    dirs: list[str] = [os.path.dirname(__file__)]
 
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        if (parent / "build.zig").exists():
+    parent = os.path.dirname(here)
+    while True:
+        nxt = os.path.dirname(parent)
+        if nxt == parent:
+            break
+        parent = nxt
+        if os.path.exists(os.path.join(parent, "build.zig")):
             # zig-out/lib on POSIX; on Windows the loadable .dll lands in
             # zig-out/bin (zig-out/lib only gets the .lib import stub) —
             # check both rather than special-case by platform, since it's
             # harmless to check a dir that doesn't have the file.
-            dirs.append(parent / "zig-out" / "lib")
-            dirs.append(parent / "zig-out" / "bin")
+            dirs.append(os.path.join(parent, "zig-out", "lib"))
+            dirs.append(os.path.join(parent, "zig-out", "bin"))
             break
 
     env_path = os.environ.get("LIBSCANIO_LIB_PATH")
     if env_path:
-        dirs.append(Path(env_path))
+        dirs.append(env_path)
 
     return dirs
 
@@ -51,14 +60,14 @@ def load() -> ctypes.CDLL:
 
     name = _lib_name()
     for d in _candidate_dirs():
-        candidate = d / name
-        if candidate.exists():
-            lib = ctypes.CDLL(str(candidate))
+        candidate = os.path.join(d, name)
+        if os.path.exists(candidate):
+            lib = ctypes.CDLL(candidate)
             _setup_signatures(lib)
             _lib_cache = lib
             return lib
 
-    searched = "\n  ".join(str(d / name) for d in _candidate_dirs())
+    searched = "\n  ".join(os.path.join(d, name) for d in _candidate_dirs())
     raise FileNotFoundError(
         f"Could not find {name}. Searched:\n  {searched}\n"
         "Run `zig build c-lib -Doptimize=ReleaseFast` to build it, "

@@ -18,10 +18,16 @@ describe() is the exception — a diagnostic, sampled TYPE GUESS per
 column, not a schema scan() itself relies on or enforces.
 """
 
+# Annotations are never evaluated at runtime here, so PEP 563 lets this
+# module keep its type hints without paying `import typing` (3.4ms) on
+# every process start. `re` is imported lazily inside _parse_where for
+# the same reason (5.0ms) — see _where_patterns(). Both matter because
+# the dominant cost of a small-file query is process startup, not the
+# scan: on a 1MB file the Zig side finishes in ~2ms.
+from __future__ import annotations
+
 import ctypes
 import datetime
-import re
-from typing import Iterator, Optional, Sequence, Union
 
 from ._loader import CAgg, COptions, CPredicate, load
 
@@ -29,8 +35,24 @@ __all__ = ["scan", "scan_array", "scan_table", "schema", "count", "aggregate", "
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
-_COND_RE = re.compile(r"^(\w+)\s*(>=|<=|!=|>|<|=)\s*(.+)$")
-_IN_RE = re.compile(r"^(\w+)\s+IN\s*\((.*)\)$")
+_WHERE_PATTERNS = None
+
+
+def _where_patterns():
+    """(condition, IN) patterns, compiled on first use.
+
+    Deferred so `import re` is paid only by callers that actually pass a
+    WHERE clause, not by every import of this module.
+    """
+    global _WHERE_PATTERNS
+    if _WHERE_PATTERNS is None:
+        import re
+
+        _WHERE_PATTERNS = (
+            re.compile(r"^(\w+)\s*(>=|<=|!=|>|<|=)\s*(.+)$"),
+            re.compile(r"^(\w+)\s+IN\s*\((.*)\)$"),
+        )
+    return _WHERE_PATTERNS
 
 
 class ScanError(RuntimeError):
@@ -70,9 +92,10 @@ def _parse_where(
     """
     predicates = []
     keepalive = []
+    cond_re, in_re = _where_patterns()
     for part in where.split(" AND "):
         part = part.strip()
-        m_in = _IN_RE.match(part)
+        m_in = in_re.match(part)
         if m_in:
             col, vals_str = m_in.group(1), m_in.group(2)
             vals = [v.strip() for v in vals_str.split(",") if v.strip()]
@@ -90,7 +113,7 @@ def _parse_where(
                 )
             )
             continue
-        m = _COND_RE.match(part)
+        m = cond_re.match(part)
         if not m:
             raise ScanError(f'invalid WHERE condition: "{part}"')
         col, op, val = m.group(1), m.group(2), m.group(3).strip()
