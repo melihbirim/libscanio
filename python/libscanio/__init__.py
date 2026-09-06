@@ -475,9 +475,27 @@ def scan_table(path: str, where: Optional[str] = None, infer_types: bool = False
                 # Two real ISO8601 shapes describe() accepts under one
                 # label: "...Z"/"...+00:00" (needs a tz-aware target) and
                 # bare "YYYY-MM-DD[THH:MM:SS]" (needs a tz-naive target,
-                # or Arrow rejects it asking for one) — try both rather
-                # than inspecting which _DATETIME_FORMATS matched.
-                for target in (pa.timestamp("s", tz="UTC"), pa.timestamp("s")):
+                # or Arrow rejects it asking for one).
+                #
+                # Which to try FIRST is decided on a few rows, not by
+                # attempting each on the whole column: a cast that is
+                # going to fail still reads every row before raising, so
+                # guessing wrong cost 0.344s on a 666K-row column and the
+                # fallback then did the real work in 0.012s — 29x the
+                # price of the cast itself, paid per datetime column. The
+                # probe is a handful of values, and both targets are
+                # still tried in full below, so the outcome is unchanged
+                # even when the probe is unrepresentative.
+                targets = (pa.timestamp("s", tz="UTC"), pa.timestamp("s"))
+                probe = arrays[i].slice(0, min(8, n_rows))
+                accepted = []
+                for target in targets:
+                    try:
+                        pc.cast(probe, target)
+                        accepted.append(target)
+                    except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError):
+                        pass
+                for target in accepted + [t for t in targets if t not in accepted]:
                     try:
                         arrays[i] = pc.cast(arrays[i], target)
                         break

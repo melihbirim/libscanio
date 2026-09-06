@@ -335,5 +335,44 @@ try:
 finally:
     os.unlink(ST_BAD_P)
 
+# ---------------------------------------------------------------------
+# scan_table(infer_types=True) picks the datetime target from a short
+# probe rather than trying each on the whole column. Both ISO8601 shapes
+# describe() labels "datetime" must still land on the right Arrow type,
+# and a column the probe agrees with but the full data doesn't must
+# still fall back to string rather than half-cast.
+ST_DT_P = "_test_scan_table_datetime.csv"
+with open(ST_DT_P, "w") as f:
+    f.write("id,naive,aware\n")
+    for i in range(12):
+        f.write(f"{i},2024-01-0{i % 9 + 1}T08:00:00,2024-01-0{i % 9 + 1}T08:00:00Z\n")
+try:
+    tbl_dt = libscanio.scan_table(ST_DT_P, infer_types=True)
+    check("scan_table: bare ISO8601 casts to a tz-naive timestamp",
+          str(tbl_dt.schema.field("naive").type), "timestamp[s]")
+    check("scan_table: ...Z ISO8601 casts to a tz-aware timestamp",
+          str(tbl_dt.schema.field("aware").type), "timestamp[s, tz=UTC]")
+    check("scan_table: datetime values round-trip",
+          str(tbl_dt.column("naive")[0]), "2024-01-01 08:00:00")
+finally:
+    os.unlink(ST_DT_P)
+
+# The probe sees only well-formed timestamps; a bad value later in the
+# column must still leave the whole column a string.
+ST_DTBAD_P = "_test_scan_table_datetime_mixed.csv"
+with open(ST_DTBAD_P, "w") as f:
+    f.write("id,when\n")
+    for i in range(12):
+        f.write(f"{i},2024-01-01T08:00:00Z\n")
+    f.write("99,not-a-date\n")
+try:
+    tbl_dtbad = libscanio.scan_table(ST_DTBAD_P, infer_types=True)
+    check("scan_table: datetime probe agreeing but full column failing keeps string",
+          str(tbl_dtbad.schema.field("when").type), "string")
+    check("scan_table: that column keeps its complete data",
+          tbl_dtbad.column("when").to_pylist()[-1], "not-a-date")
+finally:
+    os.unlink(ST_DTBAD_P)
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)
