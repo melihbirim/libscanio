@@ -174,8 +174,15 @@ pub const Scanner = struct {
             .field_buf = &[_][]const u8{},
         };
 
+        // nextLine() can grow line_scratch (a header spanning a chunk
+        // boundary), and neither it nor header_line below is reachable
+        // for cleanup on an error return — deinit() only runs for a
+        // scanner that was successfully returned.
+        errdefer scanner.line_scratch.deinit(allocator);
+
         const header_line = (try scanner.nextLine()) orelse return ScanError.EmptyFile;
         scanner.header_line = try allocator.dupe(u8, header_line);
+        errdefer allocator.free(scanner.header_line);
         scanner.header = try scanner.splitOwned(scanner.header_line);
         return scanner;
     }
@@ -201,7 +208,7 @@ pub const Scanner = struct {
     /// scratch buffer, not a fresh allocation per row.
     pub fn next(self: *Scanner) !?Row {
         const line = (try self.nextLine()) orelse return null;
-        const n = self.splitInto(line);
+        const n = try self.splitInto(line);
         return Row{ .fields = self.field_buf[0..n] };
     }
 
@@ -289,13 +296,13 @@ pub const Scanner = struct {
     /// bytes, and indexOfScalarPos's per-call setup cost dominates at that
     /// length. The plain scalar scan wins for short, narrow fields; only
     /// worth revisiting for schemas with long text fields.
-    fn splitInto(self: *Scanner, line: []const u8) usize {
+    fn splitInto(self: *Scanner, line: []const u8) !usize {
         var count: usize = 0;
         var start: usize = 0;
         var i: usize = 0;
         while (i <= line.len) : (i += 1) {
             if (i == line.len or line[i] == self.delimiter) {
-                self.ensureFieldCapacity(count + 1);
+                try self.ensureFieldCapacity(count + 1);
                 self.field_buf[count] = line[start..i];
                 count += 1;
                 // Everything past stop_after_column is provably never
@@ -311,10 +318,17 @@ pub const Scanner = struct {
         return count;
     }
 
-    fn ensureFieldCapacity(self: *Scanner, needed: usize) void {
+    /// Grows field_buf to hold `needed` field slices.
+    ///
+    /// Returns the allocation error rather than swallowing it: it used to
+    /// `catch return`, leaving the OLD, smaller buffer in place — and
+    /// splitInto's very next statement is `self.field_buf[count] = ...`,
+    /// an out-of-bounds heap write on exactly the path that was meant to
+    /// be handling the failure. (Same bug, and same fix, as
+    /// growFieldBuffers in c_api.zig.)
+    fn ensureFieldCapacity(self: *Scanner, needed: usize) !void {
         if (needed <= self.field_buf.len) return;
-        const grown = self.allocator.realloc(self.field_buf, needed) catch return;
-        self.field_buf = grown;
+        self.field_buf = try self.allocator.realloc(self.field_buf, needed);
     }
 
     /// One-shot split that owns its own slice (used only for the header).
@@ -460,4 +474,38 @@ test "stop_after_column past a short row still returns correctly (ragged CSV)" {
     try std.testing.expectEqual(@as(usize, 2), row.fields.len);
     try std.testing.expectEqualStrings("1", row.get(0).?);
     try std.testing.expectEqualStrings("2", row.get(1).?);
+}
+
+test "Scanner: an OOM growing field_buf surfaces as an error, not an out-of-bounds write" {
+    // field_buf grows one field at a time from empty, so every field of
+    // every row is a potential failure point. Before this, a failed
+    // realloc left the smaller buffer in place and splitInto wrote past
+    // its end; now the error reaches the caller. Walking every failure
+    // index also proves none of them leak.
+    const backing = std.testing.allocator;
+    const path = "test_scanner_fieldbuf_oom.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b,c\n1,2,3\n4,5,6\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var fail_index: usize = 0;
+    while (fail_index < 40) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        var sc = Scanner.open(failing.allocator(), path) catch |e| {
+            try std.testing.expectEqual(error.OutOfMemory, e);
+            continue;
+        };
+        defer sc.deinit();
+
+        var rows: usize = 0;
+        while (true) {
+            const row = sc.next() catch |e| {
+                try std.testing.expectEqual(error.OutOfMemory, e);
+                break;
+            } orelse break;
+            // Whenever a row does come back, it is fully formed.
+            try std.testing.expectEqual(@as(usize, 3), row.fields.len);
+            rows += 1;
+        }
+        try std.testing.expect(rows <= 2);
+    }
 }

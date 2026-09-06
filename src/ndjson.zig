@@ -227,6 +227,14 @@ pub const NdjsonScanner = struct {
             try keys.append(allocator, try allocator.dupe(u8, field.key));
         }
         scanner.header = try keys.toOwnedSlice(allocator);
+        // toOwnedSlice hands the key copies to scanner.header, which puts
+        // them out of reach of the `keys` errdefer above — anything that
+        // fails from here on has to free them itself.
+        errdefer {
+            for (scanner.header) |k| allocator.free(@constCast(k));
+            allocator.free(scanner.header);
+        }
+        errdefer scanner.header_index.deinit(allocator);
 
         try scanner.header_index.ensureTotalCapacity(allocator, @intCast(scanner.header.len));
         for (scanner.header, 0..) |key, idx| {
@@ -266,7 +274,7 @@ pub const NdjsonScanner = struct {
             break :blk (if (self.mode == .json_array) (try self.nextObject()) else (try self.nextLine())) orelse return null;
         };
 
-        self.ensureCapacity(self.header.len);
+        try self.ensureCapacity(self.header.len);
 
         // Fused fast path: matches CSV's own approach (byte-scan straight
         // into field_buf, no intermediate structure) for the case that
@@ -377,9 +385,16 @@ pub const NdjsonScanner = struct {
         };
     }
 
-    fn ensureCapacity(self: *NdjsonScanner, n: usize) void {
+    /// Grows field_buf to hold `n` field slices.
+    ///
+    /// Returns the allocation error rather than swallowing it: it used to
+    /// `catch return` and leave the old, smaller buffer in place, after
+    /// which next() writes field_buf[k] for every header key — an
+    /// out-of-bounds heap write. Same bug as Scanner.ensureFieldCapacity
+    /// and c_api.zig's growFieldBuffers.
+    fn ensureCapacity(self: *NdjsonScanner, n: usize) !void {
         if (n <= self.field_buf.len) return;
-        self.field_buf = self.allocator.realloc(self.field_buf, n) catch return;
+        self.field_buf = try self.allocator.realloc(self.field_buf, n);
     }
 
     fn fillBuffer(self: *NdjsonScanner) !void {
@@ -712,4 +727,36 @@ test "stop_after_column: a bound past the header is clamped, not out of bounds" 
     const row = (try s.next()).?;
     try std.testing.expectEqual(@as(usize, 2), row.fields.len);
     try std.testing.expectEqualStrings("Austin", row.get(1).?);
+}
+
+test "NdjsonScanner: an OOM growing field_buf surfaces as an error, not an out-of-bounds write" {
+    // Same defect as Scanner.ensureFieldCapacity: a failed realloc used to
+    // leave the old, smaller field_buf in place, and next() then wrote one
+    // slice per header key past its end.
+    const backing = std.testing.allocator;
+    const path = "test_ndjson_fieldbuf_oom.ndjson";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data =
+        \\{"a":1,"b":2,"c":3}
+        \\{"a":4,"b":5,"c":6}
+        \\
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var fail_index: usize = 0;
+    while (fail_index < 60) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        var sc = NdjsonScanner.open(failing.allocator(), path) catch |e| {
+            try std.testing.expect(e == error.OutOfMemory or e == NdjsonError.InvalidJson);
+            continue;
+        };
+        defer sc.deinit();
+
+        while (true) {
+            const row = sc.next() catch |e| {
+                try std.testing.expect(e == error.OutOfMemory or e == NdjsonError.InvalidJson);
+                break;
+            } orelse break;
+            try std.testing.expectEqual(@as(usize, 3), row.fields.len);
+        }
+    }
 }
