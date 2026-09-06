@@ -161,6 +161,33 @@ fn countRange(file: std.fs.File, range: Range) !usize {
 /// exposed publicly: a real caller almost always wants the header-
 /// excluded row count, same as Scanner.countRemaining()'s post-header
 /// semantics.
+/// Spawn one thread per worker, run them all, and join every one before
+/// returning — the only way any worker pool in this file is started.
+///
+/// The bare `for (0..n) |i| threads[i] = try std.Thread.spawn(...)` this
+/// replaces was a use-after-free waiting to happen. `std.Thread.spawn`
+/// really can fail partway through the loop (ThreadQuotaExceeded /
+/// SystemResources — a high explicit num_threads, or a constrained
+/// `ulimit -u`), and returning straight out of the loop abandons the
+/// threads already running: they hold `&workers[i]` and the shared file
+/// handle, both of which the caller's own `defer`s free and close the
+/// instant it returns, while those threads are still writing to the
+/// worker structs and pread()ing that fd. Joining the already-spawned
+/// ones first costs nothing on the success path and makes the failure
+/// path merely slow instead of memory-unsafe.
+fn spawnAndJoin(threads: []std.Thread, comptime WorkFn: anytype, workers: anytype) !void {
+    std.debug.assert(threads.len == workers.len);
+    var spawned: usize = 0;
+    // Registered after the caller's `defer allocator.free(...)` calls, so
+    // it runs BEFORE them on the error path — the joins finish while the
+    // memory those threads touch is still alive.
+    errdefer for (threads[0..spawned]) |t| t.join();
+    while (spawned < threads.len) : (spawned += 1) {
+        threads[spawned] = try std.Thread.spawn(.{}, WorkFn, .{&workers[spawned]});
+    }
+    for (threads) |t| t.join();
+}
+
 fn parallelCountLines(allocator: Allocator, path: []const u8, num_threads_in: usize) !usize {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
@@ -186,10 +213,7 @@ fn parallelCountLines(allocator: Allocator, path: []const u8, num_threads_in: us
     defer allocator.free(threads);
 
     for (ranges, 0..) |r, i| workers[i] = .{ .file = file, .range = r };
-    for (0..num_threads) |i| {
-        threads[i] = try std.Thread.spawn(.{}, countWorkerRun, .{&workers[i]});
-    }
-    for (threads) |t| t.join();
+    try spawnAndJoin(threads, countWorkerRun, workers);
 
     var total: usize = 0;
     for (workers) |w| {
@@ -949,8 +973,7 @@ pub fn parallelCountRowsWhere(
         const threads = try allocator.alloc(std.Thread, ranges.len);
         defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
-        for (0..ranges.len) |i| threads[i] = try std.Thread.spawn(.{}, jsonArrayFilterWorkerRun, .{&workers[i]});
-        for (threads) |t| t.join();
+        try spawnAndJoin(threads, jsonArrayFilterWorkerRun, workers);
 
         var total: usize = 0;
         for (workers) |w| {
@@ -980,8 +1003,7 @@ pub fn parallelCountRowsWhere(
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .stop_after_column = stop_after_column };
-        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, csvFilterWorkerRun, .{&workers[i]});
-        for (threads) |t| t.join();
+        try spawnAndJoin(threads, csvFilterWorkerRun, workers);
         for (workers) |w| {
             if (w.err) |e| return e;
             total += w.result;
@@ -994,8 +1016,7 @@ pub fn parallelCountRowsWhere(
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
-        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, ndjsonFilterWorkerRun, .{&workers[i]});
-        for (threads) |t| t.join();
+        try spawnAndJoin(threads, ndjsonFilterWorkerRun, workers);
         for (workers) |w| {
             if (w.err) |e| return e;
             total += w.result;
@@ -1215,8 +1236,7 @@ pub fn parallelScan(
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates };
-        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, csvScanWorkerRun, .{&workers[i]});
-        for (threads) |t| t.join();
+        try spawnAndJoin(threads, csvScanWorkerRun, workers);
 
         var first_err: ?anyerror = null;
         for (workers) |w| {
@@ -1241,8 +1261,7 @@ pub fn parallelScan(
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
-        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, ndjsonScanWorkerRun, .{&workers[i]});
-        for (threads) |t| t.join();
+        try spawnAndJoin(threads, ndjsonScanWorkerRun, workers);
 
         var first_err: ?anyerror = null;
         for (workers) |w| {
@@ -1296,6 +1315,11 @@ pub const ColumnarScanResult = struct {
 fn newColumnBufs(allocator: Allocator, n_cols: usize) ![]ColumnBuf {
     const columns = try allocator.alloc(ColumnBuf, n_cols);
     for (columns) |*c| c.* = .{};
+    // Every column is initialized before the first fallible call, so this
+    // errdefer can free them all: without it an OOM from a later
+    // offsets.append leaked both the slice and every offsets buffer
+    // already appended to.
+    errdefer deinitColumnBufs(allocator, columns);
     for (columns) |*c| try c.offsets.append(allocator, 0);
     return columns;
 }
@@ -1498,9 +1522,21 @@ fn ndjsonScanColumnarWorkerRun(w: *NdjsonScanColumnarWorker) void {
 /// `workers` is consumed: every worker's ColumnBuf is deinitialized by
 /// the time this returns, success or error.
 fn mergeColumnarWorkers(allocator: Allocator, n_cols: usize, comptime WorkerT: type, workers: []WorkerT) !ColumnarScanResult {
+    // Registered BEFORE the first fallible call, so the "workers is
+    // consumed on every path" contract above holds even when that first
+    // allocation is the one that fails — it used to leak every worker's
+    // buffers in exactly that case.
+    //
+    // `workers[merged..]`, not all of `workers`: the loop below eagerly
+    // frees each worker as it finishes with it (that eager free is
+    // deliberate — see the doc comment above), so freeing the whole slice
+    // here would free the already-merged ones a second time. An OOM from
+    // the appendSlice/append calls below while merging worker N>0 hit
+    // exactly that double free.
+    var merged: usize = 0;
+    errdefer for (workers[merged..]) |*w| deinitColumnBufs(allocator, w.columns);
     const final_columns = try newColumnBufs(allocator, n_cols);
     errdefer deinitColumnBufs(allocator, final_columns);
-    errdefer for (workers) |*w| deinitColumnBufs(allocator, w.columns);
 
     var total_rows: usize = 0;
     for (workers) |*w| {
@@ -1513,6 +1549,7 @@ fn mergeColumnarWorkers(allocator: Allocator, n_cols: usize, comptime WorkerT: t
         }
         total_rows += w.n_rows;
         deinitColumnBufs(allocator, w.columns);
+        merged += 1;
     }
     return .{ .allocator = allocator, .columns = final_columns, .n_rows = total_rows, .n_cols = n_cols };
 }
@@ -1583,8 +1620,7 @@ pub fn parallelScanColumnar(
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .n_cols = n_cols };
-        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, csvScanColumnarWorkerRun, .{&workers[i]});
-        for (threads) |t| t.join();
+        try spawnAndJoin(threads, csvScanColumnarWorkerRun, workers);
 
         var first_err: ?anyerror = null;
         for (workers) |w| {
@@ -1605,8 +1641,7 @@ pub fn parallelScanColumnar(
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
-        for (0..num_threads) |i| threads[i] = try std.Thread.spawn(.{}, ndjsonScanColumnarWorkerRun, .{&workers[i]});
-        for (threads) |t| t.join();
+        try spawnAndJoin(threads, ndjsonScanColumnarWorkerRun, workers);
 
         var first_err: ?anyerror = null;
         for (workers) |w| {
@@ -2223,4 +2258,47 @@ test "parallelScanColumnar: empty file returns EmptyFile" {
     defer std.fs.cwd().deleteFile(path) catch {};
 
     try std.testing.expectError(ParallelError.EmptyFile, parallelScanColumnar(allocator, path, ',', &.{}, 4));
+}
+
+test "mergeColumnarWorkers: every allocation-failure point frees each worker exactly once" {
+    // Guards two real bugs at once, both invisible to the happy-path
+    // tests above because both only fire when an allocation fails
+    // partway through the merge:
+    //   1. the errdefer used to cover ALL of `workers` while the merge
+    //      loop was already eagerly freeing each one it finished — an
+    //      OOM while merging worker N>0 double-freed workers 0..N-1;
+    //   2. the workers errdefer was registered AFTER the first fallible
+    //      call, so an OOM there leaked every worker's buffers despite
+    //      the documented "workers is consumed on every path" contract.
+    // std.testing.allocator turns a double free into a panic and a leak
+    // into a test failure, so this asserts both without asserting on
+    // allocator internals: it just has to survive every failure point.
+    const backing = std.testing.allocator;
+    const FakeWorker = struct { columns: []ColumnBuf, n_rows: usize };
+    const n_cols: usize = 2;
+
+    // Enough rounds to cover every allocation the merge makes (the
+    // final_columns alloc, its per-column offsets, and each
+    // appendSlice/append growth) plus slack past the last one.
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var workers: [3]FakeWorker = undefined;
+        for (&workers, 0..) |*w, wi| {
+            const cols = try newColumnBufs(backing, n_cols);
+            for (cols) |*c| {
+                try c.data.appendSlice(backing, "abcd");
+                try c.offsets.append(backing, 4);
+            }
+            w.* = .{ .columns = cols, .n_rows = wi + 1 };
+        }
+
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        if (mergeColumnarWorkers(failing.allocator(), n_cols, FakeWorker, &workers)) |res| {
+            var r = res;
+            defer r.deinit();
+            try std.testing.expectEqual(@as(usize, 6), r.n_rows); // 1+2+3
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }
