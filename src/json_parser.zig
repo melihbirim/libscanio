@@ -666,15 +666,6 @@ fn decodeOwnedJsonString(raw: []const u8, allocator: Allocator) ParseError![]u8 
     return try out.toOwnedSlice(allocator);
 }
 
-/// Old parseValue function - keeping for reference but unused
-fn parseValue(line: []const u8, tokens: []simd.Token, i: *usize, allocator: Allocator) !JsonValue {
-    _ = line;
-    _ = tokens;
-    _ = i;
-    _ = allocator;
-    return error.OldFunctionNotUsed;
-}
-
 /// Helper to get integer value from JsonValue
 pub fn getInt(value: JsonValue) !i64 {
     return switch (value) {
