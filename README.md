@@ -10,6 +10,17 @@ CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project, limit, 
 
 CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, single-column ORDER BY, per-column type inference (`describe()`), a bounded-memory parallel scan/count/filtered-scan path (`scan_table()` uses 2.3-2.8x less memory than `pyarrow` under N-way concurrent load, the real Python-API-level comparison — see ROADMAP.md), zero-copy Arrow output (`scan_table()`, Python), a C ABI, Python and [Node](node/) bindings, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No group-by, multi-column ORDER BY, or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
 
+**CSV quoting is not supported.** Fields are split on the delimiter;
+quotes are ordinary characters, not grouping. `1,"Smith, John",London`
+is four fields, not three — so a value containing your delimiter shifts
+every column after it on that row, and a filter on those columns will be
+wrong rather than merely unmatched. This is a real limitation, not a bug
+to report: it is what makes the split a single pass with no state. If
+your data has quoted delimiters, normalise it first (or use
+[csvql](https://github.com/melihbirim/csvql), which parses SQL and CSV
+properly). Rows with more or fewer fields than the header are handled and
+tested — extras get a positional `colN` key, missing ones are absent.
+
 ## Quickstart
 
 ```python
@@ -101,6 +112,8 @@ zig build c-lib -Doptimize=ReleaseFast   # -> zig-out/lib/libscanio.{dylib,so,dl
 zig build smoke-test                     # dlopen()s the built library via Python ctypes — the real path
 zig build python-test                    # Python binding suite against the real built library
 zig build node-test                      # Node binding suite — N-API addon, zero runtime dependencies, no npm install needed
+zig build cli -Doptimize=ReleaseFast     # -> zig-out/bin/scanio
+zig build diff-test                      # every client on the same queries, cross-checked against an independent oracle
 ```
 
 ## Non-goals

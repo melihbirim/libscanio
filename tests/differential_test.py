@@ -186,6 +186,43 @@ def via_python(path, where, columns, limit):
     return out
 
 
+NODE_API_DRIVER = r"""
+// One process, several calls — the per-API drivers below all go through
+// this so a Node startup isn't paid per assertion.
+const ls = require(process.argv[2]);
+const file = process.argv[3];
+const out = {};
+try {
+  out.schema = ls.schema(file);
+  out.count = ls.count(file);
+  out.aggregate_amount = ls.aggregate(file, 'amount');
+  out.aggregate_amount_where = ls.aggregate(file, 'amount', 'city = London');
+  out.topk = ls.topk(file, 'amount', 3);
+  out.topk_asc = ls.topk(file, 'amount', 3, null, false);
+  out.orderBy = ls.orderBy(file, 'amount');
+  out.orderBy_desc = ls.orderBy(file, 'amount', null, true);
+  out.orderBy_where = ls.orderBy(file, 'amount', 'city = London');
+} catch (e) {
+  out.error = String(e && e.message);
+}
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def node_api_calls(path):
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(NODE_API_DRIVER)
+        driver = f.name
+    try:
+        p = subprocess.run(["node", driver, os.path.join(REPO, "node", "index.js"), path],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            raise AssertionError(f"node api driver failed: {p.stderr}")
+        return json.loads(p.stdout)
+    finally:
+        os.unlink(driver)
+
+
 NODE_DRIVER = r"""
 const ls = require(process.argv[2]);
 const [, , , file, where, columns, limit] = process.argv;
@@ -349,6 +386,50 @@ def main():
                 cli_cmd = [CLI, path, "--count"] + (["--where", where] if where else [])
                 cli_n = int(subprocess.run(cli_cmd, capture_output=True, text=True).stdout.strip())
                 check(f"count == cli count | {kind} where={where!r}", cli_n, n_count)
+
+        # The rest of the API surface: aggregate/topk/orderBy/schema are
+        # separate code paths in each client (Node re-derives topk/orderBy
+        # rows from its own JSON, Python from the C ABI's row buffers), so
+        # scan() agreeing proves nothing about them.
+        for kind in ("csv", "ndjson"):
+            path = FIXTURES[kind]
+            nd = node_api_calls(path)
+            check(f"schema    | {kind}", nd["schema"], libscanio.schema(path))
+            check(f"count     | {kind}", nd["count"], libscanio.count(path))
+
+            py_agg = libscanio.aggregate(path, "amount")
+            check(f"aggregate | {kind}", nd["aggregate_amount"], py_agg)
+            check(f"aggregate+where | {kind}", nd["aggregate_amount_where"],
+                  libscanio.aggregate(path, "amount", "city = London"))
+            # And against the oracle: "nan"/empty are skipped, not summed.
+            vals = [parse_numeric(r[header_of(path).index("amount")])
+                    for r in oracle_rows(path, header_of(path), [])]
+            nums = [v for v in vals if v is not None]
+            check(f"aggregate == oracle count | {kind}", py_agg["count"], len(nums))
+            check(f"aggregate == oracle sum   | {kind}", round(py_agg["sum"], 6), round(sum(nums), 6))
+            check(f"aggregate == oracle min   | {kind}", py_agg["min"], min(nums))
+            check(f"aggregate == oracle max   | {kind}", py_agg["max"], max(nums))
+
+            py_topk = [dict(r) for r in libscanio.topk(path, "amount", 3)]
+            check(f"topk desc | {kind}", nd["topk"], py_topk)
+            check(f"topk asc  | {kind}", nd["topk_asc"],
+                  [dict(r) for r in libscanio.topk(path, "amount", 3, descending=False)])
+            # top-K must be the k largest numeric values, in order.
+            check(f"topk == oracle | {kind}", [r["_key"] for r in py_topk],
+                  sorted(nums, reverse=True)[:3])
+
+            check(f"orderBy   | {kind}", nd["orderBy"],
+                  [dict(r) for r in libscanio.order_by(path, "amount")])
+            check(f"orderBy desc | {kind}", nd["orderBy_desc"],
+                  [dict(r) for r in libscanio.order_by(path, "amount", descending=True)])
+            check(f"orderBy+where | {kind}", nd["orderBy_where"],
+                  [dict(r) for r in libscanio.order_by(path, "amount", "city = London")])
+            # Ordering must be stable-in-value: ascending then reversed
+            # gives the same multiset of keys as descending.
+            asc = [r["amount"] for r in libscanio.order_by(path, "amount")]
+            desc = [r["amount"] for r in libscanio.order_by(path, "amount", descending=True)]
+            check(f"orderBy asc/desc are mirrors | {kind}", sorted(asc), sorted(desc))
+            check(f"orderBy returns every row | {kind}", len(asc), libscanio.count(path))
 
         # Ragged rows: the three clients must agree field-for-field.
         path = FIXTURES["ragged"]

@@ -315,6 +315,24 @@ async function main() {
     fs.unlinkSync(raggedPath);
   }
 
+  // The Python client exposes exactly {count, sum, min, max, avg}; this
+  // one used to also leak `has_values`, a C-ABI-only flag (C structs have
+  // no null), making the two clients disagree on the shape of the same
+  // answer.
+  const aggPath = path.join(os.tmpdir(), `libscanio_agg_${process.pid}.csv`);
+  fs.writeFileSync(aggPath, 'id,label,amount\n1,alpha,10\n2,beta,20\n');
+  try {
+    check('aggregate: result shape matches the Python client exactly',
+      Object.keys(libscanio.aggregate(aggPath, 'amount')).sort(),
+      ['avg', 'count', 'max', 'min', 'sum']);
+    const emptyAgg = libscanio.aggregate(aggPath, 'label');
+    check('aggregate: a column with no numeric values reports count 0', emptyAgg.count, 0);
+    check('aggregate: and nulls min/max/avg rather than reporting zero',
+      [emptyAgg.min, emptyAgg.max, emptyAgg.avg], [null, null, null]);
+  } finally {
+    fs.unlinkSync(aggPath);
+  }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }

@@ -84,7 +84,15 @@ function count(filePath, where = null) {
  * numeric value was ever seen (count === 0).
  */
 function aggregate(filePath, column, where = null) {
-  return JSON.parse(call(addon().aggregateJson, filePath, column, where));
+  // `has_values` is a C-ABI detail: C structs have no null, so the ABI
+  // reports emptiness in a side flag that the addon faithfully mirrors
+  // into its JSON. The addon already nulls min/max/avg when it is false,
+  // which leaves the flag redundant — and it was the ONE key making this
+  // client's result shape differ from the Python client's for the same
+  // file. Dropped here so both expose exactly {count, sum, min, max, avg}.
+  const { has_values, ...result } = JSON.parse(call(addon().aggregateJson, filePath, column, where));
+  void has_values;
+  return result;
 }
 
 /**
