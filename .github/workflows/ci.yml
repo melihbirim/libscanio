@@ -124,3 +124,14 @@ jobs:
         run: |
           node node/test/addon_test.js
           node node/test/test.js
+
+      # The per-binding suites above each check one path in isolation, so
+      # they cannot catch two clients disagreeing about the same file.
+      # This job already has Node and the addon; it only needs the C ABI
+      # and the CLI to run all three clients side by side.
+      - name: Cross-client differential test
+        shell: bash
+        run: |
+          zig build c-lib -Doptimize=ReleaseFast
+          zig build cli -Doptimize=ReleaseFast
+          python3 tests/differential_test.py

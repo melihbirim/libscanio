@@ -369,6 +369,20 @@ pub fn build(b: *std.Build) void {
     // Node binding — N-API addon. `zig build node` must have already
     // produced zig-out/lib/scanio.node; these tests load it directly,
     // no `npm install` needed at all (zero runtime dependencies).
+    // Cross-client differential test: the same query through the Python
+    // client, the Node client and the CLI, all compared against a
+    // plain-Python oracle. The per-binding suites above each verify one
+    // path in isolation and so cannot catch two clients disagreeing
+    // about the same file — which is exactly what happened with ragged
+    // rows (Python raised, Node silently dropped fields, both suites
+    // green). Needs all three artifacts built, hence the dependencies.
+    const diff_test = b.addSystemCommand(&.{ python_cmd, "tests/differential_test.py" });
+    diff_test.step.dependOn(c_lib_step);
+    diff_test.step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+    if (node_install_step) |s| diff_test.step.dependOn(s);
+    const diff_test_step = b.step("diff-test", "Cross-client differential test (Python vs Node vs CLI vs an oracle)");
+    diff_test_step.dependOn(&diff_test.step);
+
     const node_addon_test = b.addSystemCommand(&.{ "node", "node/test/addon_test.js" });
     if (node_install_step) |s| node_addon_test.step.dependOn(s);
     const node_wrapper_test = b.addSystemCommand(&.{ "node", "node/test/test.js" });
