@@ -62,6 +62,10 @@ equivalent polars call, because below ~100MB the query is not what costs;
 starting the runtime is. It stays ahead at 166MB (107ms vs polars' 271ms)
 at 10MB of peak RSS.
 
+Deliberately not a query language: one file, flags, no joins, no GROUP BY,
+no SQL. If you want SQL over CSV, use [csvql](https://github.com/melihbirim/csvql)
+— a query parser is exactly the startup cost this binary exists to avoid.
+
 ```zig
 const scanio = @import("scanio");
 
