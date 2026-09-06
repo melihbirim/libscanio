@@ -147,6 +147,25 @@ pub fn build(b: *std.Build) void {
         // process rather than at link time — Windows cannot do that, see
         // the node_lib comment above.
         node_addon.linker_allow_shlib_undefined = true;
+        // Force the LLVM backend for this addon, at every optimize level.
+        // Zig 0.15.2's self-hosted x86_64 backend (the DEFAULT for Debug
+        // builds) miscompiles this file: `zig build node-test` — which
+        // rebuilds the addon at Debug, per the -Doptimize gotcha
+        // documented above — segfaults on the FIRST openScan() call that
+        // passes a `columns` projection. Reduced all the way down: the
+        // caller passes a garbage value in a callee-saved register, so
+        // the callee faults dereferencing it (address 0x20) in its own
+        // prologue — it reproduces in any std container call
+        // (ArrayList.append, HashMap.put) reached at that point, and
+        // `std.debug.print` is broken on those worker threads for the
+        // same reason. Not a bug in this file: the identical source at
+        // -Doptimize=ReleaseFast (LLVM) and at Debug with use_llvm
+        // passes all 31 addon + 53 wrapper tests. CI never hit it
+        // because it builds ReleaseFast and runs the test scripts
+        // directly, never through `zig build node-test`. Revisit when
+        // this project moves off 0.15.2 — check whether the self-hosted
+        // backend has been fixed before dropping this line.
+        node_addon.use_llvm = true;
         if (node_lib) |nlib| {
             node_addon.addObjectFile(.{ .cwd_relative = nlib });
         }
