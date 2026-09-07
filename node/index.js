@@ -410,4 +410,12 @@ async function* validateBatches(filePath, schema, options = {}) {
   } finally { addon().closeValidator(handle); }
 }
 
-module.exports = { scanBatches, validateBatches, scan, scanArray, schema, count, aggregate, topk, orderBy, profile, describe, validate, validateIter, inferSchema, ScanError };
+/** One native validation pass writing new accepted CSV/rejected JSONL files.
+ * Existing paths are refused. Returns totals; use validateBatches when rows
+ * need JavaScript processing. This call is synchronous, like validate().
+ */
+function validateToFiles(filePath, schema, acceptedPath, rejectedPath) {
+  return JSON.parse(call(addon().validateToFiles, filePath, JSON.stringify(schema), acceptedPath, rejectedPath));
+}
+
+module.exports = { validateToFiles, scanBatches, validateBatches, scan, scanArray, schema, count, aggregate, topk, orderBy, profile, describe, validate, validateIter, inferSchema, ScanError };

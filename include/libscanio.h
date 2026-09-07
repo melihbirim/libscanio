@@ -210,6 +210,20 @@ const char *scanio_validator_column_name(scanio_validator_t *v, size_t index);
 
 void scanio_validator_close(scanio_validator_t *v);
 
+/* One native pass: accepted UTF-8 CSV (CRLF) and rejected JSONL (LF).
+ * Both output paths must not exist; existing files, including input aliases,
+ * are never truncated. On error, created outputs are closed and removed
+ * (cleanup is best effort). Success is buffered file I/O, not fsync durability.
+ * JSONL: {"values":[...],"errors":[...]}, preserving positional fields.
+ * Returns 0 on success, -1 on error; out_stats is required and zeroed on error.
+ */
+typedef struct {
+    uint64_t rows_total, rows_valid, rows_invalid, errors_total;
+} scanio_import_stats_t;
+int scanio_validate_to_files(const char *path, const char *schema_json,
+                             const char *accepted_path, const char *rejected_path,
+                             scanio_import_stats_t *out_stats);
+
 /* Owned JSON batches. next returns 1 (batch), 0 (EOF), -1 (error).
  * out_batch must be non-NULL; it is set to NULL on EOF/error.
  * max_rows: 1..65536. target_bytes: positive, checked after each row;

@@ -29,9 +29,9 @@ from __future__ import annotations
 import ctypes
 import datetime
 
-from ._loader import CAgg, COptions, CPredicate, load
+from ._loader import CImportStats, CAgg, COptions, CPredicate, load
 
-__all__ = ["scan_batches", "validate_batches", "scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
+__all__ = ["validate_to_files", "scan_batches", "validate_batches", "scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
@@ -1222,3 +1222,25 @@ def validate_batches(path, schema, *, batch_size=1024, target_bytes=1024 * 1024,
                     _validation_errors(row.get("errors", []))) for row in rows]
     finally:
         lib.scanio_validator_close(ctx)
+
+
+def validate_to_files(path: str, schema: dict, accepted_path: str, rejected_path: str) -> dict:
+    """Validate and write accepted CSV/rejected JSONL in one native pass.
+
+    Output paths must not exist. On failure, newly created files are removed
+    (best effort). Returns row/error totals. Rejects contain positional
+    ``values`` and every ``errors`` entry; accepted CSV includes the header.
+    Requires UTF-8 input; fsync durability is not implied. Use streaming APIs
+    instead when each row needs application-specific Python processing.
+    """
+    import json
+    lib = load()
+    result = CImportStats()
+    native_import = getattr(lib, "scanio_validate_to_files", None)
+    if native_import is None:
+        raise ScanError("Native library lacks validate_to_files; rebuild c-lib with -Doptimize=ReleaseFast")
+    rc = native_import(path.encode(), json.dumps(schema).encode(),
+        accepted_path.encode(), rejected_path.encode(), ctypes.byref(result))
+    if rc < 0:
+        _raise_last_error(lib, "validate_to_files failed")
+    return {name: getattr(result, name) for name, _ in CImportStats._fields_}

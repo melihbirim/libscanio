@@ -99,6 +99,11 @@ class COptions(ctypes.Structure):
     ]
 
 
+class CImportStats(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("rows_total", "rows_valid", "rows_invalid", "errors_total")]
+
+
 class CAgg(ctypes.Structure):
     _fields_ = [
         ("count", ctypes.c_uint64),
@@ -258,3 +263,11 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_batch_json.restype = ctypes.c_void_p
     lib.scanio_batch_free.argtypes = [ctypes.c_void_p]
     lib.scanio_batch_free.restype = None
+
+    # Additive API: old libraries can still run their supported functions
+    # (and serve as before/after benchmark baselines).
+    native_import = getattr(lib, "scanio_validate_to_files", None)
+    if native_import is not None:
+        native_import.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(CImportStats)]
+        native_import.restype = ctypes.c_int

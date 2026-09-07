@@ -231,6 +231,12 @@ pub fn main() !u8 {
         return 0;
     }
 
+    if (args.validate) |schema_path| {
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = std.fs.File.stdout().writer(&buffer);
+        return runValidate(allocator, args, schema_path, &writer.interface, err_out);
+    }
+
     // Probe the header first so --where/--columns can be resolved by
     // name, the same two-open pattern every other binding uses.
     var probe = scanio.Query.open(allocator, args.path, .{}) catch |e| {
@@ -292,10 +298,6 @@ pub fn main() !u8 {
     var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
     const out = &stdout_w.interface;
 
-    if (args.validate) |schema_path| {
-        return runValidate(allocator, args, schema_path, owned_header, out, err_out);
-    }
-
     if (args.count_only) {
         const n = q.count() catch |e| {
             try err_out.print("scanio: scan failed: {s}\n", .{@errorName(e)});
@@ -340,7 +342,6 @@ fn runValidate(
     allocator: std.mem.Allocator,
     args: Args,
     schema_path: []const u8,
-    header: []const []const u8,
     out: *std.io.Writer,
     err_out: *std.io.Writer,
 ) !u8 {
@@ -351,15 +352,19 @@ fn runValidate(
     };
     defer allocator.free(schema_json);
 
-    var schema = scanio.parseSchema(allocator, header, schema_json) catch |e| {
-        try err_out.print("scanio: bad schema {s}: {s}\n", .{ schema_path, @errorName(e) });
+    var v = scanio.Validator.openJson(allocator, args.path, schema_json) catch |e| {
+        try err_out.print("scanio: cannot validate {s}: {s}\n", .{ args.path, @errorName(e) });
         try err_out.flush();
-        return 2;
+        return switch (e) {
+            error.BadSchema, error.UnknownColumn => 2,
+            else => 1,
+        };
     };
-    defer schema.deinit();
+    defer v.deinit();
+    const header = v.header();
 
     if (args.validate_output == .report) {
-        var report = scanio.validate(allocator, args.path, &schema, .{
+        var report = v.report(.{
             // 0 means "list them all", which the library spells as a
             // cap nothing can reach — its own 0 means "use the default".
             .max_errors = if (args.max_errors) |m| (if (m == 0) std.math.maxInt(usize) else m) else 100,
@@ -378,13 +383,6 @@ fn runValidate(
     // Row modes stream, exactly like a scan: this is the half of an
     // import that gets written somewhere, and it must not be
     // materialized to be written.
-    var v = scanio.Validator.open(allocator, args.path, &schema) catch |e| {
-        try err_out.print("scanio: cannot open {s}: {s}\n", .{ args.path, @errorName(e) });
-        try err_out.flush();
-        return 1;
-    };
-    defer v.deinit();
-
     const want_valid = args.validate_output == .valid;
     while (v.next() catch |e| {
         try err_out.print("scanio: validate failed: {s}\n", .{@errorName(e)});

@@ -191,6 +191,11 @@ doesn't drown the report. A schema key that names no real column, or a
 misspelled rule name, raises: a rule that silently does not run is worse
 than a call that fails.
 
+For file-to-file imports, `validate_to_files()` (Python) or `validateToFiles()`
+(Node) writes accepted CSV and rejected JSONL directly in Zig, in one pass,
+returning only totals. Both output paths must be new. See [native import usage
+and benchmarks](docs/NATIVE_IMPORT.md).
+
 For bulk row consumption, use `scan_batches()` / `validate_batches()` in
 Python or `scanBatches()` / `validateBatches()` in Node. They return owned
 batches, defaulting to 1,024 rows, with optional tuple/array output. See

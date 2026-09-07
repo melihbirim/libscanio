@@ -517,6 +517,34 @@ async function main() {
     check('batches: NUL', (await collect(libscanio.scanBatches(bp)))[0][0].b, 'nul\x00tail');
   } finally { fs.rmSync(batchDir, {recursive:true,force:true}); }
 
+
+  const importDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scanio-import-'));
+  try {
+    const good = path.join(importDir,'good.csv'), bad = path.join(importDir,'bad.jsonl');
+    for (const format of ['csv','ndjson','json']) {
+      const input = path.join(importDir,'input.'+format);
+      const records = [{a:'1',b:'Zürich'},{a:'bad',b:'quote"'},{a:'3',b:'comma,value'}];
+      fs.writeFileSync(input, format==='csv' ? 'a,b\n1,Zürich\nbad,"quote"""\n3,"comma,value"\n' :
+        format==='json' ? JSON.stringify(records) : records.map(r=>JSON.stringify(r)).join('\n'));
+      const rules = {a:{type:'integer',min:2}};
+      const rows = await collect(libscanio.validateIter(input,rules));
+      check(`${format} native import stats`, libscanio.validateToFiles(input,rules,good,bad),
+        {rowsTotal:3,rowsValid:1,rowsInvalid:2,errorsTotal:2});
+      check(`${format} native import accepted`, fs.readFileSync(good,'utf8'), 'a,b\r\n3,"comma,value"\r\n');
+      check(`${format} native import rejects`, fs.readFileSync(bad,'utf8'), rows.filter(r=>r.errors.length)
+        .map(r=>JSON.stringify({values:Object.values(r.row),errors:r.errors})+'\n').join(''));
+      await checkRaises('native import refuses existing outputs', ()=>libscanio.validateToFiles(input,rules,good,bad));
+      fs.unlinkSync(good);fs.unlinkSync(bad);
+      const original=fs.readFileSync(input,'utf8');
+      await checkRaises('native import refuses input alias', ()=>libscanio.validateToFiles(input,{},input,bad));
+      check('native import preserves input',fs.readFileSync(input,'utf8'),original);
+    }
+    const input=path.join(importDir,'broken.csv');
+    fs.writeFileSync(input,'a,b\n1,ok\n2,"broken\n');
+    await checkRaises('native import removes partial files on parse error',()=>libscanio.validateToFiles(input,{},good,bad));
+    check('native import cleanup', [fs.existsSync(good),fs.existsSync(bad)], [false,false]);
+  } finally { fs.rmSync(importDir,{recursive:true,force:true}); }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }

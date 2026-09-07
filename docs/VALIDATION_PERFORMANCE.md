@@ -1,5 +1,9 @@
 # Native validation and complete import performance
 
+For the newer native file-routing path that avoids host-language conversion,
+see [native imports](NATIVE_IMPORT.md). The numbers below describe the earlier
+rule-evaluation optimization.
+
 `validate()` runs a native scan and returns a report. Streaming validation
 also returns every row and its failures to the host language. Optimizing
 one does not remove the costs of conversion, application logic, or writing

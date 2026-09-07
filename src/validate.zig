@@ -286,6 +286,7 @@ pub const Validator = struct {
     allocator: Allocator,
     query: Query,
     schema: *const Schema,
+    owned_schema: ?*Schema = null,
     errors: std.ArrayListUnmanaged(RowError) = .{},
     row_number: u64 = 0,
     rows_valid: u64 = 0,
@@ -299,9 +300,30 @@ pub const Validator = struct {
         };
     }
 
+    /// Open once, compile against this scanner's header, then continue
+    /// from its existing buffered position. Heap ownership survives moves.
+    pub fn openJson(allocator: Allocator, path: []const u8, schema_json: []const u8) !Validator {
+        var query = try Query.open(allocator, path, .{});
+        errdefer query.deinit();
+        const schema = try allocator.create(Schema);
+        errdefer allocator.destroy(schema);
+        schema.* = try parseSchema(allocator, query.header(), schema_json);
+        return .{ .allocator = allocator, .query = query, .schema = schema, .owned_schema = schema };
+    }
+
+    /// A report owns the entire pass; mixing it with streaming is refused.
+    pub fn report(self: *Validator, options: ReportOptions) !Report {
+        if (self.row_number != 0) return error.ValidatorAlreadyStarted;
+        return reportFromValidator(self.allocator, self, options);
+    }
+
     pub fn deinit(self: *Validator) void {
         self.errors.deinit(self.allocator);
         self.query.deinit();
+        if (self.owned_schema) |schema| {
+            schema.deinit();
+            self.allocator.destroy(schema);
+        }
     }
 
     pub fn header(self: *const Validator) [][]const u8 {
@@ -435,6 +457,16 @@ pub fn validate(
     var v = try Validator.open(allocator, path, schema);
     defer v.deinit();
 
+    return v.report(options);
+}
+
+pub fn validateJson(allocator: Allocator, path: []const u8, schema_json: []const u8, options: ReportOptions) !Report {
+    var v = try Validator.openJson(allocator, path, schema_json);
+    defer v.deinit();
+    return v.report(options);
+}
+
+fn reportFromValidator(allocator: Allocator, v: *Validator, options: ReportOptions) !Report {
     var report = Report{ .allocator = allocator, .strings = std.heap.ArenaAllocator.init(allocator) };
     errdefer report.deinit();
     const arena = report.strings.allocator();
@@ -1113,4 +1145,26 @@ test "compiled enum agrees with linear membership including duplicates" {
     try testing.expectEqual(indexed.rows_invalid, linear.rows_invalid);
     try testing.expectEqualSlices(u64, &indexed.counts, &linear.counts);
     try testing.expectEqualStrings("absent", indexed.errors[0].value);
+}
+
+fn openJsonAllocationCase(allocator: Allocator, path: []const u8) !void {
+    var validator = Validator.openJson(allocator, path, "{\"a\":{\"type\":\"integer\"}}") catch |e| {
+        if (e == error.BadSchema) return error.OutOfMemory;
+        return e;
+    };
+    defer validator.deinit();
+    _ = try validator.next();
+}
+
+test "single-open validator owns schema through allocation failures" {
+    const path = try withFile("test_val_single_open.csv", "a\n1\n2\n");
+    defer std.fs.cwd().deleteFile(path) catch {};
+    try testing.checkAllAllocationFailures(testing.allocator, openJsonAllocationCase, .{path});
+    var validator = try Validator.openJson(testing.allocator, path, "{}");
+    defer validator.deinit();
+    const first = (try validator.next()).?;
+    try testing.expectEqualStrings("1", first.row.get(0).?);
+    try testing.expectError(error.ValidatorAlreadyStarted, validator.report(.{}));
+    const second = (try validator.next()).?;
+    try testing.expectEqualStrings("2", second.row.get(0).?);
 }

@@ -640,5 +640,65 @@ with tempfile.TemporaryDirectory() as batch_tmp:
     with open(bp, "w") as f: f.write('a,b\n1,nul\x00tail\n')
     check("batches: embedded NUL preserved", next(libscanio.scan_batches(bp))[0]["b"], "nul\x00tail")
 
+
+# Native routing preserves every parsed value and error, and never overwrites.
+with tempfile.TemporaryDirectory() as tmp_import:
+    import csv
+    import io
+    import json
+    source = Path(tmp_import) / 'input.csv'
+    good = Path(tmp_import) / 'good.csv'
+    bad = Path(tmp_import) / 'bad.jsonl'
+    records = [['1', 'Zürich'], ['bad', 'quote"'], ['3', 'comma,value']]
+    rules = {'a': {'type': 'integer', 'min': 2}}
+    for fmt in ('csv', 'ndjson', 'json'):
+        source = Path(tmp_import) / ('input.' + fmt)
+        objects = [dict(zip(['a', 'b'], row)) for row in records]
+        if fmt == 'csv':
+            with open(source, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f); writer.writerow(['a', 'b']); writer.writerows(records)
+        else:
+            source.write_text(json.dumps(objects) if fmt == 'json' else '\n'.join(map(json.dumps, objects)), encoding='utf-8')
+        expected_good = io.StringIO(newline='')
+        writer = csv.writer(expected_good); writer.writerow(['a','b'])
+        expected_bad = []
+        for row, errors in libscanio.validate_iter(str(source), rules):
+            values = list(row.values())
+            if errors:
+                expected_bad.append(json.dumps({'values':values,'errors':[e.as_dict() for e in errors]}, ensure_ascii=False, separators=(',', ':'))+'\n')
+            else: writer.writerow(values)
+        stats = libscanio.validate_to_files(str(source), rules, str(good), str(bad))
+        check(f'{fmt} native import totals', stats, dict(rows_total=3,rows_valid=1,rows_invalid=2,errors_total=2))
+        check(f'{fmt} native import accepted bytes', good.read_bytes(), expected_good.getvalue().encode())
+        check(f'{fmt} native import rejected bytes', bad.read_bytes(), ''.join(expected_bad).encode())
+        good.unlink(); bad.unlink()
+    source = Path(tmp_import) / 'input.csv'
+    source.write_text('a,b\n1,2,extra\n3\n', encoding='utf-8')
+    stats = libscanio.validate_to_files(str(source), {}, str(good), str(bad))
+    check('native import retains ragged fields', [json.loads(line)['values'] for line in bad.read_text().splitlines()], [['1','2','extra'],['3']])
+    good.unlink(); bad.unlink()
+    source.write_text('v\n\n', encoding='utf-8')
+    libscanio.validate_to_files(str(source), {}, str(good), str(bad))
+    check('native import single empty field CSV', good.read_bytes(), b'v\r\n""\r\n')
+    good.unlink(); bad.unlink()
+    source.write_text('a,a\n1,2\n', encoding='utf-8')
+    libscanio.validate_to_files(str(source), {'a':{'min':5}}, str(good), str(bad))
+    check('native import duplicate names retain both values', json.loads(bad.read_text())['values'], ['1','2'])
+    good.unlink(); bad.unlink()
+    original = source.read_bytes()
+    check_raises('native import refuses source overwrite', lambda: libscanio.validate_to_files(str(source), {}, str(source), str(bad)))
+    check('native import input untouched', source.read_bytes(), original)
+    bad.write_text('keep')
+    check_raises('native import refuses existing rejection file', lambda: libscanio.validate_to_files(str(source), {}, str(good), str(bad)))
+    check('native import existing output untouched', bad.read_text(), 'keep')
+    check('native import removes first output if second open fails', good.exists(), False)
+    bad.unlink()
+    check_raises('native import identical outputs', lambda: libscanio.validate_to_files(str(source), {}, str(good), str(good)))
+    check('native import identical output cleanup', good.exists(), False)
+    for data in (b'a,b\n1,ok\n2,"unterminated\n', b'a\n\xff\n'):
+        source.write_bytes(data)
+        check_raises('native import malformed input', lambda: libscanio.validate_to_files(str(source), {}, str(good), str(bad)))
+        check('native import removes partial outputs', (good.exists(),bad.exists()), (False,False))
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

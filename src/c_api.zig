@@ -127,7 +127,6 @@ const Ctx = struct {
     /// NUL-terminated header column names, built once at open() — small
     /// and fixed-size, unlike row fields, so no reuse/grow logic needed.
     header_cstrs: [][:0]u8 = &.{},
-
 };
 
 /// Grows the reused per-field buffers (`field_cstrs`/`field_ptrs`) to
@@ -412,7 +411,6 @@ const TopkCtx = struct {
     index: usize = 0,
     field_cstrs: [][]u8 = &.{},
     field_ptrs: [][*:0]const u8 = &.{},
-
 };
 
 /// Runs top-K over the REST of ctx's rows (same drains-the-query
@@ -496,7 +494,6 @@ const OrderByCtx = struct {
     index: usize = 0,
     field_cstrs: [][]u8 = &.{},
     field_ptrs: [][*:0]const u8 = &.{},
-
 };
 
 /// Runs ORDER BY over the REST of ctx's rows (same drains-the-query
@@ -955,10 +952,7 @@ export fn scanio_validate(
         return null;
     };
 
-    var schema = openSchema(std.mem.span(p), std.mem.span(sj)) orelse return null;
-    defer schema.deinit();
-
-    var report = scan.validate(c_allocator, std.mem.span(p), &schema, .{
+    var report = scan.validateJson(c_allocator, std.mem.span(p), std.mem.span(sj), .{
         .max_errors = if (max_errors == 0) 100 else max_errors,
     }) catch |e| {
         setError("validate failed: {s}", .{@errorName(e)});
@@ -1001,26 +995,8 @@ export fn scanio_validate_free(vr: ?*ValidationReport) void {
     c_allocator.destroy(h);
 }
 
-/// Parses `schema_json` against the file's real header. Opening the file
-/// twice (once to read the header, once to scan) is the same two-open
-/// pattern every name-resolving entry point here already uses.
-fn openSchema(path: []const u8, schema_json: []const u8) ?scan.Schema {
-    var probe = Query.open(c_allocator, path, .{}) catch |e| {
-        setError("cannot open {s}: {s}", .{ path, @errorName(e) });
-        return null;
-    };
-    defer probe.deinit();
-    return scan.parseSchema(c_allocator, probe.header(), schema_json) catch |e| {
-        setError("bad schema: {s}", .{@errorName(e)});
-        return null;
-    };
-}
-
 const ValidatorCtx = struct {
     validator: scan.Validator,
-    /// Owned by this context, since the Validator borrows the rules'
-    /// column names from it.
-    schema: scan.Schema,
     field_cstrs: [][]u8 = &.{},
     field_ptrs: [][*:0]const u8 = &.{},
     /// Reused across rows: rendered only for a row that actually failed,
@@ -1043,24 +1019,15 @@ export fn scanio_validator_open(path: ?[*:0]const u8, schema_json: ?[*:0]const u
         return null;
     };
 
-    var schema = openSchema(std.mem.span(p), std.mem.span(sj)) orelse return null;
-    errdefer schema.deinit();
-
     const ctx = c_allocator.create(ValidatorCtx) catch {
         setError("out of memory", .{});
         return null;
     };
-    errdefer c_allocator.destroy(ctx);
-
-    // The Validator borrows the schema, so the schema must live in the
-    // context, not on this stack frame.
-    ctx.* = .{ .validator = undefined, .schema = schema };
-    ctx.validator = scan.Validator.open(c_allocator, std.mem.span(p), &ctx.schema) catch |e| {
-        setError("cannot open {s}: {s}", .{ std.mem.span(p), @errorName(e) });
+    ctx.* = .{ .validator = scan.Validator.openJson(c_allocator, std.mem.span(p), std.mem.span(sj)) catch |e| {
         c_allocator.destroy(ctx);
-        schema.deinit();
+        setError("cannot open validator: {s}", .{@errorName(e)});
         return null;
-    };
+    } };
 
     const header = ctx.validator.header();
     ctx.header_cstrs = c_allocator.alloc([:0]u8, header.len) catch {
@@ -1175,7 +1142,6 @@ export fn scanio_validator_n_columns(vctx: ?*ValidatorCtx) usize {
 export fn scanio_validator_close(vctx: ?*ValidatorCtx) void {
     const c = vctx orelse return;
     c.validator.deinit();
-    c.schema.deinit();
     c.errors_json.deinit(c_allocator);
     for (c.header_cstrs) |buf| c_allocator.free(buf);
     if (c.header_cstrs.len > 0) c_allocator.free(c.header_cstrs);
@@ -1822,4 +1788,18 @@ test "C ABI: validation batches preserve totals and errors" {
     const errors = parsed.value.array.items[1].object.get("errors").?.array.items;
     try std.testing.expectEqualStrings("bad_type", errors[0].object.get("rule").?.string);
     try std.testing.expectEqual(@as(i64, 2), errors[0].object.get("row").?.integer);
+}
+
+pub export fn scanio_validate_to_files(path: ?[*:0]const u8, schema_json: ?[*:0]const u8, accepted: ?[*:0]const u8, rejected: ?[*:0]const u8, out: ?*scan.validation_import.Stats) c_int {
+    clearError();
+    if (out) |result| result.* = .{};
+    if (path == null or schema_json == null or accepted == null or rejected == null or out == null) {
+        setError("validate_to_files requires input, schema, two outputs and stats", .{});
+        return -1;
+    }
+    out.?.* = scan.validation_import.run(c_allocator, std.mem.span(path.?), std.mem.span(schema_json.?), std.mem.span(accepted.?), std.mem.span(rejected.?)) catch |e| {
+        setError("validate_to_files failed: {s}", .{@errorName(e)});
+        return -1;
+    };
+    return 0;
 }

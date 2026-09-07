@@ -1026,22 +1026,8 @@ fn napiCloseScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c)
 // JavaScript, the way describe() is composed, would have guaranteed the
 // opposite.
 
-/// Parses `schema_json` against the file's real header — the same
-/// probe-then-scan pattern every name-resolving entry point here uses.
-fn openSchema(path: [:0]const u8, schema_json: [:0]const u8) !scan.Schema {
-    const header = try probeHeader(c_allocator, path);
-    defer freeHeader(c_allocator, header);
-    return scan.parseSchema(c_allocator, header, schema_json);
-}
-
 fn validateWork(path: [:0]const u8, schema_json: [:0]const u8, max_errors: i64, out: *RowsResult) void {
-    var schema = openSchema(path, schema_json) catch |e| {
-        out.err = e;
-        return;
-    };
-    defer schema.deinit();
-
-    var report = scan.validate(c_allocator, path, &schema, .{
+    var report = scan.validateJson(c_allocator, path, schema_json, .{
         .max_errors = if (max_errors <= 0) 100 else @intCast(max_errors),
     }) catch |e| {
         out.err = e;
@@ -1077,15 +1063,11 @@ fn napiValidate(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) 
 
 const ValidatorHandle = struct {
     validator: scan.Validator,
-    /// Owned here because the Validator borrows the rules' column names
-    /// from it for the whole scan.
-    schema: scan.Schema,
     in_use: bool = false,
     close_requested: bool = false,
 
     fn destroy(self: *ValidatorHandle) void {
         self.validator.deinit();
-        self.schema.deinit();
         c_allocator.destroy(self);
     }
 };
@@ -1093,26 +1075,15 @@ const ValidatorHandle = struct {
 const ValidatorRegistry = HandleRegistry(ValidatorHandle);
 
 fn openValidatorWork(path: [:0]const u8, schema_json: [:0]const u8, out: *OpenScanResult) void {
-    var schema = openSchema(path, schema_json) catch |e| {
-        out.err = e;
-        return;
-    };
-    var schema_moved = false;
-    defer if (!schema_moved) schema.deinit();
-
     const handle = c_allocator.create(ValidatorHandle) catch {
         out.err = error.OutOfMemory;
         return;
     };
-    // The Validator borrows the schema, so it has to live in the handle
-    // rather than on this frame.
-    handle.* = .{ .validator = undefined, .schema = schema };
-    handle.validator = scan.Validator.open(c_allocator, path, &handle.schema) catch |e| {
+    handle.* = .{ .validator = scan.Validator.openJson(c_allocator, path, schema_json) catch |e| {
         c_allocator.destroy(handle);
         out.err = e;
         return;
-    };
-    schema_moved = true;
+    } };
 
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
@@ -1264,6 +1235,32 @@ fn napiValidatorBatch(env: napi.napi_env, info: napi.napi_callback_info) callcon
 
 // ── Module registration ──────────────────────────────────────────────
 
+const ImportResult = struct { stats: scan.validation_import.Stats = .{}, err: ?anyerror = null };
+
+fn importWork(path: [:0]const u8, schema: [:0]const u8, accepted: [:0]const u8, rejected: [:0]const u8, result: *ImportResult) void {
+    result.stats = scan.validation_import.run(c_allocator, path, schema, accepted, rejected) catch |e| {
+        result.err = e;
+        return;
+    };
+}
+
+fn napiValidateToFiles(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const path = getStringArg(env, info, 0, c_allocator) catch return napiFail(env, "input path required");
+    defer c_allocator.free(path);
+    const schema = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "schema required");
+    defer c_allocator.free(schema);
+    const accepted = getStringArg(env, info, 2, c_allocator) catch return napiFail(env, "accepted path required");
+    defer c_allocator.free(accepted);
+    const rejected = getStringArg(env, info, 3, c_allocator) catch return napiFail(env, "rejected path required");
+    defer c_allocator.free(rejected);
+    var result = ImportResult{};
+    runOnWorkerStack(importWork, .{ path, schema, accepted, rejected, &result });
+    if (result.err) |e| return failErr(env, e);
+    var buffer: [256]u8 = undefined;
+    const json = std.fmt.bufPrint(&buffer, "{{\"rowsTotal\":{d},\"rowsValid\":{d},\"rowsInvalid\":{d},\"errorsTotal\":{d}}}", .{ result.stats.rows_total, result.stats.rows_valid, result.stats.rows_invalid, result.stats.errors_total }) catch return napiFail(env, "stats overflow");
+    return napiString(env, json);
+}
+
 fn napiBuildMode(env: napi.napi_env, _: napi.napi_callback_info) callconv(.c) napi.napi_value {
     return napiString(env, @tagName(@import("builtin").mode));
 }
@@ -1285,6 +1282,7 @@ export fn napi_register_module_v1(env: napi.napi_env, exports: napi.napi_value) 
     const props = [_]napi.napi_property_descriptor{
         prop("schemaJson", napiSchema),
         prop("buildMode", napiBuildMode),
+        prop("validateToFiles", napiValidateToFiles),
         prop("validateJson", napiValidate),
         prop("openValidator", napiOpenValidator),
         prop("validatorNextJson", napiValidatorNext),

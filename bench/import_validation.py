@@ -2,7 +2,7 @@
 """Complete import benchmark: write accepted CSV and rejected JSONL rows.
 
 Same four rules and identical output bytes for native Python, validate_iter,
-and validate_batches. Timings include open/validate/write/close, not fixture
+validate_batches, and native validate_to_files. Timings include open/validate/write/close, not fixture
 creation or output verification. Writes use the OS cache, not fsync durability.
 """
 import argparse
@@ -65,13 +65,16 @@ def rows_for(engine, path):
 
 
 def route(engine, source, good, bad):
+    if engine == 'validate_to_files':
+        stats = scan.validate_to_files(source, SCHEMA, good, bad)
+        return stats['rows_valid'], stats['rows_invalid']
     accepted = rejected = 0
-    with open(good, 'w', newline='', encoding='utf-8') as out, open(bad, 'w', encoding='utf-8') as rejects:
+    with open(good, 'w', newline='', encoding='utf-8') as out, open(bad, 'w', encoding='utf-8', newline='') as rejects:
         writer = csv.DictWriter(out, fieldnames=NAMES)
         writer.writeheader()
         for row, errors in rows_for(engine, source):
             if errors:
-                rejects.write(json.dumps(dict(row=row, errors=errors), ensure_ascii=False)+'\n')
+                rejects.write(json.dumps(dict(values=list(row.values()), errors=errors), ensure_ascii=False, separators=(',', ':'))+'\n')
                 rejected += 1
             else:
                 writer.writerow(row)
@@ -94,7 +97,7 @@ def main():
     args = p.parse_args()
     if args.rows < 1 or args.reps < 1: p.error('rows and reps must be positive')
     if scan.build_mode() != 'ReleaseFast': raise RuntimeError('Rebuild c-lib with -Doptimize=ReleaseFast')
-    samples = {name: [] for name in ['native-python','validate_iter','validate_batches']}
+    samples = {name: [] for name in ['native-python','validate_iter','validate_batches','validate_to_files']}
     with tempfile.TemporaryDirectory() as tmp:
         source, good, bad = (str(Path(tmp)/name) for name in ['source.csv','accepted.csv','rejected.jsonl'])
         with open(source, 'w', newline='') as f:
@@ -104,8 +107,10 @@ def main():
         expected = None
         for rep in range(args.reps+1):
             engines = list(samples)
-            engines = engines[rep%3:] + engines[:rep%3]
+            engines = engines[rep%len(engines):] + engines[:rep%len(engines)]
             for engine in engines:
+                Path(good).unlink(missing_ok=True)
+                Path(bad).unlink(missing_ok=True)
                 start = time.perf_counter()
                 counts = route(engine, source, good, bad)
                 elapsed = time.perf_counter()-start

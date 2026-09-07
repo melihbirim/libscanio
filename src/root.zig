@@ -92,6 +92,7 @@ const validate_mod = @import("validate.zig");
 test {
     _ = @import("input_limits.zig");
     _ = @import("batch.zig");
+    _ = @import("validation_import.zig");
     _ = @import("input_limits_test.zig");
     _ = validate_mod;
 }
@@ -107,6 +108,8 @@ pub const ReportOptions = validate_mod.ReportOptions;
 pub const ValidateError = validate_mod.ValidateError;
 pub const parseSchema = validate_mod.parseSchema;
 pub const validate = validate_mod.validate;
+pub const validateJson = validate_mod.validateJson;
+pub const validation_import = @import("validation_import.zig");
 pub const writeReportJson = validate_mod.writeReportJson;
 pub const writeRowErrorsJson = validate_mod.writeRowErrorsJson;
 pub const batch = @import("batch.zig");
