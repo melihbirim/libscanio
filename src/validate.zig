@@ -145,6 +145,18 @@ fn isInteger(s: []const u8) bool {
     return true;
 }
 
+/// Surrounding whitespace is never data here. `isBlank`, `isInteger`,
+/// `isBoolean` and `isDatetime` all trim, so the numeric checks have to
+/// as well: without this, ` 55 ` was a valid `integer` and an invalid
+/// `float` in the same file, which is not a rule anyone could have
+/// meant. Deliberately local to validation rather than pushed into
+/// query.zig's parseNumeric — that one defines what a PREDICATE sees,
+/// and widening it would silently change every WHERE, aggregate and
+/// sort in the library.
+fn numeric(s: []const u8) ?f64 {
+    return query_mod.parseNumeric(std.mem.trim(u8, s, " \t"));
+}
+
 fn isBoolean(s: []const u8) bool {
     const t = std.mem.trim(u8, s, " \t");
     return std.ascii.eqlIgnoreCase(t, "true") or std.ascii.eqlIgnoreCase(t, "false");
@@ -203,7 +215,7 @@ fn matchesType(t: ColumnType, value: []const u8) bool {
         // parseNumeric, not parseFloat: the library's one definition of
         // "a usable number", which excludes the literal text "nan" and
         // "inf" (see query.zig).
-        .float => query_mod.parseNumeric(value) != null,
+        .float => numeric(value) != null,
         .boolean => isBoolean(value),
         .datetime => isDatetime(value),
     };
@@ -308,7 +320,7 @@ pub const Validator = struct {
             }
 
             if (rule.min != null or rule.max != null) {
-                if (query_mod.parseNumeric(value)) |n| {
+                if (numeric(value)) |n| {
                     if (rule.min) |m| {
                         if (n < m) try self.add(rule.column, rule.name, .below_min, value);
                     }
@@ -954,4 +966,36 @@ test "a structural error renders its column as null, not as a fake index" {
         "[{\"row\":1,\"column\":null,\"column_name\":\"\",\"rule\":\"too_few_fields\",\"value\":\"\"}]",
         w.written(),
     );
+}
+
+test "surrounding whitespace is not data, for every numeric rule alike" {
+    // ` 55 ` used to pass `integer` (which trims) and fail `float` and
+    // `min` (which did not) — the same cell valid under one rule and
+    // malformed under another.
+    const a = testing.allocator;
+    const path = try withFile("test_val_pad.csv", "n\n 55 \n\t7\t\n 4 \n");
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    for ([_][]const u8{
+        \\{"n": {"type": "integer"}}
+        ,
+        \\{"n": {"type": "float"}}
+        ,
+    }) |schema_json| {
+        var r = try reportOf(a, path, schema_json, .{});
+        defer r.report.deinit();
+        defer r.schema.deinit();
+        try testing.expectEqual(@as(u64, 0), r.report.errors_total);
+    }
+
+    var r = try reportOf(a, path,
+        \\{"n": {"min": 5}}
+    , .{});
+    defer r.report.deinit();
+    defer r.schema.deinit();
+    // Only the genuine 4 is below the minimum — and the value is
+    // reported exactly as it sits in the file, not trimmed.
+    try testing.expectEqual(@as(u64, 1), r.report.errors_total);
+    try testing.expectEqual(ErrorKind.below_min, r.report.errors[0].kind);
+    try testing.expectEqualStrings(" 4 ", r.report.errors[0].value);
 }

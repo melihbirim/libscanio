@@ -352,7 +352,7 @@ def write_fixtures(tmp):
         f.write("4,Bo,-5,London\n")           # name too short; amount below min
         f.write("5,Alexandra,2000,Tokyo\n")   # name too long; amount above max; city not in set
         f.write("6,Carol,,   \n")             # amount blank; city whitespace-only
-        f.write("7,Dave,3.5,Paris\n")         # clean, float amount
+        f.write("7,Dave, 3.5 ,Paris\n")       # clean; a padded number is still a number
         f.write("8,Eve,nan,London\n")         # "nan" is text, not a number
     FIXTURES["validate"] = val
 
@@ -415,7 +415,7 @@ def _oracle_is_type(t, v):
         return bool(body) and body.isdigit() and body.isascii()
     if t == "float":
         try:
-            f = float(v)
+            f = float(v.strip(" \t"))
         except ValueError:
             return False
         return f == f and f not in (float("inf"), float("-inf"))
@@ -438,7 +438,7 @@ def _oracle_is_type(t, v):
 
 def _oracle_number(v):
     try:
-        f = float(v)
+        f = float(v.strip(" \t"))
     except ValueError:
         return None
     return f if f == f and f not in (float("inf"), float("-inf")) else None

@@ -172,6 +172,23 @@ scanio orders.csv --validate schema.json --valid    # ...or stream just the rows
 scanio orders.csv --validate schema.json --invalid  # ...or just the ones that didn't
 ```
 
+Runnable end-to-end examples of exactly this — the summary, the
+streaming import, and the inferred draft — are in
+[examples/validate_import.py](examples/validate_import.py) and
+[examples/validate_import.js](examples/validate_import.js), against
+[examples/scores.csv](examples/scores.csv).
+
+Two things worth knowing before writing a rule:
+
+* **`min`/`max` are inclusive.** `{"min": 30}` means >= 30, so a value of
+  exactly 30 passes. There is no exclusive form yet; on integer data,
+  write `{"min": 31}`.
+* **`float` means "any usable number"**, integers included — use it
+  unless a decimal point should itself be an error, in which case use
+  `integer`. Surrounding whitespace is never data: ` 55 ` is the number
+  55 under every numeric rule, and the error still quotes the cell
+  exactly as it appears in the file.
+
 Don't have a schema yet? `infer_schema(path)` drafts one from the file's
 own shape (via `describe()`'s sampling) for you to edit. It is a starting
 point, not a schema to trust: it can only describe the file it read, so a
