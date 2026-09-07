@@ -452,12 +452,19 @@ def _oracle_is_type(t, v):
         s = v.strip(" \t")
         if not (_ISO_DATE.match(s) or _ISO_DATETIME.match(s)):
             return False
-        month, day = int(s[5:7]), int(s[8:10])
-        if not (1 <= month <= 12 and 1 <= day <= 31):
+        import datetime
+        try:
+            datetime.date.fromisoformat(s[:10])
+        except ValueError:
             return False
         if len(s) > 10:
             hour, minute = int(s[11:13]), int(s[14:16])
             if hour > 23 or minute > 59:
+                return False
+            if len(s) > 16 and s[16] == ':' and int(s[17:19]) > 60:
+                return False
+            offset = re.search(r"[+-](\d{2}):(\d{2})$", s[10:])
+            if offset and (int(offset[1]) > 23 or int(offset[2]) > 59):
                 return False
         return True
     raise AssertionError(f"oracle does not know type {t!r}")
@@ -730,6 +737,40 @@ def main():
             check(f"validate | cli --invalid count | {label}", len(invalid_rows), want["rows_invalid"])
             check(f"validate | cli --valid + --invalid is every row | {label}",
                   len(valid_rows) + len(invalid_rows), want["rows_total"])
+
+        # Calendar, numeric reuse, compiled enums, and report cap boundaries.
+        hard_path = os.path.join(tmp, "validation_hard.csv")
+        hard_rows = [
+            ["2024-02-29", " 30 ", "paid"],
+            ["2023-02-29", "29", "missing"],
+            ["1900-02-29", "nan", "v0"],
+            ["2000-02-29", "inf", "v31"],
+            ["2024-04-31", "1e309", "v1"],
+            ["2024-01-01T00:00+99:99", "bad", "missing"],
+            ["2024-01-01T00:00-23:59", "30.5", "paid"],
+            ["2024-01-01T00:00+00:60", "-1", "missing"],
+        ]
+        with open(hard_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "score", "status"])
+            writer.writerows(hard_rows)
+        hard_schema = {"date": {"type":"datetime"},
+                       "score":{"type":"float","min":30,"max":31},
+                       "status":{"one_of":[f"v{i}" for i in range(32)]+["paid","paid"]}}
+        for cap in (1, 2, 5, 100):
+            want = oracle_validate(hard_path, hard_schema, max_errors=cap)
+            py = validate_via_python(hard_path, hard_schema, max_errors=cap)
+            nd = validate_via_node(hard_path, hard_schema, max_errors=cap)
+            streamed = nd.pop("streamed")
+            check(f"validation hard oracle/Python cap={cap}", py, want)
+            check(f"validation hard Node cap={cap}", nd, want)
+            check(f"validation hard streaming preserves errors cap={cap}",
+                  sum(len(row["errors"]) for row in streamed), want["errors_total"])
+            batch_errors = [e.as_dict() for batch in libscanio.validate_batches(hard_path, hard_schema, batch_size=2)
+                            for row, errors in batch for e in errors]
+            check(f"validation hard batches preserve prefix cap={cap}", batch_errors[:cap], want["errors"])
+        cli, _ = validate_via_cli(hard_path, hard_schema, tmp)
+        check("validation hard CLI", cli, oracle_validate(hard_path, hard_schema))
 
         # Truncation: the stored list is capped, the totals are not — and
         # all three clients must cap identically.

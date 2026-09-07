@@ -239,10 +239,19 @@ Two things worth knowing before writing a rule:
   55 under every numeric rule, and the error still quotes the cell
   exactly as it appears in the file.
 
+Datetime rules now check Gregorian calendar dates (years 1–9999), including
+leap years, and numeric timezone offsets (hours 0–23, minutes 0–59).
+Impossible dates such as `2024-02-31` fail validation.
+
 Don't have a schema yet? `infer_schema(path)` drafts one from the file's
 own shape (via `describe()`'s sampling) for you to edit. It is a starting
 point, not a schema to trust: it can only describe the file it read, so a
 file that is entirely wrong infers a schema it passes cleanly.
+
+Native validation now reuses float parsing for range checks, compiles large
+membership lists, and counts errors beyond a report's sample cap without
+constructing discarded error records. See [validation performance and import
+benchmarks](docs/VALIDATION_PERFORMANCE.md) for measured gains and limits.
 
 The rules are evaluated in Zig, not in each binding, so Python, Node and
 the CLI cannot drift into three different answers about whether a cell is

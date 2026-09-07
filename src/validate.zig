@@ -96,6 +96,9 @@ pub const Rule = struct {
     min_len: ?usize = null,
     max_len: ?usize = null,
     one_of: []const []const u8 = &.{},
+    /// Compiled by parseSchema for large sets; storage belongs to the
+    /// schema arena. Reparse the schema to change its membership rules.
+    one_of_index: ?std.StringHashMapUnmanaged(void) = null,
 };
 
 /// One failure. `column` is null for a structural error, which is about
@@ -174,7 +177,13 @@ fn isDatetime(s: []const u8) bool {
     for ([_]usize{ 0, 1, 2, 3, 5, 6, 8, 9 }) |i| if (!std.ascii.isDigit(t[i])) return false;
     const month = (t[5] - '0') * 10 + (t[6] - '0');
     const day = (t[8] - '0') * 10 + (t[9] - '0');
-    if (month < 1 or month > 12 or day < 1 or day > 31) return false;
+    const year = @as(u16, t[0] - '0') * 1000 + @as(u16, t[1] - '0') * 100 +
+        @as(u16, t[2] - '0') * 10 + @as(u16, t[3] - '0');
+    if (year == 0 or month < 1 or month > 12 or day < 1) return false;
+    const days = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    const leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
+    const max_day = days[month - 1] + @as(u8, if (month == 2 and leap) 1 else 0);
+    if (day > max_day) return false;
     if (t.len == 10) return true;
 
     if (t[10] != 'T' and t[10] != ' ') return false;
@@ -202,8 +211,10 @@ fn isDatetime(s: []const u8) bool {
     if (rest.len == 0) return true;
     if (rest.len == 1 and (rest[0] == 'Z' or rest[0] == 'z')) return true;
     if (rest.len == 6 and (rest[0] == '+' or rest[0] == '-')) {
-        return std.ascii.isDigit(rest[1]) and std.ascii.isDigit(rest[2]) and rest[3] == ':' and
-            std.ascii.isDigit(rest[4]) and std.ascii.isDigit(rest[5]);
+        if (!(std.ascii.isDigit(rest[1]) and std.ascii.isDigit(rest[2]) and rest[3] == ':' and
+            std.ascii.isDigit(rest[4]) and std.ascii.isDigit(rest[5]))) return false;
+        return (rest[1] - '0') * 10 + (rest[2] - '0') <= 23 and
+            (rest[4] - '0') * 10 + (rest[5] - '0') <= 59;
     }
     return false;
 }
@@ -242,6 +253,30 @@ pub const ValidatedRow = struct {
     }
 };
 
+/// Report mode counts every failure but only constructs retained errors.
+/// Streaming mode has no cap and returns every error as before.
+const ErrorSink = struct {
+    allocator: Allocator,
+    errors: *std.ArrayListUnmanaged(RowError),
+    row_number: u64,
+    counts: ?*[n_error_kinds]u64,
+    limit: usize,
+    failed: bool = false,
+
+    fn add(self: *ErrorSink, column: ?usize, name: []const u8, kind: ErrorKind, value: []const u8) !void {
+        self.failed = true;
+        if (self.counts) |counts| counts[@intFromEnum(kind)] += 1;
+        if (self.errors.items.len >= self.limit) return;
+        try self.errors.append(self.allocator, .{
+            .row = self.row_number,
+            .column = column,
+            .column_name = name,
+            .kind = kind,
+            .value = value,
+        });
+    }
+};
+
 /// Walks a file row by row, handing back each row with its failures
 /// attached. This is the primitive; `validate()` is a summary built on
 /// top of it. Streaming is the point: an importer wants to write the
@@ -274,34 +309,29 @@ pub const Validator = struct {
     }
 
     pub fn next(self: *Validator) !?ValidatedRow {
+        return self.nextWithSink(std.math.maxInt(usize), null);
+    }
+
+    fn nextWithSink(self: *Validator, limit: usize, counts: ?*[n_error_kinds]u64) !?ValidatedRow {
         const row = (try self.query.next()) orelse return null;
         self.row_number += 1;
         self.errors.clearRetainingCapacity();
-        try self.check(row);
-        if (self.errors.items.len == 0) self.rows_valid += 1 else self.rows_invalid += 1;
+        var sink = ErrorSink{ .allocator = self.allocator, .errors = &self.errors, .row_number = self.row_number, .counts = counts, .limit = limit };
+        try self.check(row, &sink);
+        if (sink.failed) self.rows_invalid += 1 else self.rows_valid += 1;
         return .{ .number = self.row_number, .row = row, .errors = self.errors.items };
     }
 
-    fn add(self: *Validator, column: ?usize, name: []const u8, kind: ErrorKind, value: []const u8) !void {
-        try self.errors.append(self.allocator, .{
-            .row = self.row_number,
-            .column = column,
-            .column_name = name,
-            .kind = kind,
-            .value = value,
-        });
-    }
-
-    fn check(self: *Validator, row: Row) !void {
+    fn check(self: *Validator, row: Row, sink: *ErrorSink) !void {
         // Structural first: it explains every rule failure that follows
         // on a torn row, so it should be the first thing a reader sees.
         if (row.fields.len < self.schema.n_columns) {
-            try self.add(null, "", .too_few_fields, "");
+            try sink.add(null, "", .too_few_fields, "");
         } else if (row.fields.len > self.schema.n_columns) {
-            try self.add(null, "", .too_many_fields, "");
+            try sink.add(null, "", .too_many_fields, "");
         }
 
-        for (self.schema.rules) |rule| {
+        for (self.schema.rules) |*rule| {
             // A missing cell on a short row is already reported as
             // too_few_fields; repeating it per column would bury that.
             const value = row.get(rule.column) orelse continue;
@@ -310,49 +340,55 @@ pub const Validator = struct {
                 // An empty optional cell is not a type error, a range
                 // error or a length error — it is simply absent. Only
                 // `required` has anything to say about it.
-                if (rule.required) try self.add(rule.column, rule.name, .missing_required, value);
+                if (rule.required) try sink.add(rule.column, rule.name, .missing_required, value);
                 continue;
             }
 
-            if (!matchesType(rule.type, value)) {
-                try self.add(rule.column, rule.name, .bad_type, value);
+            // Float type and range share one parse, including failure.
+            var number: ?f64 = null;
+            const type_ok = if (rule.type == .float) blk: {
+                number = numeric(value);
+                break :blk number != null;
+            } else matchesType(rule.type, value);
+            if (!type_ok) {
+                try sink.add(rule.column, rule.name, .bad_type, value);
                 continue; // range/length checks on a wrong-typed cell say nothing new
             }
 
             if (rule.min != null or rule.max != null) {
-                if (numeric(value)) |n| {
+                if (rule.type != .float) number = numeric(value);
+                if (number) |n| {
                     if (rule.min) |m| {
-                        if (n < m) try self.add(rule.column, rule.name, .below_min, value);
+                        if (n < m) try sink.add(rule.column, rule.name, .below_min, value);
                     }
                     if (rule.max) |m| {
-                        if (n > m) try self.add(rule.column, rule.name, .above_max, value);
+                        if (n > m) try sink.add(rule.column, rule.name, .above_max, value);
                     }
                 } else {
                     // min/max were asked for, so this cell had to be a
                     // number and is not — regardless of what `type` said.
-                    try self.add(rule.column, rule.name, .bad_type, value);
+                    try sink.add(rule.column, rule.name, .bad_type, value);
                 }
             }
 
             if (rule.min_len != null or rule.max_len != null) {
                 const len = textLength(value);
                 if (rule.min_len) |m| {
-                    if (len < m) try self.add(rule.column, rule.name, .too_short, value);
+                    if (len < m) try sink.add(rule.column, rule.name, .too_short, value);
                 }
                 if (rule.max_len) |m| {
-                    if (len > m) try self.add(rule.column, rule.name, .too_long, value);
+                    if (len > m) try sink.add(rule.column, rule.name, .too_long, value);
                 }
             }
 
             if (rule.one_of.len > 0) {
-                var found = false;
-                for (rule.one_of) |v| {
-                    if (std.mem.eql(u8, v, value)) {
-                        found = true;
-                        break;
+                const found = if (rule.one_of_index) |index| index.contains(value) else blk: {
+                    for (rule.one_of) |v| {
+                        if (std.mem.eql(u8, v, value)) break :blk true;
                     }
-                }
-                if (!found) try self.add(rule.column, rule.name, .not_in_set, value);
+                    break :blk false;
+                };
+                if (!found) try sink.add(rule.column, rule.name, .not_in_set, value);
             }
         }
     }
@@ -406,23 +442,19 @@ pub fn validate(
     var kept: std.ArrayListUnmanaged(RowError) = .{};
     errdefer kept.deinit(allocator);
 
-    while (try v.next()) |vr| {
+    while (try v.nextWithSink(options.max_errors - kept.items.len, &report.counts)) |vr| {
         for (vr.errors) |e| {
-            report.errors_total += 1;
-            report.counts[@intFromEnum(e.kind)] += 1;
-            if (kept.items.len < options.max_errors) {
-                try kept.append(allocator, .{
-                    .row = e.row,
-                    .column = e.column,
-                    .column_name = try arena.dupe(u8, e.column_name),
-                    .kind = e.kind,
-                    .value = try arena.dupe(u8, e.value),
-                });
-            } else {
-                report.truncated = true;
-            }
+            try kept.append(allocator, .{
+                .row = e.row,
+                .column = e.column,
+                .column_name = try arena.dupe(u8, e.column_name),
+                .kind = e.kind,
+                .value = try arena.dupe(u8, e.value),
+            });
         }
     }
+    for (report.counts) |count| report.errors_total += count;
+    report.truncated = report.errors_total > kept.items.len;
 
     report.rows_total = v.row_number;
     report.rows_valid = v.rows_valid;
@@ -510,6 +542,12 @@ pub fn parseSchema(
                 // rule that silently does not run.
                 return ValidateError.BadSchema;
             }
+        }
+        // Short enums are cheaper to scan; large enums get one lookup.
+        if (rule.one_of.len >= 32) {
+            var index: std.StringHashMapUnmanaged(void) = .{};
+            for (rule.one_of) |value| try index.put(astore, value, {});
+            rule.one_of_index = index;
         }
         try rules.append(allocator, rule);
     }
@@ -643,8 +681,7 @@ test "a clean file reports no errors at all" {
 
 test "each rule reports its own kind, against the offending cell" {
     const a = testing.allocator;
-    const path = try withFile("test_val_kinds.csv",
-        "id,amount,status,code\n" ++
+    const path = try withFile("test_val_kinds.csv", "id,amount,status,code\n" ++
         "abc,5,new,XY\n" ++ // id not an integer
         "2,-1,new,XY\n" ++ // amount below min
         "3,5,bogus,XY\n" ++ // status not in set
@@ -998,4 +1035,82 @@ test "surrounding whitespace is not data, for every numeric rule alike" {
     try testing.expectEqual(@as(u64, 1), r.report.errors_total);
     try testing.expectEqual(ErrorKind.below_min, r.report.errors[0].kind);
     try testing.expectEqualStrings(" 4 ", r.report.errors[0].value);
+}
+
+test "datetime checks Gregorian dates and timezone bounds" {
+    for ([_][]const u8{ "2000-02-29", "2024-02-29T23:59:59Z", "2024-04-30", "2024-01-01T00:00+23:59", " 2024-01-01T00:00-00:00 " }) |value| {
+        try testing.expect(isDatetime(value));
+    }
+    for ([_][]const u8{ "0000-01-01", "1900-02-29", "2023-02-29", "2024-02-30", "2024-04-31", "2024-01-01T00:00+24:00", "2024-01-01T00:00+00:60", "2024-01-01T00:00+99:99" }) |value| {
+        try testing.expect(!isDatetime(value));
+    }
+}
+
+test "capped report counts every failure and keeps the exact prefix" {
+    const path = try withFile("test_val_sink.csv", "a,b\n1,\n2,\n3,ok\n");
+    defer std.fs.cwd().deleteFile(path) catch {};
+    var schema = try parseSchema(testing.allocator, &.{ "a", "b" }, "{\"a\":{\"min\":5,\"min_len\":2},\"b\":{\"required\":true}}");
+    defer schema.deinit();
+    var full = try validate(testing.allocator, path, &schema, .{ .max_errors = 100 });
+    defer full.deinit();
+    try testing.expectEqual(@as(u64, 8), full.errors_total);
+    for ([_]usize{ 0, 1, 2, 3, 7, 8, 9 }) |cap| {
+        var limited = try validate(testing.allocator, path, &schema, .{ .max_errors = cap });
+        defer limited.deinit();
+        try testing.expectEqual(full.rows_invalid, limited.rows_invalid);
+        try testing.expectEqual(full.rows_valid, limited.rows_valid);
+        try testing.expectEqual(full.errors_total, limited.errors_total);
+        try testing.expectEqualSlices(u64, &full.counts, &limited.counts);
+        try testing.expectEqual(@min(cap, full.errors.len), limited.errors.len);
+        try testing.expectEqual(cap < full.errors.len, limited.truncated);
+        for (limited.errors, full.errors[0..limited.errors.len]) |got, want| {
+            try testing.expectEqual(want.row, got.row);
+            try testing.expectEqual(want.kind, got.kind);
+            try testing.expectEqualStrings(want.value, got.value);
+        }
+    }
+    var v = try Validator.open(testing.allocator, path, &schema);
+    defer v.deinit();
+    var counts = [_]u64{0} ** n_error_kinds;
+    _ = try v.nextWithSink(0, &counts);
+    try testing.expectEqual(@as(usize, 0), v.errors.capacity);
+    // Public streaming next always keeps its complete errors.
+    const row = (try v.next()).?;
+    try testing.expectEqual(@as(usize, 3), row.errors.len);
+    try testing.expect(!row.isValid());
+}
+
+const large_enum_json = "{\"v\":{\"one_of\":[\"0\",\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\",\"10\",\"11\",\"12\",\"13\",\"14\",\"15\",\"16\",\"17\",\"18\",\"19\",\"20\",\"21\",\"22\",\"23\",\"24\",\"25\",\"26\",\"27\",\"28\",\"29\",\"Zürich\",\"Zürich\"]}}";
+
+fn enumAllocationCase(allocator: Allocator) !void {
+    var schema = parseSchema(allocator, &.{"v"}, large_enum_json) catch |err| {
+        // Valid constant JSON: parseFromSlice's BadSchema here can only
+        // be its existing translation of an injected allocation failure.
+        if (err == error.BadSchema) return error.OutOfMemory;
+        return err;
+    };
+    defer schema.deinit();
+    try testing.expect(schema.rules[0].one_of_index.?.contains("Zürich"));
+    try testing.expect(!schema.rules[0].one_of_index.?.contains("absent"));
+}
+
+test "compiled enums clean up on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, enumAllocationCase, .{});
+}
+
+test "compiled enum agrees with linear membership including duplicates" {
+    const path = try withFile("test_val_enum_index.csv", "v\n0\nZürich\nabsent\n29\n");
+    defer std.fs.cwd().deleteFile(path) catch {};
+    var schema = try parseSchema(testing.allocator, &.{"v"}, large_enum_json);
+    defer schema.deinit();
+    var indexed = try validate(testing.allocator, path, &schema, .{});
+    defer indexed.deinit();
+    // Exercise the fallback used by schemas assembled directly in Zig.
+    schema.rules[0].one_of_index = null;
+    var linear = try validate(testing.allocator, path, &schema, .{});
+    defer linear.deinit();
+    try testing.expectEqual(@as(u64, 1), indexed.rows_invalid);
+    try testing.expectEqual(indexed.rows_invalid, linear.rows_invalid);
+    try testing.expectEqualSlices(u64, &indexed.counts, &linear.counts);
+    try testing.expectEqualStrings("absent", indexed.errors[0].value);
 }
