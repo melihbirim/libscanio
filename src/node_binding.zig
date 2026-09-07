@@ -1231,7 +1231,42 @@ fn napiCloseValidator(env: napi.napi_env, info: napi.napi_callback_info) callcon
     return undef;
 }
 
+fn batchResult(env: napi.napi_env, source: anytype, comptime validated: bool, rows: i64, bytes: i64) napi.napi_value {
+    if (rows < 1 or rows > 65536 or bytes < 1) return napiFail(env, "invalid batch size");
+    const json = scan.batch.readJson(c_allocator, source, validated, .{
+        .max_rows = @intCast(rows),
+        .target_bytes = @intCast(bytes),
+    }) catch |e| return failErr(env, e);
+    if (json) |data| {
+        defer c_allocator.free(data);
+        return napiString(env, data);
+    }
+    var result: napi.napi_value = undefined;
+    _ = napi.napi_get_null(env, &result);
+    return result;
+}
+
+fn napiNextBatch(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const id = getIntArg(env, info, 0, i64, 0);
+    if (id <= 0) return napiFail(env, "invalid handle");
+    const handle = acquireHandle(@intCast(id)) orelse return napiFail(env, "unknown or busy handle");
+    defer releaseHandle(handle);
+    return batchResult(env, &handle.query, false, getIntArg(env, info, 1, i64, 1024), getIntArg(env, info, 2, i64, 1048576));
+}
+
+fn napiValidatorBatch(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const id = getIntArg(env, info, 0, i64, 0);
+    if (id <= 0) return napiFail(env, "invalid handle");
+    const handle = ValidatorRegistry.acquire(@intCast(id)) orelse return napiFail(env, "unknown or busy handle");
+    defer ValidatorRegistry.release(handle);
+    return batchResult(env, &handle.validator, true, getIntArg(env, info, 1, i64, 1024), getIntArg(env, info, 2, i64, 1048576));
+}
+
 // ── Module registration ──────────────────────────────────────────────
+
+fn napiBuildMode(env: napi.napi_env, _: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    return napiString(env, @tagName(@import("builtin").mode));
+}
 
 fn prop(name: [*:0]const u8, method: napi.napi_callback) napi.napi_property_descriptor {
     return .{
@@ -1249,6 +1284,7 @@ fn prop(name: [*:0]const u8, method: napi.napi_callback) napi.napi_property_desc
 export fn napi_register_module_v1(env: napi.napi_env, exports: napi.napi_value) callconv(.c) napi.napi_value {
     const props = [_]napi.napi_property_descriptor{
         prop("schemaJson", napiSchema),
+        prop("buildMode", napiBuildMode),
         prop("validateJson", napiValidate),
         prop("openValidator", napiOpenValidator),
         prop("validatorNextJson", napiValidatorNext),
@@ -1261,6 +1297,8 @@ export fn napi_register_module_v1(env: napi.napi_env, exports: napi.napi_value) 
         prop("orderByJson", napiOrderBy),
         prop("openScan", napiOpenScan),
         prop("nextRowJson", napiNextRow),
+        prop("nextBatchJson", napiNextBatch),
+        prop("validatorBatchJson", napiValidatorBatch),
         prop("closeScan", napiCloseScan),
     };
     _ = napi.napi_define_properties(env, exports, props.len, &props);

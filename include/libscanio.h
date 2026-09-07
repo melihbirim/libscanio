@@ -210,6 +210,26 @@ const char *scanio_validator_column_name(scanio_validator_t *v, size_t index);
 
 void scanio_validator_close(scanio_validator_t *v);
 
+/* Owned JSON batches. next returns 1 (batch), 0 (EOF), -1 (error).
+ * out_batch must be non-NULL; it is set to NULL on EOF/error.
+ * max_rows: 1..65536. target_bytes: positive, checked after each row;
+ * a single row can exceed it. Close the scanner after an error: part
+ * of a failed batch may already have been consumed. Existing handles
+ * and option struct layouts are unchanged. Do not use a handle concurrently.
+ * JSON is NOT NUL-terminated; use the length from scanio_batch_json.
+ * A batch remains valid after advancing/closing its scanner. Free each
+ * batch exactly once; scanio_batch_free(NULL) is permitted.
+ * Scan shape: [[field,...],...]. Validation shape:
+ * [{"number":1,"values":[...],"errors":[...]},...]; clean rows omit errors.
+ */
+typedef struct scanio_batch scanio_batch_t;
+int scanio_next_batch(scanio_t *ctx, size_t max_rows, size_t target_bytes,
+                      scanio_batch_t **out_batch);
+int scanio_validator_next_batch(scanio_validator_t *ctx, size_t max_rows,
+                                size_t target_bytes, scanio_batch_t **out_batch);
+const char *scanio_batch_json(const scanio_batch_t *batch, size_t *out_len);
+void scanio_batch_free(scanio_batch_t *batch);
+
 /* The optimize mode this library was built with — "Debug",
  * "ReleaseSafe", "ReleaseFast" or "ReleaseSmall". For a benchmark to
  * assert on before publishing a number: several build steps reinstall

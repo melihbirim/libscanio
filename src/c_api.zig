@@ -1720,3 +1720,106 @@ test "C ABI: the parallel columnar path takes the same flag" {
     try std.testing.expectEqual(@as(usize, 300), scanio_collect_columnar_n_rows(kept));
     try std.testing.expectEqual(@as(usize, 300), scanio_collect_columnar_n_rows(dropped));
 }
+
+// Owned batch storage is independent of the scanner lifetime.
+const Batch = struct { json: []u8 };
+
+fn readBatch(source: anytype, comptime validated: bool, max_rows: usize, target_bytes: usize, out: ?*?*Batch) c_int {
+    clearError();
+    const output = out orelse {
+        setError("batch output is null", .{});
+        return -1;
+    };
+    output.* = null;
+    const json = scan.batch.readJson(c_allocator, source, validated, .{ .max_rows = max_rows, .target_bytes = target_bytes }) catch |e| {
+        setError("batch failed: {s}", .{@errorName(e)});
+        return -1;
+    } orelse return 0;
+    const batch = c_allocator.create(Batch) catch {
+        c_allocator.free(json);
+        setError("out of memory allocating batch", .{});
+        return -1;
+    };
+    batch.* = .{ .json = json };
+    output.* = batch;
+    return 1;
+}
+
+pub export fn scanio_next_batch(ctx: ?*Ctx, max_rows: usize, target_bytes: usize, out: ?*?*Batch) c_int {
+    const c = ctx orelse {
+        if (out) |o| o.* = null;
+        setError("scanner is null", .{});
+        return -1;
+    };
+    return readBatch(&c.query, false, max_rows, target_bytes, out);
+}
+
+pub export fn scanio_validator_next_batch(ctx: ?*ValidatorCtx, max_rows: usize, target_bytes: usize, out: ?*?*Batch) c_int {
+    const c = ctx orelse {
+        if (out) |o| o.* = null;
+        setError("validator is null", .{});
+        return -1;
+    };
+    return readBatch(&c.validator, true, max_rows, target_bytes, out);
+}
+
+pub export fn scanio_batch_json(batch: ?*const Batch, out_len: ?*usize) ?[*]const u8 {
+    if (out_len) |n| n.* = if (batch) |b| b.json.len else 0;
+    return if (batch) |b| b.json.ptr else null;
+}
+
+pub export fn scanio_batch_free(batch: ?*Batch) void {
+    if (batch) |b| {
+        c_allocator.free(b.json);
+        c_allocator.destroy(b);
+    }
+}
+
+test "C ABI: batches own their data after scanner close" {
+    const path = "test_batch_owned.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b\n1,one\n2,two\n3,three\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+    const ctx = scanio_open(path, null).?;
+    var closed = false;
+    defer if (!closed) scanio_close(ctx);
+    var batch: ?*Batch = null;
+    try std.testing.expectEqual(@as(c_int, -1), scanio_next_batch(ctx, 0, 1024, &batch));
+    try std.testing.expect(batch == null);
+    try std.testing.expectEqual(@as(c_int, -1), scanio_next_batch(ctx, 2, 1024, null));
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next_batch(ctx, 2, 1024, &batch));
+    const first = batch.?;
+    defer scanio_batch_free(first);
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next_batch(ctx, 2, 1024, &batch));
+    const last = batch.?;
+    defer scanio_batch_free(last);
+    try std.testing.expectEqual(@as(c_int, 0), scanio_next_batch(ctx, 2, 1024, &batch));
+    try std.testing.expect(batch == null);
+    scanio_close(ctx);
+    closed = true;
+    var len: usize = 0;
+    const json = scanio_batch_json(first, &len).?;
+    try std.testing.expectEqualStrings("[[\"1\",\"one\"],[\"2\",\"two\"]]", json[0..len]);
+    const tail = scanio_batch_json(last, &len).?;
+    try std.testing.expectEqualStrings("[[\"3\",\"three\"]]", tail[0..len]);
+    scanio_batch_free(null);
+}
+
+test "C ABI: validation batches preserve totals and errors" {
+    const path = "test_batch_validation.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a\n1\nbad\n3\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+    const ctx = scanio_validator_open(path, "{\"a\":{\"type\":\"integer\"}}").?;
+    defer scanio_validator_close(ctx);
+    var batch: ?*Batch = null;
+    try std.testing.expectEqual(@as(c_int, 1), scanio_validator_next_batch(ctx, 8192, 1024, &batch));
+    defer scanio_batch_free(batch);
+    try std.testing.expectEqual(@as(u64, 3), scanio_validator_rows_total(ctx));
+    try std.testing.expectEqual(@as(u64, 1), scanio_validator_rows_invalid(ctx));
+    var len: usize = 0;
+    const json = scanio_batch_json(batch, &len).?;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json[0..len], .{});
+    defer parsed.deinit();
+    const errors = parsed.value.array.items[1].object.get("errors").?.array.items;
+    try std.testing.expectEqualStrings("bad_type", errors[0].object.get("rule").?.string);
+    try std.testing.expectEqual(@as(i64, 2), errors[0].object.get("row").?.integer);
+}

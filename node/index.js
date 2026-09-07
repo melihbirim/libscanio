@@ -366,4 +366,48 @@ async function inferSchema(filePath, options = {}) {
   return out;
 }
 
-module.exports = { scan, scanArray, schema, count, aggregate, topk, orderBy, profile, describe, validate, validateIter, inferSchema, ScanError };
+function checkBatchOptions(batchSize, targetBytes) {
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 65536)
+    throw new RangeError('batchSize must be an integer in 1..65536');
+  if (!Number.isInteger(targetBytes) || targetBytes < 1 || targetBytes > 0x7fffffff)
+    throw new RangeError('targetBytes must be an integer in 1..2147483647');
+}
+
+/** Yield owned batches; byte target may be exceeded by one complete row.
+ * asObjects:false yields arrays. Early break closes the native handle.
+ * A malformed row fails its entire batch, with no partial batch yielded.
+ */
+async function* scanBatches(filePath, options = {}) {
+  const { columns, where, limit, negate = false, batchSize = 1024,
+    targetBytes = 1048576, asObjects = true } = options;
+  checkBatchOptions(batchSize, targetBytes);
+  const { handle, namesJson } = call(addon().openScan, filePath, where ?? null,
+    columns ? JSON.stringify(columns) : null, limit ?? -1, negate);
+  try {
+    const names = JSON.parse(namesJson);
+    let json;
+    while ((json = call(addon().nextBatchJson, handle, batchSize, targetBytes)) !== null) {
+      const rows = JSON.parse(json);
+      yield asObjects ? rows.map(row => zipRow(names, row)) : rows;
+    }
+  } finally { addon().closeScan(handle); }
+}
+
+/** Yield batches of the same {number,row,errors} items as validateIter().
+ * asObjects:false returns array rows. Batch ownership/errors match scanBatches.
+ */
+async function* validateBatches(filePath, schema, options = {}) {
+  const { batchSize = 1024, targetBytes = 1048576, asObjects = true } = options;
+  checkBatchOptions(batchSize, targetBytes);
+  const { handle, namesJson } = call(addon().openValidator, filePath, JSON.stringify(schema));
+  try {
+    const names = JSON.parse(namesJson);
+    let json;
+    while ((json = call(addon().validatorBatchJson, handle, batchSize, targetBytes)) !== null) {
+      yield JSON.parse(json).map(item => ({number: item.number,
+        row: asObjects ? zipRow(names, item.values) : item.values, errors: item.errors ?? []}));
+    }
+  } finally { addon().closeValidator(handle); }
+}
+
+module.exports = { scanBatches, validateBatches, scan, scanArray, schema, count, aggregate, topk, orderBy, profile, describe, validate, validateIter, inferSchema, ScanError };

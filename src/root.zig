@@ -91,6 +91,7 @@ const validate_mod = @import("validate.zig");
 // directory under fixed names.
 test {
     _ = @import("input_limits.zig");
+    _ = @import("batch.zig");
     _ = @import("input_limits_test.zig");
     _ = validate_mod;
 }
@@ -108,6 +109,7 @@ pub const parseSchema = validate_mod.parseSchema;
 pub const validate = validate_mod.validate;
 pub const writeReportJson = validate_mod.writeReportJson;
 pub const writeRowErrorsJson = validate_mod.writeRowErrorsJson;
+pub const batch = @import("batch.zig");
 
 const aggregate_mod = @import("aggregate.zig");
 pub const AggResult = aggregate_mod.AggResult;

@@ -31,7 +31,7 @@ import datetime
 
 from ._loader import CAgg, COptions, CPredicate, load
 
-__all__ = ["scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
+__all__ = ["scan_batches", "validate_batches", "scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
@@ -1152,3 +1152,73 @@ def infer_schema(path: str, sample_size: int = 1000, required: bool = False) -> 
             rule["required"] = True
         out[col["column"]] = rule
     return out
+
+
+def _check_batch_options(batch_size, target_bytes):
+    if type(batch_size) is not int or not 1 <= batch_size <= 65536:
+        raise ValueError("batch_size must be an integer in 1..65536")
+    if type(target_bytes) is not int or not 1 <= target_bytes <= 0x7fffffff:
+        raise ValueError("target_bytes must be an integer in 1..2147483647")
+
+
+def _read_batches(lib, ctx, next_batch, batch_size, target_bytes):
+    import json
+    while True:
+        handle = ctypes.c_void_p()
+        rc = next_batch(ctx, batch_size, target_bytes, ctypes.byref(handle))
+        if rc == 0:
+            return
+        if rc < 0:
+            _raise_last_error(lib, "batch failed")
+        try:
+            length = ctypes.c_size_t()
+            ptr = lib.scanio_batch_json(handle, ctypes.byref(length))
+            # Explicit UTF-8 keeps the same decoding contract as scan().
+            rows = json.loads(ctypes.string_at(ptr, length.value).decode("utf-8"))
+        finally:
+            lib.scanio_batch_free(handle)
+        yield rows
+
+
+def scan_batches(path, columns=None, where=None, limit=None, negate=False, *,
+                 batch_size=1024, target_bytes=1024 * 1024, as_dict=True):
+    """Yield lists of rows using one native call per batch.
+
+    Rows are dictionaries by default, or tuples with as_dict=False.
+    Filtering/projection/limit/negate match scan(). The byte target is
+    checked after each serialized row, so one row may exceed it. Returned
+    batches own their Python data. Close the generator on early exit.
+    A malformed row fails its entire batch; preceding batches remain valid.
+    """
+    _check_batch_options(batch_size, target_bytes)
+    lib = load()
+    ctx, names, keepalive = _open_full(lib, path, columns, where, limit, negate)
+    try:
+        for rows in _read_batches(lib, ctx, lib.scanio_next_batch, batch_size, target_bytes):
+            yield [_zip_row(names, row) for row in rows] if as_dict else [tuple(row) for row in rows]
+    finally:
+        lib.scanio_close(ctx)
+
+
+def validate_batches(path, schema, *, batch_size=1024, target_bytes=1024 * 1024,
+                     as_dict=True):
+    """Yield batches of (row, errors) pairs, matching validate_iter().
+
+    as_dict=False returns tuple rows. Batch sizing, ownership, early-close,
+    and malformed-row behavior match scan_batches(). Every failure is kept
+    within its batch; there is no report-style max_errors truncation.
+    """
+    import json
+    _check_batch_options(batch_size, target_bytes)
+    lib = load()
+    ctx = lib.scanio_validator_open(path.encode(), json.dumps(schema).encode())
+    if not ctx:
+        _raise_last_error(lib, "validate failed")
+    try:
+        names = [lib.scanio_validator_column_name(ctx, i).decode()
+                 for i in range(lib.scanio_validator_n_columns(ctx))]
+        for rows in _read_batches(lib, ctx, lib.scanio_validator_next_batch, batch_size, target_bytes):
+            yield [(_zip_row(names, row["values"]) if as_dict else tuple(row["values"]),
+                    _validation_errors(row.get("errors", []))) for row in rows]
+    finally:
+        lib.scanio_validator_close(ctx)

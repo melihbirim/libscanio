@@ -157,12 +157,20 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY" \
             --json bench-results.json
 
+      - name: Batch API benchmark smoke (gate on correctness)
+        shell: bash
+        run: |
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" bench/batches.py --rows 2000 --reps 1 --json batch-results.json
+
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bench-results-${{ matrix.os }}
-          path: bench-results.json
+          path: |
+            bench-results.json
+            batch-results.json
           if-no-files-found: ignore
 
       - name: Cross-client differential test

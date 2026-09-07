@@ -191,6 +191,11 @@ doesn't drown the report. A schema key that names no real column, or a
 misspelled rule name, raises: a rule that silently does not run is worse
 than a call that fails.
 
+For bulk row consumption, use `scan_batches()` / `validate_batches()` in
+Python or `scanBatches()` / `validateBatches()` in Node. They return owned
+batches, defaulting to 1,024 rows, with optional tuple/array output. See
+[batch APIs and benchmarks](docs/BATCHING.md).
+
 **Both halves in one pass.** `validate()` gives you the summary;
 `validate_iter()` gives you each row *with its failures attached*, which
 is what an actual import wants — the good rows go to the target table

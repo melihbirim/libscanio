@@ -248,3 +248,13 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
 
     lib.scanio_last_error.argtypes = []
     lib.scanio_last_error.restype = ctypes.c_char_p
+
+    for name in ("scanio_next_batch", "scanio_validator_next_batch"):
+        fn = getattr(lib, name)
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+                       ctypes.POINTER(ctypes.c_void_p)]
+        fn.restype = ctypes.c_int
+    lib.scanio_batch_json.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+    lib.scanio_batch_json.restype = ctypes.c_void_p
+    lib.scanio_batch_free.argtypes = [ctypes.c_void_p]
+    lib.scanio_batch_free.restype = None

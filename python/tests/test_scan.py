@@ -590,5 +590,55 @@ try:
 finally:
     os.unlink(NEG_R)
 
+
+# Batch transport: compare complete values/errors, not only row counts.
+import tempfile
+import json
+with tempfile.TemporaryDirectory() as batch_tmp:
+    for fmt in ("csv", "ndjson", "json"):
+        bp = os.path.join(batch_tmp, "rows." + fmt)
+        records = [{"a": "1", "b": "Zürich"}, {"a": "bad", "b": 'quote"'},
+                   {"a": "3", "b": "tail"}, {"a": "4", "b": "last"}]
+        with open(bp, "w", encoding="utf-8", newline="") as f:
+            if fmt == "csv":
+                import csv
+                writer = csv.writer(f); writer.writerow(["a", "b"])
+                writer.writerows([r["a"], r["b"]] for r in records)
+            elif fmt == "ndjson":
+                f.write("\n".join(json.dumps(r) for r in records))
+            else:
+                json.dump(records, f)
+        rules = {"a": {"type": "integer", "min": 2}}
+        expected = list(libscanio.scan(bp))
+        errors = list(libscanio.validate_iter(bp, rules))
+        for size in (1, 2, 3, 8192):
+            batches = list(libscanio.scan_batches(bp, batch_size=size))
+            check(f"{fmt} batches {size}: values/order/retention", [r for b in batches for r in b], expected)
+            check(f"{fmt} batches {size}: size bound", all(0 < len(b) <= size for b in batches), True)
+            check(f"{fmt} validation batches {size}: full errors",
+                  [r for b in libscanio.validate_batches(bp, rules, batch_size=size) for r in b], errors)
+        check(f"{fmt} batches: projection/filter/limit/negate",
+              [r for b in libscanio.scan_batches(bp, columns=["b"], where="a = 1", negate=True, limit=2) for r in b],
+              list(libscanio.scan(bp, columns=["b"], where="a = 1", negate=True, limit=2)))
+        check(f"{fmt} batches: byte target", [len(b) for b in libscanio.scan_batches(bp, target_bytes=1)], [1]*4)
+        check(f"{fmt} batches: tuple output", [r for b in libscanio.scan_batches(bp, as_dict=False) for r in b],
+              [tuple(r.values()) for r in expected])
+        check(f"{fmt} batches: empty selection", list(libscanio.scan_batches(bp, where="a = absent")), [])
+        for _ in range(10):
+            it = libscanio.validate_batches(bp, rules, batch_size=1)
+            next(it); it.close()
+        for kwargs in ({"batch_size": 0}, {"batch_size": 65537}, {"batch_size": True}, {"target_bytes": 0}):
+            check_raises(f"{fmt} invalid batch options {kwargs}", lambda kw=kwargs: list(libscanio.scan_batches(bp, **kw)), ValueError)
+    bp = os.path.join(batch_tmp, "ragged.csv")
+    with open(bp, "w") as f: f.write("a,b\n1,2,extra\n3\n")
+    check("batches: ragged rows", [r for b in libscanio.scan_batches(bp) for r in b], list(libscanio.scan(bp)))
+    check("validation batches: ragged errors", [r for b in libscanio.validate_batches(bp, {}) for r in b], list(libscanio.validate_iter(bp, {})))
+    with open(bp, "w") as f: f.write('a,b\n1,good\n2,"unterminated\n')
+    it = libscanio.scan_batches(bp, batch_size=1)
+    check("batches: valid batch before malformed row", next(it), [{"a":"1", "b":"good"}])
+    check_raises("batches: malformed row raises", lambda: next(it))
+    with open(bp, "w") as f: f.write('a,b\n1,nul\x00tail\n')
+    check("batches: embedded NUL preserved", next(libscanio.scan_batches(bp))[0]["b"], "nul\x00tail")
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

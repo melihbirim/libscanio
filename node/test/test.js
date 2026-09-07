@@ -479,6 +479,44 @@ async function main() {
     fs.unlinkSync(negRagged);
   }
 
+
+  const batchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scanio-batches-'));
+  try {
+    for (const format of ['csv', 'ndjson', 'json']) {
+      const bp = path.join(batchDir, 'rows.' + format);
+      const records = [{a:'1',b:'Zürich'}, {a:'bad',b:'quote"'}, {a:'3',b:'tail'}, {a:'4',b:'last'}];
+      fs.writeFileSync(bp, format === 'csv' ? 'a,b\n1,Zürich\nbad,"quote"""\n3,tail\n4,last\n' :
+        format === 'json' ? JSON.stringify(records) : records.map(r => JSON.stringify(r)).join('\n'));
+      const rules = {a:{type:'integer',min:2}};
+      const expected = await collect(libscanio.scan(bp));
+      const errors = await collect(libscanio.validateIter(bp, rules));
+      for (const batchSize of [1,2,3,8192]) {
+        const batches = await collect(libscanio.scanBatches(bp, {batchSize}));
+        check(`${format} batches ${batchSize}: order/retention`, batches.flat(), expected);
+        check(`${format} batches ${batchSize}: size bound`, batches.every(b => b.length > 0 && b.length <= batchSize), true);
+        check(`${format} validation batches ${batchSize}: errors`,
+          (await collect(libscanio.validateBatches(bp, rules, {batchSize}))).flat(), errors);
+      }
+      const opts = {columns:['b'],where:'a = 1',negate:true,limit:2};
+      check(`${format} batches: query options`, (await collect(libscanio.scanBatches(bp, opts))).flat(), await collect(libscanio.scan(bp, opts)));
+      check(`${format} batches: byte target`, (await collect(libscanio.scanBatches(bp, {targetBytes:1}))).map(b => b.length), [1,1,1,1]);
+      check(`${format} batches: arrays`, (await collect(libscanio.scanBatches(bp, {asObjects:false}))).flat(), records.map(r => Object.values(r)));
+      for (let i=0;i<10;i++) { for await (const b of libscanio.validateBatches(bp, rules, {batchSize:1})) { break; } }
+      for (const options of [{batchSize:0},{batchSize:65537},{batchSize:1.5},{targetBytes:0}]) {
+        await assert.rejects(() => collect(libscanio.scanBatches(bp, options)), RangeError);
+      }
+    }
+    const bp = path.join(batchDir, 'ragged.csv');
+    fs.writeFileSync(bp, 'a,b\n1,2,extra\n3\n');
+    check('batches: ragged rows', (await collect(libscanio.scanBatches(bp))).flat(), await collect(libscanio.scan(bp)));
+    check('batches: ragged validation', (await collect(libscanio.validateBatches(bp, {}))).flat(), await collect(libscanio.validateIter(bp, {})));
+    fs.writeFileSync(bp, 'a,b\n1,ok\n2,"unterminated\n');
+    await checkRaises('batches: malformed row', () => collect(libscanio.scanBatches(bp)));
+    await checkRaises('validation batches: malformed row', () => collect(libscanio.validateBatches(bp, {})));
+    fs.writeFileSync(bp, 'a,b\n1,nul\x00tail\n');
+    check('batches: NUL', (await collect(libscanio.scanBatches(bp)))[0][0].b, 'nul\x00tail');
+  } finally { fs.rmSync(batchDir, {recursive:true,force:true}); }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }
