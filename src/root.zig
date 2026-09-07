@@ -40,8 +40,12 @@ pub const csv_fields = csv;
 /// its run-to-run variance.
 const CHUNK_SIZE = 256 * 1024;
 pub const default_chunk_size = CHUNK_SIZE;
+pub const InputLimits = @import("input_limits.zig").InputLimits;
+pub const InputLimitError = @import("input_limits.zig").LimitError;
 
 pub const ScannerOptions = struct {
+    /// Opt-in protection; use InputLimits.recommended for bounded records.
+    limits: InputLimits = InputLimits.unlimited,
     delimiter: u8 = ',',
     chunk_size: usize = CHUNK_SIZE,
     /// If set, splitInto() stops once it has captured field index
@@ -54,7 +58,8 @@ pub const ScannerOptions = struct {
     /// it is always safe, never a behavior change from the caller's
     /// perspective. Rows with FEWER fields than this still return
     /// correctly (the line-end check still applies); this only lets a
-    /// WIDE row's unneeded tail go unscanned.
+    /// WIDE row's unneeded tail go unscanned. With max_fields enabled,
+    /// the tail is scanned to enforce the limit but is not returned.
     stop_after_column: ?usize = null,
 };
 
@@ -67,6 +72,7 @@ pub const parseNumeric = query_mod.parseNumeric;
 
 const ndjson_mod = @import("ndjson.zig");
 pub const NdjsonScanner = ndjson_mod.NdjsonScanner;
+pub const NdjsonScannerOptions = ndjson_mod.ScannerOptions;
 pub const NdjsonError = ndjson_mod.NdjsonError;
 
 // Vendored from zson (github.com/melihbirim/zson, MIT, same author) —
@@ -84,6 +90,8 @@ const validate_mod = @import("validate.zig");
 // with this one, and those write fixture files into the working
 // directory under fixed names.
 test {
+    _ = @import("input_limits.zig");
+    _ = @import("input_limits_test.zig");
     _ = validate_mod;
 }
 pub const Schema = validate_mod.Schema;
@@ -152,6 +160,9 @@ pub const ScanError = error{
 };
 
 pub const Scanner = struct {
+    limits: InputLimits = InputLimits.unlimited,
+    /// A limit failure is terminal: retrying cannot skip the rejected row.
+    limit_failure: ?InputLimitError = null,
     allocator: Allocator,
     file: std.fs.File,
     buf: []u8,
@@ -184,6 +195,7 @@ pub const Scanner = struct {
     }
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, options: ScannerOptions) !Scanner {
+        if (options.chunk_size == 0) return error.InvalidChunkSize;
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
         const size = (try file.stat()).size;
@@ -193,6 +205,7 @@ pub const Scanner = struct {
         errdefer allocator.free(buf);
 
         var scanner = Scanner{
+            .limits = options.limits,
             .allocator = allocator,
             .file = file,
             .buf = buf,
@@ -245,6 +258,17 @@ pub const Scanner = struct {
     /// slice is only valid until the next call to next() — it's a reused
     /// scratch buffer, not a fresh allocation per row.
     pub fn next(self: *Scanner) !?Row {
+        if (self.limit_failure) |err| return err;
+        return self.nextChecked() catch |err| {
+            switch (err) {
+                error.RecordTooLarge, error.TooManyFields => self.limit_failure = @errorCast(err),
+                else => {},
+            }
+            return err;
+        };
+    }
+
+    fn nextChecked(self: *Scanner) !?Row {
         const line = (try self.nextLine()) orelse return null;
         const n = try self.splitInto(line);
         return Row{ .fields = self.field_buf[0..n] };
@@ -260,6 +284,12 @@ pub const Scanner = struct {
     /// operation — over 2x slower for pure byte comparison, nothing
     /// CSV-specific about the cost. See simd_count.zig's doc comment.
     pub fn countRemaining(self: *Scanner) !usize {
+        if (self.limit_failure) |err| return err;
+        if (self.limits.enabled()) {
+            var count: usize = 0;
+            while (try self.next()) |_| count += 1;
+            return count;
+        }
         var n: usize = 0;
         var last_byte: ?u8 = null;
         while (true) {
@@ -307,6 +337,7 @@ pub const Scanner = struct {
                 if (std.mem.indexOfScalar(u8, self.buf[self.buf_pos..self.buf_len], '\n')) |rel| {
                     const abs_end = self.buf_pos + rel;
                     const chunk_part = self.buf[self.buf_pos..abs_end];
+                    try self.limits.checkRecord(self.line_scratch.items.len, chunk_part.len);
                     self.buf_pos = abs_end + 1;
                     if (self.line_scratch.items.len == 0) {
                         return trimCR(chunk_part);
@@ -314,6 +345,7 @@ pub const Scanner = struct {
                     try self.line_scratch.appendSlice(self.allocator, chunk_part);
                     return trimCR(self.line_scratch.items);
                 }
+                try self.limits.checkRecord(self.line_scratch.items.len, self.buf_len - self.buf_pos);
                 try self.line_scratch.appendSlice(self.allocator, self.buf[self.buf_pos..self.buf_len]);
                 self.buf_pos = self.buf_len;
             }
@@ -336,7 +368,7 @@ pub const Scanner = struct {
     /// worth revisiting for schemas with long text fields.
     fn splitInto(self: *Scanner, line: []const u8) !usize {
         var count: usize = 0;
-        var it = try csv.FieldIterator.init(self.allocator, line, self.delimiter, &self.quote_scratch);
+        var it = try csv.FieldIterator.initWithLimits(self.allocator, line, self.delimiter, &self.quote_scratch, self.limits);
         while (try it.next()) |field| {
             try self.ensureFieldCapacity(count + 1);
             self.field_buf[count] = field;
@@ -346,7 +378,12 @@ pub const Scanner = struct {
             // the rest of the line's bytes entirely, not just skip storing
             // them.
             if (self.stop_after_column) |stop| {
-                if (count == stop + 1) return count;
+                if (count - 1 == stop) {
+                    // A projection cannot hide an over-wide row. The
+                    // iterator checks before unescaping each extra field.
+                    if (self.limits.max_fields != null) while (try it.next()) |_| {};
+                    return count;
+                }
             }
         }
         return count;
@@ -380,7 +417,7 @@ pub const Scanner = struct {
             for (list.items) |f| self.allocator.free(@constCast(f));
             list.deinit(self.allocator);
         }
-        var it = try csv.FieldIterator.init(self.allocator, line, self.delimiter, &self.quote_scratch);
+        var it = try csv.FieldIterator.initWithLimits(self.allocator, line, self.delimiter, &self.quote_scratch, self.limits);
         while (try it.next()) |field| {
             // Two allocations, so the copy needs its own errdefer: if the
             // append is the one that fails, the copy is not in the list

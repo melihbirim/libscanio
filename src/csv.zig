@@ -31,8 +31,9 @@
 //! cannot represent, instead of silently wrong fields.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const InputLimits = @import("input_limits.zig").InputLimits;
 
-pub const SplitError = error{UnterminatedQuote} || Allocator.Error;
+pub const SplitError = error{UnterminatedQuote} || Allocator.Error || @import("input_limits.zig").LimitError;
 
 /// Walks the fields of one CSV record.
 ///
@@ -47,6 +48,8 @@ pub const SplitError = error{UnterminatedQuote} || Allocator.Error;
 /// also means a line with no `""` in it — every line, in every file
 /// anyone has benchmarked — does not allocate at all.
 pub const FieldIterator = struct {
+    limits: InputLimits = InputLimits.unlimited,
+    fields_read: usize = 0,
     line: []const u8,
     delimiter: u8,
     allocator: Allocator,
@@ -60,8 +63,19 @@ pub const FieldIterator = struct {
         delimiter: u8,
         scratch: *std.ArrayListUnmanaged(u8),
     ) SplitError!FieldIterator {
+        return initWithLimits(allocator, line, delimiter, scratch, InputLimits.unlimited);
+    }
+
+    pub fn initWithLimits(
+        allocator: Allocator,
+        line: []const u8,
+        delimiter: u8,
+        scratch: *std.ArrayListUnmanaged(u8),
+        limits: InputLimits,
+    ) SplitError!FieldIterator {
+        try limits.checkRecord(0, line.len);
         scratch.clearRetainingCapacity();
-        return .{ .line = line, .delimiter = delimiter, .allocator = allocator, .scratch = scratch };
+        return .{ .line = line, .delimiter = delimiter, .allocator = allocator, .scratch = scratch, .limits = limits };
     }
 
     /// Inline on purpose: this is the per-field hot loop of every CSV
@@ -69,6 +83,8 @@ pub const FieldIterator = struct {
     /// call away.
     pub inline fn next(self: *FieldIterator) SplitError!?[]const u8 {
         if (self.done) return null;
+        try self.limits.checkField(self.fields_read);
+        self.fields_read += 1;
         const line = self.line;
         const start = self.pos;
 

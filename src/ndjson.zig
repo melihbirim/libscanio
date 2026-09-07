@@ -84,6 +84,13 @@ const Row = scan.Row;
 const json_parser = @import("json_parser.zig");
 const json_array = @import("json_array.zig");
 const simd_count = @import("simd_count.zig");
+const InputLimits = @import("input_limits.zig").InputLimits;
+const InputLimitError = @import("input_limits.zig").LimitError;
+
+pub const ScannerOptions = struct {
+    chunk_size: usize = scan.default_chunk_size,
+    limits: InputLimits = InputLimits.unlimited,
+};
 
 pub const NdjsonError = error{
     EmptyFile,
@@ -94,6 +101,8 @@ pub const NdjsonError = error{
 const Mode = enum { line_delimited, json_array };
 
 pub const NdjsonScanner = struct {
+    limits: InputLimits = InputLimits.unlimited,
+    limit_failure: ?InputLimitError = null,
     allocator: Allocator,
     file: std.fs.File,
     mode: Mode,
@@ -172,15 +181,21 @@ pub const NdjsonScanner = struct {
     }
 
     pub fn openWithChunkSize(allocator: Allocator, path: []const u8, chunk_size: usize) !NdjsonScanner {
+        return openWithOptions(allocator, path, .{ .chunk_size = chunk_size });
+    }
+
+    pub fn openWithOptions(allocator: Allocator, path: []const u8, options: ScannerOptions) !NdjsonScanner {
+        if (options.chunk_size == 0) return error.InvalidChunkSize;
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
         const size = (try file.stat()).size;
         if (size == 0) return NdjsonError.EmptyFile;
 
-        const buf = try allocator.alloc(u8, chunk_size);
+        const buf = try allocator.alloc(u8, options.chunk_size);
         errdefer allocator.free(buf);
 
         var scanner = NdjsonScanner{
+            .limits = options.limits,
             .allocator = allocator,
             .file = file,
             .mode = .line_delimited,
@@ -195,6 +210,7 @@ pub const NdjsonScanner = struct {
             .row_arena = std.heap.ArenaAllocator.init(allocator),
         };
         errdefer scanner.row_arena.deinit();
+        errdefer scanner.line_scratch.deinit(allocator);
 
         // Sniff NDJSON vs JSON array from the first non-whitespace byte —
         // needs at least one chunk loaded first.
@@ -208,6 +224,7 @@ pub const NdjsonScanner = struct {
         }
 
         const first_line = (try (if (scanner.mode == .json_array) scanner.nextObject() else scanner.nextLine())) orelse return NdjsonError.EmptyFile;
+        try scanner.limits.checkJsonFields(first_line);
         scanner.first_row_line = try allocator.dupe(u8, first_line);
         // Every path below can fail — a malformed or truncated first
         // line reaches the parseObject catch, and it used to leak this
@@ -266,6 +283,17 @@ pub const NdjsonScanner = struct {
     }
 
     pub fn next(self: *NdjsonScanner) !?Row {
+        if (self.limit_failure) |err| return err;
+        return self.nextChecked() catch |err| {
+            switch (err) {
+                error.RecordTooLarge, error.TooManyFields => self.limit_failure = @errorCast(err),
+                else => {},
+            }
+            return err;
+        };
+    }
+
+    fn nextChecked(self: *NdjsonScanner) !?Row {
         const line = blk: {
             if (!self.used_first_row) {
                 self.used_first_row = true;
@@ -274,6 +302,7 @@ pub const NdjsonScanner = struct {
             break :blk (if (self.mode == .json_array) (try self.nextObject()) else (try self.nextLine())) orelse return null;
         };
 
+        try self.limits.checkJsonFields(line);
         try self.ensureCapacity(self.header.len);
 
         // Fused fast path: matches CSV's own approach (byte-scan straight
@@ -345,6 +374,12 @@ pub const NdjsonScanner = struct {
     /// fast path for count() with no WHERE clause — never parses a
     /// field. Same bounded-memory property as next().
     pub fn countRemaining(self: *NdjsonScanner) !usize {
+        if (self.limit_failure) |err| return err;
+        if (self.limits.enabled()) {
+            var count: usize = 0;
+            while (try self.next()) |_| count += 1;
+            return count;
+        }
         var n: usize = 0;
         if (!self.used_first_row) {
             self.used_first_row = true;
@@ -418,6 +453,7 @@ pub const NdjsonScanner = struct {
                 if (std.mem.indexOfScalar(u8, self.buf[self.buf_pos..self.buf_len], '\n')) |rel| {
                     const abs_end = self.buf_pos + rel;
                     const chunk_part = self.buf[self.buf_pos..abs_end];
+                    try self.limits.checkRecord(self.line_scratch.items.len, chunk_part.len);
                     self.buf_pos = abs_end + 1;
                     if (self.line_scratch.items.len == 0) {
                         return trimCR(chunk_part);
@@ -425,6 +461,7 @@ pub const NdjsonScanner = struct {
                     try self.line_scratch.appendSlice(self.allocator, chunk_part);
                     return trimCR(self.line_scratch.items);
                 }
+                try self.limits.checkRecord(self.line_scratch.items.len, self.buf_len - self.buf_pos);
                 try self.line_scratch.appendSlice(self.allocator, self.buf[self.buf_pos..self.buf_len]);
                 self.buf_pos = self.buf_len;
             }
@@ -488,6 +525,7 @@ pub const NdjsonScanner = struct {
                     depth -= 1;
                     if (depth == 0) {
                         const chunk_part = self.buf[obj_start..self.buf_pos];
+                        try self.limits.checkRecord(self.line_scratch.items.len, chunk_part.len);
                         if (self.line_scratch.items.len == 0) {
                             return chunk_part;
                         }
@@ -497,6 +535,7 @@ pub const NdjsonScanner = struct {
                 }
             }
             if (started) {
+                try self.limits.checkRecord(self.line_scratch.items.len, self.buf_len - obj_start);
                 try self.line_scratch.appendSlice(self.allocator, self.buf[obj_start..self.buf_len]);
             }
             if (self.eof) {

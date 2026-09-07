@@ -70,6 +70,9 @@ pub const Predicate = struct {
 };
 
 pub const QueryOptions = struct {
+    /// Serial reader limits; recommended is an opt-in protected profile.
+    /// Active limits also apply to headers, count(), and projected tails.
+    limits: scan.InputLimits = scan.InputLimits.unlimited,
     /// Column indices to keep in each returned row, in order. Null = all columns.
     columns: ?[]const usize = null,
     /// Implicitly AND-ed together. Empty = no filter.
@@ -80,10 +83,10 @@ pub const QueryOptions = struct {
     format: ?Format = null,
     /// CSV read-buffer size in bytes. Null = Scanner's default (256KB —
     /// see CHUNK_SIZE in root.zig for the measurements behind that
-    /// default). NDJSON/JSON-array files use that same default chunk
-    /// size directly (NdjsonScanner.open()) — not yet exposed through
-    /// this option; add if a real caller needs to tune it separately.
+    /// default).
     csv_chunk_size: ?usize = null,
+    /// NDJSON/JSON-array read-buffer size. Null = the same default.
+    json_chunk_size: ?usize = null,
     /// Highest column index this Query's caller will actually read —
     /// the max of every WHERE predicate's column and every projected
     /// column (plus, for aggregate()/topk()-style single-column callers,
@@ -175,11 +178,15 @@ pub const Query = struct {
         const format = options.format orelse inferFormat(path);
         const source: Source = switch (format) {
             .csv => .{ .csv = try Scanner.openWithOptions(allocator, path, .{
+                .limits = options.limits,
                 .chunk_size = options.csv_chunk_size orelse scan.default_chunk_size,
                 .stop_after_column = options.stop_after_column,
             }) },
             .ndjson => blk: {
-                var nd = try NdjsonScanner.open(allocator, path);
+                var nd = try NdjsonScanner.openWithOptions(allocator, path, .{
+                    .limits = options.limits,
+                    .chunk_size = options.json_chunk_size orelse scan.default_chunk_size,
+                });
                 nd.setStopAfterColumn(options.stop_after_column);
                 break :blk .{ .ndjson = nd };
             },
