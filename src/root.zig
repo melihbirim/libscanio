@@ -77,6 +77,30 @@ const json_parser_mod = @import("json_parser.zig");
 const json_simd_mod = @import("json_simd.zig");
 const json_array_mod = @import("json_array.zig");
 
+const validate_mod = @import("validate.zig");
+// Re-exporting its types is not enough to pull a file's test blocks into
+// this binary, and validate.zig must not get a test module of its own:
+// it would be a second binary running parallel.zig's tests concurrently
+// with this one, and those write fixture files into the working
+// directory under fixed names.
+test {
+    _ = validate_mod;
+}
+pub const Schema = validate_mod.Schema;
+pub const Rule = validate_mod.Rule;
+pub const ColumnType = validate_mod.ColumnType;
+pub const ErrorKind = validate_mod.ErrorKind;
+pub const RowError = validate_mod.RowError;
+pub const ValidatedRow = validate_mod.ValidatedRow;
+pub const Validator = validate_mod.Validator;
+pub const Report = validate_mod.Report;
+pub const ReportOptions = validate_mod.ReportOptions;
+pub const ValidateError = validate_mod.ValidateError;
+pub const parseSchema = validate_mod.parseSchema;
+pub const validate = validate_mod.validate;
+pub const writeReportJson = validate_mod.writeReportJson;
+pub const writeRowErrorsJson = validate_mod.writeRowErrorsJson;
+
 const aggregate_mod = @import("aggregate.zig");
 pub const AggResult = aggregate_mod.AggResult;
 pub const aggregate = aggregate_mod.aggregate;

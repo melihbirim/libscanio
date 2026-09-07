@@ -449,5 +449,89 @@ try:
 finally:
     os.unlink(BADQ_P)
 
+# ---------------------------------------------------------------------
+# Import validation. The rules live in Zig, so these tests are also the
+# Python client's half of the promise that Node gets the same answers —
+# tests/differential_test.py checks the two against each other directly.
+VAL_P = "_test_validate.csv"
+with open(VAL_P, "w", encoding="utf-8") as f:
+    f.write("id,name,amount,status\n")
+    f.write("1,Alice,100,new\n")
+    f.write("x,Bob,-5,bogus\n")
+    f.write("3,,20,paid\n")
+VAL_SCHEMA = {
+    "id": {"type": "integer", "required": True},
+    "name": {"required": True},
+    "amount": {"type": "float", "min": 0},
+    "status": {"one_of": ["new", "paid", "shipped"]},
+}
+try:
+    r = libscanio.validate(VAL_P, VAL_SCHEMA)
+    check("validate: row totals", (r.rows_total, r.rows_valid, r.rows_invalid), (3, 1, 2))
+    check("validate: ok is False when any row failed", r.ok, False)
+    check("validate: every failure is counted", r.errors_total, 4)
+    check("validate: counts are keyed by rule name",
+          r.counts, {"bad_type": 1, "below_min": 1, "not_in_set": 1, "missing_required": 1})
+    check("validate: an error names the row, column and offending value",
+          (r.errors[0].row, r.errors[0].column, r.errors[0].column_name,
+           r.errors[0].rule, r.errors[0].value),
+          (2, 0, "id", "bad_type", "x"))
+    check("validate: a clean run reports ok",
+          libscanio.validate(VAL_P, {"name": {}}).ok, True)
+
+    # The cap bounds what is STORED, never what is counted — the whole
+    # point is that a wholly-broken file still produces a report.
+    capped = libscanio.validate(VAL_P, {"id": {"type": "integer"}}, max_errors=0)
+    check("validate: max_errors=0 falls back to the default, not to zero errors",
+          len(capped.errors), 1)
+    r2 = libscanio.validate(VAL_P, VAL_SCHEMA, max_errors=2)
+    check("validate: max_errors caps the stored list", len(r2.errors), 2)
+    check("validate: ...but not the totals", r2.errors_total, 4)
+    check("validate: ...and says so", r2.truncated, True)
+
+    # validate_iter is the streaming half: the row AND its reasons, so an
+    # importer can write both sides in one pass.
+    seen = list(libscanio.validate_iter(VAL_P, VAL_SCHEMA))
+    check("validate_iter: yields every row, not just the bad ones", len(seen), 3)
+    check("validate_iter: a passing row carries no errors", seen[0][1], [])
+    check("validate_iter: a failing row carries the row itself",
+          seen[1][0], {"id": "x", "name": "Bob", "amount": "-5", "status": "bogus"})
+    check("validate_iter: ...and every rule it broke",
+          sorted(e.rule for e in seen[1][1]), ["bad_type", "below_min", "not_in_set"])
+    check("validate_iter: agrees with validate on which rows are clean",
+          sum(1 for _, errs in seen if not errs), r.rows_valid)
+
+    check_raises("validate: an unknown column is an error, not an unenforced rule",
+                 lambda: libscanio.validate(VAL_P, {"nope": {"required": True}}))
+    check_raises("validate: a misspelled rule name is an error too",
+                 lambda: libscanio.validate(VAL_P, {"id": {"requred": True}}))
+    check_raises("validate_iter: same, before any row is yielded",
+                 lambda: list(libscanio.validate_iter(VAL_P, {"nope": {}})))
+
+    inferred = libscanio.infer_schema(VAL_P)
+    check("infer_schema: names every column", sorted(inferred), ["amount", "id", "name", "status"])
+    check("infer_schema: types what it can, leaves the rest open",
+          inferred["amount"], {"type": "integer"})
+    check("infer_schema: required=True marks them all",
+          libscanio.infer_schema(VAL_P, required=True)["id"], {"required": True})
+    check("infer_schema: its own output validates the file it came from",
+          libscanio.validate(VAL_P, inferred).ok, True)
+finally:
+    os.unlink(VAL_P)
+
+# A blank cell is absent, not badly typed — the rule that keeps a report
+# about a sparse column readable.
+BLANK_P = "_test_validate_blank.csv"
+with open(BLANK_P, "w", encoding="utf-8") as f:
+    f.write("id,note\n1,\n2,   \n3,hello\n")
+try:
+    r = libscanio.validate(BLANK_P, {"note": {"type": "integer"}})
+    check("validate: blank cells are not type errors", r.errors_total, 1)
+    check("validate: ...only the real value is", r.errors[0].value, "hello")
+    r = libscanio.validate(BLANK_P, {"note": {"required": True}})
+    check("validate: required treats a whitespace-only cell as blank", r.errors_total, 2)
+finally:
+    os.unlink(BLANK_P)
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

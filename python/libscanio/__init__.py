@@ -31,7 +31,7 @@ import datetime
 
 from ._loader import CAgg, COptions, CPredicate, load
 
-__all__ = ["scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "ScanError"]
+__all__ = ["scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "validate", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
@@ -865,3 +865,253 @@ def describe(path: str, sample_size: int = 1000) -> list[dict]:
         non_empty = [v for v in values if v != ""]
         result.append({"column": col, "type": _infer_column_type(non_empty)})
     return result
+
+
+# ── import validation ────────────────────────────────────────────────
+
+
+class ValidationError:
+    """One failed rule, on one cell. `column` is None for a structural
+    error (`too_few_fields` / `too_many_fields`), which is about the
+    row's shape rather than any single value.
+
+    Hand-written rather than a NamedTuple or a dataclass on purpose:
+    both cost an `import typing` (15ms) or `import collections` (1.8ms)
+    at module load, and this module goes to some length to import in
+    ~3ms — see the note at the top of the file. Nothing here needs more
+    than __slots__.
+    """
+
+    __slots__ = ("row", "column", "column_name", "rule", "value")
+
+    def __init__(self, row, column, column_name, rule, value):
+        self.row = row
+        self.column = column
+        self.column_name = column_name
+        self.rule = rule
+        self.value = value
+
+    def __eq__(self, other):
+        if not isinstance(other, ValidationError):
+            return NotImplemented
+        return all(getattr(self, f) == getattr(other, f) for f in self.__slots__)
+
+    def __hash__(self):
+        return hash(tuple(getattr(self, f) for f in self.__slots__))
+
+    def __repr__(self):
+        return (
+            f"ValidationError(row={self.row}, column={self.column!r}, "
+            f"column_name={self.column_name!r}, rule={self.rule!r}, value={self.value!r})"
+        )
+
+    def as_dict(self) -> dict:
+        return {f: getattr(self, f) for f in self.__slots__}
+
+
+class ValidationReport:
+    """The result of a full pre-flight pass.
+
+    `errors` is capped at `max_errors`; `errors_total` and `counts` are
+    complete regardless, so a truncated report still tells you the true
+    scale of the problem. `truncated` says whether the cap was hit.
+    """
+
+    __slots__ = (
+        "rows_total",
+        "rows_valid",
+        "rows_invalid",
+        "errors_total",
+        "truncated",
+        "counts",
+        "errors",
+    )
+
+    def __init__(self, rows_total, rows_valid, rows_invalid, errors_total, truncated, counts, errors):
+        self.rows_total = rows_total
+        self.rows_valid = rows_valid
+        self.rows_invalid = rows_invalid
+        self.errors_total = errors_total
+        self.truncated = truncated
+        self.counts = counts
+        self.errors = errors
+
+    @property
+    def ok(self) -> bool:
+        return self.rows_invalid == 0
+
+    def __eq__(self, other):
+        if not isinstance(other, ValidationReport):
+            return NotImplemented
+        return all(getattr(self, f) == getattr(other, f) for f in self.__slots__)
+
+    def __repr__(self):
+        return (
+            f"ValidationReport(rows_total={self.rows_total}, rows_valid={self.rows_valid}, "
+            f"rows_invalid={self.rows_invalid}, errors_total={self.errors_total}, "
+            f"truncated={self.truncated}, counts={self.counts!r}, "
+            f"errors=[{len(self.errors)} shown])"
+        )
+
+    def as_dict(self) -> dict:
+        d = {f: getattr(self, f) for f in self.__slots__}
+        d["errors"] = [e.as_dict() for e in self.errors]
+        return d
+
+
+def _validation_errors(raw: list) -> list[ValidationError]:
+    return [
+        ValidationError(e["row"], e["column"], e["column_name"], e["rule"], e["value"])
+        for e in raw
+    ]
+
+
+def validate(path: str, schema: dict, max_errors: int = 100) -> ValidationReport:
+    """Check every row against `schema` in one streaming pass, and
+    report what failed.
+
+    This is the question an import asks, which is the opposite of the one
+    `scan(where=...)` answers: not "which rows do I want" but "which rows
+    can I not take, and why".
+
+        report = libscanio.validate("orders.csv", {
+            "id":     {"type": "integer", "required": True},
+            "amount": {"type": "float", "min": 0},
+            "status": {"one_of": ["new", "paid", "shipped"]},
+            "email":  {"required": True, "max_len": 255},
+        })
+        if not report.ok:
+            for e in report.errors:
+                print(f"row {e.row}, {e.column_name}: {e.rule} ({e.value!r})")
+
+    Rule keys: `type` (any/integer/float/boolean/datetime/string),
+    `required`, `min`, `max`, `min_len`, `max_len`, `one_of`. Lengths
+    count characters, not bytes. A blank cell is *absent*, not badly
+    typed — only `required` has anything to say about it.
+
+    Every schema key must name a real column and every rule name must be
+    spelled correctly; both raise, because a rule that silently does not
+    run is worse than a call that fails.
+
+    Memory is bounded: rows stream, and only the first `max_errors`
+    errors are stored (all of them are counted).
+
+    Raises:
+        ScanError: file not found, unknown column, or malformed schema.
+    """
+    import json  # deferred: see the module-header note on import cost
+
+    lib = load()
+    handle = lib.scanio_validate(
+        path.encode(), json.dumps(schema).encode(), max_errors
+    )
+    if not handle:
+        _raise_last_error(lib, "validate failed")
+    try:
+        raw = json.loads(lib.scanio_validate_json(handle).decode())
+    finally:
+        lib.scanio_validate_free(handle)
+
+    return ValidationReport(
+        rows_total=raw["rows_total"],
+        rows_valid=raw["rows_valid"],
+        rows_invalid=raw["rows_invalid"],
+        errors_total=raw["errors_total"],
+        truncated=raw["truncated"],
+        counts=raw["counts"],
+        errors=_validation_errors(raw["errors"]),
+    )
+
+
+def validate_iter(
+    path: str, schema: dict
+) -> Iterator[tuple[dict[str, str], list[ValidationError]]]:
+    """Stream every row with its failures attached, as
+    `(row, errors)` — `errors` is empty for a row that passed.
+
+    This is the shape an actual import wants, and the reason `validate()`
+    does not return two lists: the good rows go to the target table and
+    the bad ones to a rejects file in the SAME pass, so neither side is
+    ever materialized and memory stays flat no matter how big the file
+    or how broken it is.
+
+        with open("rejects.csv", "w") as rejects:
+            for row, errors in libscanio.validate_iter("orders.csv", schema):
+                if errors:
+                    rejects.write(f"{row['id']},{errors[0].rule}\\n")
+                else:
+                    load(row)
+
+    Raises:
+        ScanError: file not found, unknown column, or malformed schema.
+    """
+    import json  # deferred: see the module-header note on import cost
+
+    lib = load()
+    ctx = lib.scanio_validator_open(path.encode(), json.dumps(schema).encode())
+    if not ctx:
+        _raise_last_error(lib, "validate failed")
+    try:
+        names = [
+            lib.scanio_validator_column_name(ctx, i).decode()
+            for i in range(lib.scanio_validator_n_columns(ctx))
+        ]
+    except Exception:
+        lib.scanio_validator_close(ctx)
+        raise
+    try:
+        fields = ctypes.POINTER(ctypes.c_char_p)()
+        n = ctypes.c_size_t()
+        errors_json = ctypes.c_char_p()
+        row_no = ctypes.c_uint64()
+        while True:
+            rc = lib.scanio_validator_next(
+                ctx,
+                ctypes.byref(fields),
+                ctypes.byref(n),
+                ctypes.byref(errors_json),
+                ctypes.byref(row_no),
+            )
+            if rc == 0:
+                return
+            if rc < 0:
+                _raise_last_error(lib, "validate failed")
+            row = _zip_row(names, [fields[i].decode() for i in range(n.value)])
+            # NULL for a clean row: no JSON is built for it on either
+            # side of the boundary, which is what keeps the common case
+            # as cheap as a plain scan.
+            errors = (
+                _validation_errors(json.loads(errors_json.value.decode()))
+                if errors_json.value
+                else []
+            )
+            yield row, errors
+    finally:
+        lib.scanio_validator_close(ctx)
+
+
+def infer_schema(path: str, sample_size: int = 1000, required: bool = False) -> dict:
+    """Draft a schema from what the file already looks like, using
+    `describe()`'s sampled type inference.
+
+    A starting point to edit, not a schema to trust: it can only describe
+    the file it read, so a column that is 100% integers in the sample
+    becomes `{"type": "integer"}` even if the real rule is narrower — and
+    a file that is entirely wrong will infer a schema it passes cleanly.
+    Print it, fix it, then pass it to `validate()`.
+
+    `required=True` marks every column required, which is usually closer
+    to a real import's intent than the default of marking none.
+    """
+    out: dict = {}
+    for col in describe(path, sample_size=sample_size):
+        rule: dict = {}
+        # "empty" means the sample had no values at all — inferring a
+        # type from nothing would be a guess, so only the presence rule
+        # (if asked for) survives.
+        if col["type"] not in ("string", "empty"):
+            rule["type"] = col["type"]
+        if required:
+            rule["required"] = True
+        out[col["column"]] = rule
+    return out

@@ -8,7 +8,7 @@ CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project, limit, 
 
 ## Status
 
-CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, single-column ORDER BY, per-column type inference (`describe()`), a bounded-memory parallel scan/count/filtered-scan path (`scan_table()` uses 2.3-2.8x less memory than `pyarrow` under N-way concurrent load, the real Python-API-level comparison — see ROADMAP.md), zero-copy Arrow output (`scan_table()`, Python), a C ABI, Python and [Node](node/) bindings, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No group-by, multi-column ORDER BY, or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
+CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, single-column ORDER BY, per-column type inference (`describe()`), schema validation for imports (`validate()`/`validate_iter()`), a bounded-memory parallel scan/count/filtered-scan path (`scan_table()` uses 2.3-2.8x less memory than `pyarrow` under N-way concurrent load, the real Python-API-level comparison — see ROADMAP.md), zero-copy Arrow output (`scan_table()`, Python), a C ABI, Python and [Node](node/) bindings, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No group-by, multi-column ORDER BY, or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
 
 **CSV quoting: RFC 4180, minus multi-line records.** A field whose first
 byte is `"` is a quoted field: the delimiter inside it is data
@@ -109,6 +109,105 @@ while (scanio_next(s, &fields, &n) == 1) {
 }
 scanio_close(s);
 ```
+
+## Validating an import
+
+CSV files usually arrive to be *loaded*, not queried, and the question a
+loader asks is the opposite of the one a `where` clause answers: not
+"which rows do I want" but "which rows can I not take, and why". That
+needs a reason, per cell, that you can put in front of a human.
+
+```python
+import libscanio
+
+schema = {
+    "id":     {"type": "integer", "required": True},
+    "email":  {"required": True, "max_len": 255},
+    "amount": {"type": "float", "min": 0},
+    "status": {"one_of": ["new", "paid", "shipped"]},
+}
+
+report = libscanio.validate("orders.csv", schema)
+print(f"{report.rows_valid:,} of {report.rows_total:,} rows loadable")
+for e in report.errors:
+    print(f"  row {e.row}, {e.column_name}: {e.rule} ({e.value!r})")
+```
+
+```
+199,997 of 200,000 rows loadable
+  row 41, email: missing_required ('')
+  row 118, amount: below_min ('-5')
+  row 2207, status: not_in_set ('refunded')
+```
+
+Rule keys: `type` (`any`/`integer`/`float`/`boolean`/`datetime`/`string`),
+`required`, `min`, `max`, `min_len`, `max_len`, `one_of`. Lengths count
+characters, not bytes. A blank cell is *absent*, not badly typed — only
+`required` has anything to say about it, so a sparse optional column
+doesn't drown the report. A schema key that names no real column, or a
+misspelled rule name, raises: a rule that silently does not run is worse
+than a call that fails.
+
+**Both halves in one pass.** `validate()` gives you the summary;
+`validate_iter()` gives you each row *with its failures attached*, which
+is what an actual import wants — the good rows go to the target table
+and the bad ones to a rejects file without either side being
+materialized:
+
+```python
+with open("rejects.csv", "w") as rejects:
+    for row, errors in libscanio.validate_iter("orders.csv", schema):
+        if errors:
+            rejects.write(f"{row['id']},{errors[0].rule}\n")
+        else:
+            load(row)
+```
+
+Same thing from Node (`validate` / `validateIter` / `inferSchema`) and
+from the CLI, where report mode doubles as a shell gate:
+
+```bash
+scanio orders.csv --validate schema.json            # JSON report; exit 1 if any row failed
+scanio orders.csv --validate schema.json --valid    # ...or stream just the rows that passed
+scanio orders.csv --validate schema.json --invalid  # ...or just the ones that didn't
+```
+
+Don't have a schema yet? `infer_schema(path)` drafts one from the file's
+own shape (via `describe()`'s sampling) for you to edit. It is a starting
+point, not a schema to trust: it can only describe the file it read, so a
+file that is entirely wrong infers a schema it passes cleanly.
+
+The rules are evaluated in Zig, not in each binding, so Python, Node and
+the CLI cannot drift into three different answers about whether a cell is
+an integer — `zig build diff-test` asserts all three against an
+independent oracle on every run.
+
+**Measured**, on a 126MB / 3M-row / 10-column CSV with four rules across
+four columns (same machine and method as
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md)):
+
+| | median | throughput | peak RSS |
+|---|---|---|---|
+| `scanio --validate` (report) | 0.49s | 257 MB/s | **10.1MB** |
+| `libscanio.validate()` (Python) | 0.48s | 263 MB/s | 10.9MB |
+| `libscanio.validate()` (Node) | 0.50s | 253 MB/s | 46.1MB (V8 floor) |
+| hand-written Python `csv` loop, same four rules | 4.37s | 29 MB/s | 10.1MB |
+
+For reference on the same file: a plain `--count` is 0.02s (it never
+splits a field) and a full scan that splits every field is 0.27s — so the
+four rules cost about as much again as the parse they run on, and the
+whole thing stays within a rounding error of a scan's memory. The
+per-row streaming forms (`validate_iter()` / `validateIter()`) cost
+11.4s and 7.8s respectively, because there the per-row crossing into
+Python or JavaScript dominates — `scan()` alone over the same file is
+9.0s. Use the report when you want the summary; use the streaming form
+when you actually need the rows.
+
+What's deliberately absent: uniqueness ("no duplicate ids") and
+referential checks. Both need state proportional to the file — a set of
+every value seen — which is the one thing this library promises not to
+build. They belong in the database doing the import, which already has
+the index.
 
 ## Build
 

@@ -731,85 +731,118 @@ const ScanHandle = struct {
     /// closeScan() came in while in_use — the in-flight nextRowJson()
     /// destroys the handle on its way out instead.
     close_requested: bool = false,
+
+    /// Frees everything this handle owns, including itself. Never call
+    /// it on a handle still reachable through the registry.
+    fn destroy(self: *ScanHandle) void {
+        self.query.deinit();
+        freeHeader(c_allocator, self.header);
+        if (self.predicates.len > 0) freePredicates(c_allocator, self.predicates);
+        if (self.columns) |c| c_allocator.free(c);
+        c_allocator.destroy(self);
+    }
 };
 
-/// Registry of open scan handles, keyed by a small monotonic ID — NOT
-/// the raw pointer address. A raw pointer exposed to JS as a plain
-/// number is an arbitrary-memory-dereference risk the moment a caller
-/// passes a stale, garbage, or off-by-one handle value: nextRowJson()/
-/// closeScan() would `@ptrFromInt` it and read/write through it with
-/// zero validation. Looking the ID up here first means an invalid
-/// handle fails with a normal JS error instead of a native crash or
-/// memory corruption. Mutex guards it because N-API addons can be
-/// loaded into `worker_threads`, not just the main JS thread — this
-/// registry has no reason to assume single-threaded access even though
-/// today's callers happen to be single-threaded.
-var handle_registry: std.AutoHashMapUnmanaged(u64, *ScanHandle) = .{};
-var handle_registry_mutex: std.Thread.Mutex = .{};
-var next_handle_id: u64 = 1;
+/// Registry of open handles, keyed by a small monotonic ID — NOT the
+/// raw pointer address. A raw pointer exposed to JS as a plain number is
+/// an arbitrary-memory-dereference risk the moment a caller passes a
+/// stale, garbage, or off-by-one handle value: the next()/close() entry
+/// points would `@ptrFromInt` it and read/write through it with zero
+/// validation. Looking the ID up here first means an invalid handle
+/// fails with a normal JS error instead of a native crash or memory
+/// corruption. The mutex is there because N-API addons can be loaded
+/// into `worker_threads`, not just the main JS thread — this registry
+/// has no reason to assume single-threaded access even though today's
+/// callers happen to be single-threaded.
+///
+/// Generic over the handle type because there are now two of them
+/// (scanning and validating) with identical lifetime rules; `T` must
+/// carry `in_use`/`close_requested` flags and a `destroy(*T)` method
+/// that frees everything it owns, itself included.
+fn HandleRegistry(comptime T: type) type {
+    return struct {
+        var map: std.AutoHashMapUnmanaged(u64, *T) = .{};
+        var mutex: std.Thread.Mutex = .{};
+        var next_id: u64 = 1;
+
+        fn register(handle: *T) !u64 {
+            mutex.lock();
+            defer mutex.unlock();
+            const id = next_id;
+            next_id += 1;
+            try map.put(c_allocator, id, handle);
+            return id;
+        }
+
+        /// Looks a handle up and marks it busy, so a concurrent close()
+        /// cannot free it out from under the caller.
+        ///
+        /// The mutex used to guard the lookup ONLY, which left a real
+        /// use-after-free between the two calls that are supposed to be
+        /// safe under `worker_threads` (the whole reason this registry
+        /// exists): thread A gets the pointer from the map, thread B
+        /// closes the same handle and frees it, then thread A
+        /// dereferences freed memory. Returns null for an unknown,
+        /// already-closed, or already-busy handle — all three are caller
+        /// errors that must surface as a JS exception rather than as
+        /// memory corruption.
+        fn acquire(id: u64) ?*T {
+            mutex.lock();
+            defer mutex.unlock();
+            const handle = map.get(id) orelse return null;
+            if (handle.in_use) return null;
+            handle.in_use = true;
+            return handle;
+        }
+
+        /// Ends the borrow started by acquire(), destroying the handle
+        /// if a close() arrived in the meantime.
+        fn release(handle: *T) void {
+            mutex.lock();
+            handle.in_use = false;
+            const now_dead = handle.close_requested;
+            mutex.unlock();
+            if (now_dead) handle.destroy();
+        }
+
+        /// Removes a handle from the registry — the ID is invalid from
+        /// here on either way, which is what makes double-close a silent
+        /// no-op. Returns the handle to free, or null if an in-flight
+        /// next() still holds it (that call frees it when it releases)
+        /// or the ID was never valid.
+        fn unregister(id: u64) ?*T {
+            mutex.lock();
+            defer mutex.unlock();
+            const entry = map.fetchRemove(id) orelse return null;
+            if (entry.value.in_use) {
+                entry.value.close_requested = true;
+                return null;
+            }
+            return entry.value;
+        }
+    };
+}
+
+const ScanRegistry = HandleRegistry(ScanHandle);
 
 fn registerHandle(handle: *ScanHandle) !u64 {
-    handle_registry_mutex.lock();
-    defer handle_registry_mutex.unlock();
-    const id = next_handle_id;
-    next_handle_id += 1;
-    try handle_registry.put(c_allocator, id, handle);
-    return id;
+    return ScanRegistry.register(handle);
 }
 
-/// Frees everything a ScanHandle owns, including the handle itself.
-/// Never call it on a handle still reachable through the registry.
 fn destroyHandle(handle: *ScanHandle) void {
-    handle.query.deinit();
-    freeHeader(c_allocator, handle.header);
-    if (handle.predicates.len > 0) freePredicates(c_allocator, handle.predicates);
-    if (handle.columns) |c| c_allocator.free(c);
-    c_allocator.destroy(handle);
+    handle.destroy();
 }
 
-/// Looks a handle up and marks it busy, so a concurrent closeScan()
-/// cannot free it out from under the caller.
-///
-/// The mutex used to guard the lookup ONLY, which left a real
-/// use-after-free between the two calls that are supposed to be safe
-/// under `worker_threads` (the whole reason this registry exists):
-/// thread A gets the pointer from the map, thread B closes the same
-/// handle and frees it, then thread A dereferences freed memory.
-/// Returns null for an unknown, already-closed, or already-busy handle —
-/// all three are caller errors that must surface as a JS exception
-/// rather than as memory corruption.
 fn acquireHandle(id: u64) ?*ScanHandle {
-    handle_registry_mutex.lock();
-    defer handle_registry_mutex.unlock();
-    const handle = handle_registry.get(id) orelse return null;
-    if (handle.in_use) return null;
-    handle.in_use = true;
-    return handle;
+    return ScanRegistry.acquire(id);
 }
 
-/// Ends the borrow started by acquireHandle(), destroying the handle if
-/// a closeScan() arrived in the meantime.
 fn releaseHandle(handle: *ScanHandle) void {
-    handle_registry_mutex.lock();
-    handle.in_use = false;
-    const now_dead = handle.close_requested;
-    handle_registry_mutex.unlock();
-    if (now_dead) destroyHandle(handle);
+    ScanRegistry.release(handle);
 }
 
-/// Removes a handle from the registry — the ID is invalid from here on
-/// either way, which is what makes double-close a silent no-op. Returns
-/// the handle to free, or null if an in-flight nextRowJson() still holds
-/// it (that call frees it when it releases) or the ID was never valid.
 fn unregisterHandle(id: u64) ?*ScanHandle {
-    handle_registry_mutex.lock();
-    defer handle_registry_mutex.unlock();
-    const entry = handle_registry.fetchRemove(id) orelse return null;
-    if (entry.value.in_use) {
-        entry.value.close_requested = true;
-        return null;
-    }
-    return entry.value;
+    return ScanRegistry.unregister(id);
 }
 
 fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, out: *OpenScanResult) void {
@@ -978,6 +1011,219 @@ fn napiCloseScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c)
     return undef;
 }
 
+// ── validation ───────────────────────────────────────────────────────
+//
+// Rules are parsed and evaluated in Zig from a JSON schema, exactly as
+// the C ABI does it — so the Node client and the Python client cannot
+// disagree about whether a given cell is an integer. Composing this in
+// JavaScript, the way describe() is composed, would have guaranteed the
+// opposite.
+
+/// Parses `schema_json` against the file's real header — the same
+/// probe-then-scan pattern every name-resolving entry point here uses.
+fn openSchema(path: [:0]const u8, schema_json: [:0]const u8) !scan.Schema {
+    const header = try probeHeader(c_allocator, path);
+    defer freeHeader(c_allocator, header);
+    return scan.parseSchema(c_allocator, header, schema_json);
+}
+
+fn validateWork(path: [:0]const u8, schema_json: [:0]const u8, max_errors: i64, out: *RowsResult) void {
+    var schema = openSchema(path, schema_json) catch |e| {
+        out.err = e;
+        return;
+    };
+    defer schema.deinit();
+
+    var report = scan.validate(c_allocator, path, &schema, .{
+        .max_errors = if (max_errors <= 0) 100 else @intCast(max_errors),
+    }) catch |e| {
+        out.err = e;
+        return;
+    };
+    defer report.deinit();
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    scan.writeReportJson(&aw.writer, report) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
+}
+
+fn napiValidate(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const path = getStringArg(env, info, 0, c_allocator) catch return napiFail(env, "validateJson(path, schema): path required");
+    defer c_allocator.free(path);
+    const schema_json = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "validateJson(path, schema): schema required");
+    defer c_allocator.free(schema_json);
+    const max_errors = getIntArg(env, info, 2, i64, 100);
+
+    var result = RowsResult{};
+    runOnWorkerStack(validateWork, .{ path, schema_json, max_errors, &result });
+    if (result.err) |e| return failErr(env, e);
+    defer c_allocator.free(result.json);
+    return napiString(env, result.json);
+}
+
+const ValidatorHandle = struct {
+    validator: scan.Validator,
+    /// Owned here because the Validator borrows the rules' column names
+    /// from it for the whole scan.
+    schema: scan.Schema,
+    in_use: bool = false,
+    close_requested: bool = false,
+
+    fn destroy(self: *ValidatorHandle) void {
+        self.validator.deinit();
+        self.schema.deinit();
+        c_allocator.destroy(self);
+    }
+};
+
+const ValidatorRegistry = HandleRegistry(ValidatorHandle);
+
+fn openValidatorWork(path: [:0]const u8, schema_json: [:0]const u8, out: *OpenScanResult) void {
+    var schema = openSchema(path, schema_json) catch |e| {
+        out.err = e;
+        return;
+    };
+    var schema_moved = false;
+    defer if (!schema_moved) schema.deinit();
+
+    const handle = c_allocator.create(ValidatorHandle) catch {
+        out.err = error.OutOfMemory;
+        return;
+    };
+    // The Validator borrows the schema, so it has to live in the handle
+    // rather than on this frame.
+    handle.* = .{ .validator = undefined, .schema = schema };
+    handle.validator = scan.Validator.open(c_allocator, path, &handle.schema) catch |e| {
+        c_allocator.destroy(handle);
+        out.err = e;
+        return;
+    };
+    schema_moved = true;
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    w.writeByte('[') catch {
+        handle.destroy();
+        out.err = error.OutOfMemory;
+        return;
+    };
+    for (handle.validator.header(), 0..) |name, i| {
+        if (i > 0) w.writeByte(',') catch {
+            handle.destroy();
+            out.err = error.OutOfMemory;
+            return;
+        };
+        jsonEscapedString(w, name);
+    }
+    w.writeByte(']') catch {
+        handle.destroy();
+        out.err = error.OutOfMemory;
+        return;
+    };
+    const names_json = aw.toOwnedSlice() catch {
+        handle.destroy();
+        out.err = error.OutOfMemory;
+        return;
+    };
+
+    const id = ValidatorRegistry.register(handle) catch {
+        handle.destroy();
+        c_allocator.free(names_json);
+        out.err = error.OutOfMemory;
+        return;
+    };
+    out.names_json = names_json;
+    out.handle = @intCast(id);
+}
+
+fn napiOpenValidator(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const path = getStringArg(env, info, 0, c_allocator) catch return napiFail(env, "openValidator(path, schema): path required");
+    defer c_allocator.free(path);
+    const schema_json = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "openValidator(path, schema): schema required");
+    defer c_allocator.free(schema_json);
+
+    var result = OpenScanResult{};
+    runOnWorkerStack(openValidatorWork, .{ path, schema_json, &result });
+    if (result.err) |e| return failErr(env, e);
+
+    var obj: napi.napi_value = undefined;
+    _ = napi.napi_create_object(env, &obj);
+    _ = napi.napi_set_named_property(env, obj, "handle", napiInt64(env, result.handle));
+    _ = napi.napi_set_named_property(env, obj, "namesJson", napiString(env, result.names_json));
+    c_allocator.free(result.names_json);
+    return obj;
+}
+
+/// One row as `{"number":N,"values":[...],"errors":[...]}`, or null at
+/// end of file. `errors` is omitted entirely for a valid row, so the
+/// common case carries no extra bytes across the boundary.
+fn napiValidatorNext(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const handle_id = getIntArg(env, info, 0, i64, 0);
+    if (handle_id <= 0) return napiFail(env, "validatorNextJson(handle): invalid handle");
+    const handle = ValidatorRegistry.acquire(@intCast(handle_id)) orelse
+        return napiFail(env, "validatorNextJson(handle): unknown, already-closed, or concurrently-in-use handle");
+    defer ValidatorRegistry.release(handle);
+
+    const maybe = handle.validator.next() catch |e| return failErr(env, e);
+    const vr = maybe orelse {
+        var null_val: napi.napi_value = undefined;
+        _ = napi.napi_get_null(env, &null_val);
+        return null_val;
+    };
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    w.print("{{\"number\":{d},\"values\":[", .{vr.number}) catch return napiFail(env, "out of memory");
+    for (vr.row.fields, 0..) |f, i| {
+        if (i > 0) w.writeByte(',') catch return napiFail(env, "out of memory");
+        jsonEscapedString(w, f);
+    }
+    w.writeByte(']') catch return napiFail(env, "out of memory");
+    if (vr.errors.len > 0) {
+        w.writeAll(",\"errors\":") catch return napiFail(env, "out of memory");
+        scan.writeRowErrorsJson(w, vr.errors) catch return napiFail(env, "out of memory");
+    }
+    w.writeByte('}') catch return napiFail(env, "out of memory");
+    const json = aw.toOwnedSlice() catch return napiFail(env, "out of memory");
+    defer c_allocator.free(json);
+    return napiString(env, json);
+}
+
+fn napiValidatorTotals(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const handle_id = getIntArg(env, info, 0, i64, 0);
+    if (handle_id <= 0) return napiFail(env, "validatorTotalsJson(handle): invalid handle");
+    const handle = ValidatorRegistry.acquire(@intCast(handle_id)) orelse
+        return napiFail(env, "validatorTotalsJson(handle): unknown or already-closed handle");
+    defer ValidatorRegistry.release(handle);
+
+    var buf: [128]u8 = undefined;
+    const json = std.fmt.bufPrint(
+        &buf,
+        "{{\"rowsTotal\":{d},\"rowsValid\":{d},\"rowsInvalid\":{d}}}",
+        .{ handle.validator.row_number, handle.validator.rows_valid, handle.validator.rows_invalid },
+    ) catch return napiFail(env, "out of memory");
+    return napiString(env, json);
+}
+
+fn napiCloseValidator(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const handle_id = getIntArg(env, info, 0, i64, 0);
+    var undef: napi.napi_value = undefined;
+    _ = napi.napi_get_undefined(env, &undef);
+    if (handle_id <= 0) return undef;
+    const handle = ValidatorRegistry.unregister(@intCast(handle_id)) orelse return undef;
+    handle.destroy();
+    return undef;
+}
+
 // ── Module registration ──────────────────────────────────────────────
 
 fn prop(name: [*:0]const u8, method: napi.napi_callback) napi.napi_property_descriptor {
@@ -996,6 +1242,11 @@ fn prop(name: [*:0]const u8, method: napi.napi_callback) napi.napi_property_desc
 export fn napi_register_module_v1(env: napi.napi_env, exports: napi.napi_value) callconv(.c) napi.napi_value {
     const props = [_]napi.napi_property_descriptor{
         prop("schemaJson", napiSchema),
+        prop("validateJson", napiValidate),
+        prop("openValidator", napiOpenValidator),
+        prop("validatorNextJson", napiValidatorNext),
+        prop("validatorTotalsJson", napiValidatorTotals),
+        prop("closeValidator", napiCloseValidator),
         prop("countJson", napiCount),
         prop("aggregateJson", napiAggregate),
         prop("scanArrayJson", napiScanArray),

@@ -2,6 +2,7 @@
 #define LIBSCANIO_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -122,6 +123,78 @@ size_t scanio_collect_n_cols(scanio_collect_t *cr);
 void scanio_collect_close(scanio_collect_t *cr);
 
 void scanio_close(scanio_t *scanner);
+
+/* ── Import validation ──────────────────────────────────────────────
+ *
+ * The question an import asks is not "which rows do I want" but "which
+ * rows can I not take, and why". Rules come in as a JSON schema keyed by
+ * column name and are parsed and evaluated inside the library, so every
+ * binding gets the same answer:
+ *
+ *   {"id":     {"type": "integer", "required": true},
+ *    "amount": {"type": "float", "min": 0},
+ *    "status": {"one_of": ["new", "paid"]},
+ *    "email":  {"required": true, "max_len": 255}}
+ *
+ * type is one of any/integer/float/boolean/datetime/string. Every key
+ * must name a real column and every rule name must be spelled right —
+ * both are errors, because a rule that silently does not run is worse
+ * than a call that fails. */
+
+typedef struct scanio_validation scanio_validation_t;
+
+/* One pass over the file, returning a summary. max_errors bounds how
+ * many individual errors the report STORES (0 = default 100); every
+ * error is counted regardless, so a wholly-broken file yields a report
+ * rather than an allocation the size of the file.
+ * Returns NULL on error — call scanio_last_error(). */
+scanio_validation_t *scanio_validate(const char *path, const char *schema_json,
+                                     size_t max_errors);
+
+/* The report, as JSON. Valid until scanio_validate_free():
+ *
+ *   {"rows_total": 5, "rows_valid": 3, "rows_invalid": 2,
+ *    "errors_total": 4, "truncated": false,
+ *    "counts": {"bad_type": 2, "missing_required": 2},
+ *    "errors": [{"row": 1, "column": 0, "column_name": "id",
+ *                "rule": "bad_type", "value": "abc"}]}
+ *
+ * "column" is null for a structural error (too_few_fields /
+ * too_many_fields), which is about the row rather than one cell. */
+const char *scanio_validate_json(scanio_validation_t *v);
+
+void scanio_validate_free(scanio_validation_t *v);
+
+typedef struct scanio_validator scanio_validator_t;
+
+/* Streaming validation: every row handed back with its failures
+ * attached, so a caller writes the good rows to its target and the bad
+ * ones to a rejects file in the same pass, never materializing either.
+ * Returns NULL on error. */
+scanio_validator_t *scanio_validator_open(const char *path, const char *schema_json);
+
+/* 1 = row produced, 0 = end of file, -1 = error. *out_errors_json is set
+ * to NULL for a valid row — the common case, and the one that stays
+ * allocation-free. When non-NULL it is a JSON array of the same error
+ * objects scanio_validate_json() emits, valid until the next call.
+ * out_row_number receives the 1-based data row number (header excluded).
+ * Any out pointer may be NULL. */
+int scanio_validator_next(scanio_validator_t *v, const char ***out_fields,
+                          size_t *out_n, const char **out_errors_json,
+                          uint64_t *out_row_number);
+
+/* Running totals, meaningful at any point and final once next() has
+ * returned 0. */
+uint64_t scanio_validator_rows_total(scanio_validator_t *v);
+uint64_t scanio_validator_rows_valid(scanio_validator_t *v);
+uint64_t scanio_validator_rows_invalid(scanio_validator_t *v);
+size_t scanio_validator_n_columns(scanio_validator_t *v);
+
+/* Header column name at `index`, or NULL if out of range. Valid until
+ * scanio_validator_close(). */
+const char *scanio_validator_column_name(scanio_validator_t *v, size_t index);
+
+void scanio_validator_close(scanio_validator_t *v);
 
 /* Human-readable reason for the most recent NULL/-1 return on this
  * thread, or NULL if the last call succeeded. The returned pointer is

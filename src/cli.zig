@@ -31,6 +31,20 @@ const usage =
     \\  --format <fmt>      csv (default) or ndjson
     \\  --help
     \\
+    \\Import validation:
+    \\  --validate <file>   JSON schema, keyed by column name:
+    \\                        {"id": {"type": "integer", "required": true},
+    \\                         "amount": {"type": "float", "min": 0}}
+    \\                      Prints a JSON report; exits 1 if any row failed.
+    \\  --valid             ...and instead stream only the rows that passed
+    \\  --invalid           ...or only the rows that failed
+    \\
+    \\Report mode is a gate: it exits 1 if any row failed, so it drops
+    \\straight into a script. The two row modes are filters and exit 0
+    \\whenever they ran, so a pipeline under `set -e` is not aborted by
+    \\the very rejects it asked to see. --validate does not combine with
+    \\--where/--columns/--limit/--count.
+    \\
     \\Reads CSV, NDJSON and JSON arrays; the format is inferred from the
     \\file extension. Output streams as it is found, so memory stays flat
     \\regardless of how much matches.
@@ -50,7 +64,15 @@ pub const Args = struct {
     count_only: bool = false,
     format: Format = .csv,
     help: bool = false,
+    /// Path to a JSON schema file. Set = run validation instead of a scan.
+    validate: ?[]const u8 = null,
+    /// What to emit under --validate. Report is the default; the two row
+    /// modes are what makes this usable in a pipeline —
+    /// `scanio in.csv --validate s.json --valid > clean.csv`.
+    validate_output: ValidateOutput = .report,
 };
+
+pub const ValidateOutput = enum { report, valid, invalid };
 
 pub const ArgError = error{
     MissingValue,
@@ -58,6 +80,8 @@ pub const ArgError = error{
     UnknownFormat,
     BadLimit,
     MissingPath,
+    ValidateRequired,
+    ValidateConflict,
 };
 
 pub fn parseArgs(argv: []const []const u8) ArgError!Args {
@@ -90,6 +114,14 @@ pub fn parseArgs(argv: []const []const u8) ArgError!Args {
             } else if (std.mem.eql(u8, argv[i], "ndjson")) {
                 a.format = .ndjson;
             } else return ArgError.UnknownFormat;
+        } else if (std.mem.eql(u8, arg, "--validate")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            a.validate = argv[i];
+        } else if (std.mem.eql(u8, arg, "--valid")) {
+            a.validate_output = .valid;
+        } else if (std.mem.eql(u8, arg, "--invalid")) {
+            a.validate_output = .invalid;
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             return ArgError.UnknownFlag;
         } else if (a.path.len == 0) {
@@ -97,6 +129,14 @@ pub fn parseArgs(argv: []const []const u8) ArgError!Args {
         } else return ArgError.UnknownFlag;
     }
     if (a.path.len == 0) return ArgError.MissingPath;
+    // --valid/--invalid select what a validation run emits; on their own
+    // they would silently do nothing.
+    if (a.validate == null and a.validate_output != .report) return ArgError.ValidateRequired;
+    // Silently ignoring a flag is worse than refusing it: a caller who
+    // wrote `--validate s.json --where x = 1` believes the filter ran.
+    if (a.validate != null and (a.where != null or a.columns != null or a.limit != null or a.count_only)) {
+        return ArgError.ValidateConflict;
+    }
     return a;
 }
 
@@ -233,6 +273,10 @@ pub fn main() !u8 {
     var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
     const out = &stdout_w.interface;
 
+    if (args.validate) |schema_path| {
+        return runValidate(allocator, args, schema_path, owned_header, out, err_out);
+    }
+
     if (args.count_only) {
         const n = q.count() catch |e| {
             try err_out.print("scanio: scan failed: {s}\n", .{@errorName(e)});
@@ -263,6 +307,73 @@ pub fn main() !u8 {
         try writeRow(out, row, out_names, args.format);
     }
     try out.flush();
+    return 0;
+}
+
+/// Validation is its own run, not a filter layered on the scan above:
+/// it reads the file through Validator, which reports per-cell reasons a
+/// WHERE clause has no way to express.
+///
+/// Exit code 1 when any row failed, so `scanio in.csv --validate s.json`
+/// works as a pre-flight gate in a shell script without parsing the
+/// report.
+fn runValidate(
+    allocator: std.mem.Allocator,
+    args: Args,
+    schema_path: []const u8,
+    header: []const []const u8,
+    out: *std.io.Writer,
+    err_out: *std.io.Writer,
+) !u8 {
+    const schema_json = std.fs.cwd().readFileAlloc(allocator, schema_path, 4 * 1024 * 1024) catch |e| {
+        try err_out.print("scanio: cannot read schema {s}: {s}\n", .{ schema_path, @errorName(e) });
+        try err_out.flush();
+        return 2;
+    };
+    defer allocator.free(schema_json);
+
+    var schema = scanio.parseSchema(allocator, header, schema_json) catch |e| {
+        try err_out.print("scanio: bad schema {s}: {s}\n", .{ schema_path, @errorName(e) });
+        try err_out.flush();
+        return 2;
+    };
+    defer schema.deinit();
+
+    if (args.validate_output == .report) {
+        var report = scanio.validate(allocator, args.path, &schema, .{}) catch |e| {
+            try err_out.print("scanio: validate failed: {s}\n", .{@errorName(e)});
+            try err_out.flush();
+            return 1;
+        };
+        defer report.deinit();
+        try scanio.writeReportJson(out, report);
+        try out.writeByte('\n');
+        try out.flush();
+        return if (report.rows_invalid > 0) 1 else 0;
+    }
+
+    // Row modes stream, exactly like a scan: this is the half of an
+    // import that gets written somewhere, and it must not be
+    // materialized to be written.
+    var v = scanio.Validator.open(allocator, args.path, &schema) catch |e| {
+        try err_out.print("scanio: cannot open {s}: {s}\n", .{ args.path, @errorName(e) });
+        try err_out.flush();
+        return 1;
+    };
+    defer v.deinit();
+
+    const want_valid = args.validate_output == .valid;
+    while (v.next() catch |e| {
+        try err_out.print("scanio: validate failed: {s}\n", .{@errorName(e)});
+        try err_out.flush();
+        return 1;
+    }) |vr| {
+        if (vr.isValid() == want_valid) try writeRow(out, vr.row, header, args.format);
+    }
+    try out.flush();
+    // 0, even with rejects: this mode is a filter that did its job, and
+    // failing the command would abort the very pipeline that asked for
+    // the rejects. The report mode above is the gate.
     return 0;
 }
 
@@ -334,4 +445,30 @@ test "writeRow: CSV output re-quotes anything that would not parse back" {
         "1,\"Smith, John\",\"he said \"\"hi\"\"\",plain\n",
         w.written(),
     );
+}
+
+test "parseArgs: --validate and its two row modes" {
+    const a = try parseArgs(&.{ "d.csv", "--validate", "s.json" });
+    try testing.expectEqualStrings("s.json", a.validate.?);
+    try testing.expectEqual(ValidateOutput.report, a.validate_output);
+
+    const b = try parseArgs(&.{ "d.csv", "--validate", "s.json", "--invalid" });
+    try testing.expectEqual(ValidateOutput.invalid, b.validate_output);
+
+    const c = try parseArgs(&.{ "d.csv", "--validate", "s.json", "--valid" });
+    try testing.expectEqual(ValidateOutput.valid, c.validate_output);
+}
+
+test "parseArgs: --valid without --validate is refused, not ignored" {
+    try testing.expectError(ArgError.ValidateRequired, parseArgs(&.{ "d.csv", "--valid" }));
+    try testing.expectError(ArgError.MissingValue, parseArgs(&.{ "d.csv", "--validate" }));
+}
+
+test "parseArgs: --validate refuses the scan flags it cannot honour" {
+    // A caller who wrote both believes the filter ran; failing says
+    // otherwise before any data is written.
+    try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--where", "a = 1" }));
+    try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--columns", "a" }));
+    try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--limit", "3" }));
+    try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--count" }));
 }

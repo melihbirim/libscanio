@@ -238,4 +238,114 @@ async function describe(filePath, sampleSize = 1000) {
   });
 }
 
-module.exports = { scan, scanArray, schema, count, aggregate, topk, orderBy, profile, describe, ScanError };
+/**
+ * Check every row against `schema` in one streaming pass, and report
+ * what failed.
+ *
+ * This is the question an import asks, which is the opposite of the one
+ * `scan({where})` answers: not "which rows do I want" but "which rows
+ * can I not take, and why".
+ *
+ *     const report = libscanio.validate('orders.csv', {
+ *       id:     { type: 'integer', required: true },
+ *       amount: { type: 'float', min: 0 },
+ *       status: { one_of: ['new', 'paid', 'shipped'] },
+ *       email:  { required: true, max_len: 255 },
+ *     });
+ *     for (const e of report.errors) {
+ *       console.log(`row ${e.row}, ${e.column_name}: ${e.rule} (${e.value})`);
+ *     }
+ *
+ * Rule keys: `type` (any/integer/float/boolean/datetime/string),
+ * `required`, `min`, `max`, `min_len`, `max_len`, `one_of`. Lengths count
+ * characters, not bytes. A blank cell is *absent*, not badly typed — only
+ * `required` has anything to say about it.
+ *
+ * Every schema key must name a real column and every rule name must be
+ * spelled correctly; both throw, because a rule that silently does not
+ * run is worse than a call that fails.
+ *
+ * Memory is bounded: rows stream, and only the first `maxErrors` errors
+ * are stored (all of them are counted — see `errorsTotal`/`counts`).
+ *
+ * @returns {{rowsTotal: number, rowsValid: number, rowsInvalid: number,
+ *   errorsTotal: number, truncated: boolean, counts: Object,
+ *   errors: Array<{row: number, column: number|null, column_name: string,
+ *                  rule: string, value: string}>, ok: boolean}}
+ */
+function validate(filePath, schema, options = {}) {
+  const { maxErrors = 100 } = options;
+  const raw = JSON.parse(call(addon().validateJson, filePath, JSON.stringify(schema), maxErrors));
+  return {
+    rowsTotal: raw.rows_total,
+    rowsValid: raw.rows_valid,
+    rowsInvalid: raw.rows_invalid,
+    errorsTotal: raw.errors_total,
+    truncated: raw.truncated,
+    counts: raw.counts,
+    errors: raw.errors,
+    ok: raw.rows_invalid === 0,
+  };
+}
+
+/**
+ * Stream every row with its failures attached, as `{row, errors, number}`
+ * — `errors` is an empty array for a row that passed.
+ *
+ * This is the shape an actual import wants, and the reason `validate()`
+ * does not return two arrays: the good rows go to the target table and
+ * the bad ones to a rejects file in the SAME pass, so neither side is
+ * ever materialized and memory stays flat no matter how big the file or
+ * how broken it is.
+ *
+ *     for await (const { row, errors } of libscanio.validateIter(p, schema)) {
+ *       if (errors.length) rejects.write(`${row.id},${errors[0].rule}\n`);
+ *       else await load(row);
+ *     }
+ */
+async function* validateIter(filePath, schema) {
+  const { handle, namesJson } = call(addon().openValidator, filePath, JSON.stringify(schema));
+  const names = JSON.parse(namesJson);
+  try {
+    let json;
+    while ((json = call(addon().validatorNextJson, handle)) !== null) {
+      const parsed = JSON.parse(json);
+      yield {
+        number: parsed.number,
+        row: zipRow(names, parsed.values),
+        // Absent for a clean row, so the common case carries no extra
+        // bytes across the boundary.
+        errors: parsed.errors ?? [],
+      };
+    }
+  } finally {
+    addon().closeValidator(handle);
+  }
+}
+
+/**
+ * Draft a schema from what the file already looks like, using
+ * `describe()`'s sampled type inference.
+ *
+ * A starting point to edit, not a schema to trust: it can only describe
+ * the file it read, so a file that is entirely wrong will infer a schema
+ * it passes cleanly. Print it, fix it, then pass it to `validate()`.
+ *
+ * `required: true` marks every column required, which is usually closer
+ * to a real import's intent than the default of marking none.
+ */
+async function inferSchema(filePath, options = {}) {
+  const { sampleSize = 1000, required = false } = options;
+  const out = {};
+  for (const col of await describe(filePath, sampleSize)) {
+    const rule = {};
+    // "empty" means the sample had no values at all — inferring a type
+    // from nothing would be a guess.
+    if (col.type !== 'string' && col.type !== 'empty') rule.type = col.type;
+    if (required) rule.required = true;
+    out[col.column] = rule;
+  }
+  return out;
+}
+
+module.exports = { scan, scanArray, schema, count, aggregate, topk, orderBy, profile, describe, validate, validateIter, inferSchema, ScanError };

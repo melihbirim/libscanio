@@ -202,6 +202,37 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_collect_columnar_close.argtypes = [ctypes.c_void_p]
     lib.scanio_collect_columnar_close.restype = None
 
+    lib.scanio_validate.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.scanio_validate.restype = ctypes.c_void_p
+
+    lib.scanio_validate_json.argtypes = [ctypes.c_void_p]
+    lib.scanio_validate_json.restype = ctypes.c_char_p
+
+    lib.scanio_validate_free.argtypes = [ctypes.c_void_p]
+    lib.scanio_validate_free.restype = None
+
+    lib.scanio_validator_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    lib.scanio_validator_open.restype = ctypes.c_void_p
+
+    lib.scanio_validator_next.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.scanio_validator_next.restype = ctypes.c_int
+
+    for _fn in ("scanio_validator_rows_total", "scanio_validator_rows_valid", "scanio_validator_rows_invalid"):
+        getattr(lib, _fn).argtypes = [ctypes.c_void_p]
+        getattr(lib, _fn).restype = ctypes.c_uint64
+
+    lib.scanio_validator_column_name.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.scanio_validator_column_name.restype = ctypes.c_char_p
+
+    lib.scanio_validator_close.argtypes = [ctypes.c_void_p]
+    lib.scanio_validator_close.restype = None
+
     lib.scanio_close.argtypes = [ctypes.c_void_p]
     lib.scanio_close.restype = None
 

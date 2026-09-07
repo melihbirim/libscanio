@@ -24,6 +24,7 @@ Requires: node on PATH, the C ABI lib and the N-API addon built.
     zig build cli    -Doptimize=ReleaseFast
 """
 import csv
+import re
 import json
 import math
 import os
@@ -339,6 +340,22 @@ def write_fixtures(tmp):
         f.write('5,Eve,7,"Zürich"\n')
     FIXTURES["quoted"] = quoted
 
+    # Deliberately varied: every rule in VALIDATION_CASES has to have
+    # both a passing and a failing row here, or the comparison proves
+    # nothing about that rule.
+    val = os.path.join(tmp, "validate.csv")
+    with open(val, "w", encoding="utf-8") as f:
+        f.write("id,name,amount,city\n")
+        f.write("1,Alice,100,London\n")       # clean
+        f.write("x,Bob,50,Paris\n")           # id not an integer
+        f.write("3,,-5,Berlin\n")             # name blank; amount below min
+        f.write("4,Bo,-5,London\n")           # name too short; amount below min
+        f.write("5,Alexandra,2000,Tokyo\n")   # name too long; amount above max; city not in set
+        f.write("6,Carol,,   \n")             # amount blank; city whitespace-only
+        f.write("7,Dave,3.5,Paris\n")         # clean, float amount
+        f.write("8,Eve,nan,London\n")         # "nan" is text, not a number
+    FIXTURES["validate"] = val
+
     ragged = os.path.join(tmp, "ragged.csv")
     with open(ragged, "w", encoding="utf-8") as f:
         f.write("a,b,c\n1,2,3\n4,5\n6\n7,8,9,EXTRA\n")
@@ -369,6 +386,203 @@ QUERIES = [
     ("city = London", None, 2),
     ("city = London", ["name"], 1),
     ("amount > 999999999", None, None),
+]
+
+
+# ── validation: an independent oracle, plus all three clients ────────
+#
+# The rules live in Zig so the three clients cannot drift apart. That is
+# only worth asserting against something that did NOT come from Zig, so
+# the checks below are written here from the documented rule semantics,
+# not ported from src/validate.zig.
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_DATETIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|z|[+-]\d{2}:\d{2})?$"
+)
+
+
+def _oracle_blank(v):
+    return v.strip(" \t\r\n") == ""
+
+
+def _oracle_is_type(t, v):
+    if t in (None, "any", "string"):
+        return True
+    if t == "integer":
+        s = v.strip(" \t")
+        body = s[1:] if s[:1] in ("+", "-") else s
+        return bool(body) and body.isdigit() and body.isascii()
+    if t == "float":
+        try:
+            f = float(v)
+        except ValueError:
+            return False
+        return f == f and f not in (float("inf"), float("-inf"))
+    if t == "boolean":
+        return v.strip(" \t").lower() in ("true", "false")
+    if t == "datetime":
+        s = v.strip(" \t")
+        if not (_ISO_DATE.match(s) or _ISO_DATETIME.match(s)):
+            return False
+        month, day = int(s[5:7]), int(s[8:10])
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            return False
+        if len(s) > 10:
+            hour, minute = int(s[11:13]), int(s[14:16])
+            if hour > 23 or minute > 59:
+                return False
+        return True
+    raise AssertionError(f"oracle does not know type {t!r}")
+
+
+def _oracle_number(v):
+    try:
+        f = float(v)
+    except ValueError:
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def oracle_validate(path, schema, max_errors=100):
+    """Rebuilds the report from the documented rules, independently."""
+    header = header_of(path)
+    errors, counts = [], {}
+    rows_total = rows_valid = rows_invalid = errors_total = 0
+
+    def note(row_no, col, name, rule, value):
+        nonlocal errors_total
+        errors_total += 1
+        counts[rule] = counts.get(rule, 0) + 1
+        if len(errors) < max_errors:
+            errors.append({"row": row_no, "column": col, "column_name": name,
+                           "rule": rule, "value": value})
+
+    for fields in read_raw(path):
+        rows_total += 1
+        before = errors_total
+        if len(fields) < len(header):
+            note(rows_total, None, "", "too_few_fields", "")
+        elif len(fields) > len(header):
+            note(rows_total, None, "", "too_many_fields", "")
+
+        for name, rule in schema.items():
+            idx = header.index(name)
+            if idx >= len(fields):
+                continue
+            v = fields[idx]
+            if _oracle_blank(v):
+                if rule.get("required"):
+                    note(rows_total, idx, name, "missing_required", v)
+                continue
+            if not _oracle_is_type(rule.get("type"), v):
+                note(rows_total, idx, name, "bad_type", v)
+                continue
+            if "min" in rule or "max" in rule:
+                n = _oracle_number(v)
+                if n is None:
+                    note(rows_total, idx, name, "bad_type", v)
+                else:
+                    if "min" in rule and n < rule["min"]:
+                        note(rows_total, idx, name, "below_min", v)
+                    if "max" in rule and n > rule["max"]:
+                        note(rows_total, idx, name, "above_max", v)
+            if "min_len" in rule and len(v) < rule["min_len"]:
+                note(rows_total, idx, name, "too_short", v)
+            if "max_len" in rule and len(v) > rule["max_len"]:
+                note(rows_total, idx, name, "too_long", v)
+            if "one_of" in rule and v not in [str(x) for x in rule["one_of"]]:
+                note(rows_total, idx, name, "not_in_set", v)
+
+        if errors_total == before:
+            rows_valid += 1
+        else:
+            rows_invalid += 1
+
+    return {"rows_total": rows_total, "rows_valid": rows_valid,
+            "rows_invalid": rows_invalid, "errors_total": errors_total,
+            "truncated": errors_total > len(errors), "counts": counts,
+            "errors": errors}
+
+
+def validate_via_python(path, schema, max_errors=100):
+    r = libscanio.validate(path, schema, max_errors=max_errors)
+    return {"rows_total": r.rows_total, "rows_valid": r.rows_valid,
+            "rows_invalid": r.rows_invalid, "errors_total": r.errors_total,
+            "truncated": r.truncated, "counts": r.counts,
+            "errors": [e.as_dict() for e in r.errors]}
+
+
+NODE_VALIDATE_DRIVER = r"""
+const ls = require(process.argv[2]);
+const [, , , file, schemaJson, maxErrors] = process.argv;
+(async () => {
+  const schema = JSON.parse(schemaJson);
+  const r = ls.validate(file, schema, { maxErrors: Number(maxErrors) });
+  const streamed = [];
+  for await (const v of ls.validateIter(file, schema)) {
+    streamed.push({ number: v.number, values: Object.values(v.row), errors: v.errors });
+  }
+  process.stdout.write(JSON.stringify({
+    rows_total: r.rowsTotal, rows_valid: r.rowsValid, rows_invalid: r.rowsInvalid,
+    errors_total: r.errorsTotal, truncated: r.truncated, counts: r.counts,
+    errors: r.errors, streamed,
+  }));
+})().catch((e) => { process.stderr.write(String(e && e.message)); process.exit(1); });
+"""
+
+
+def validate_via_node(path, schema, max_errors=100):
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(NODE_VALIDATE_DRIVER)
+        driver = f.name
+    try:
+        p = subprocess.run(
+            ["node", driver, os.path.join(REPO, "node", "index.js"), path,
+             json.dumps(schema), str(max_errors)],
+            capture_output=True, encoding="utf-8")
+        if p.returncode != 0:
+            raise AssertionError(f"node validate driver failed: {p.stderr}")
+        return json.loads(p.stdout)
+    finally:
+        os.unlink(driver)
+
+
+def validate_via_cli(path, schema, tmp):
+    schema_path = os.path.join(tmp, "schema.json")
+    with open(schema_path, "w", encoding="utf-8") as f:
+        json.dump(schema, f)
+    p = subprocess.run([CLI, path, "--validate", schema_path],
+                       capture_output=True, encoding="utf-8")
+    # Exit 1 means "rows failed", which is the point of report mode — not
+    # a command failure.
+    if p.returncode not in (0, 1):
+        raise AssertionError(f"cli validate failed: {p.stderr}")
+    return json.loads(p.stdout), p.returncode
+
+
+def cli_validate_rows(path, schema, tmp, mode):
+    schema_path = os.path.join(tmp, "schema.json")
+    with open(schema_path, "w", encoding="utf-8") as f:
+        json.dump(schema, f)
+    p = subprocess.run([CLI, path, "--validate", schema_path, mode, "--format", "ndjson"],
+                       capture_output=True, encoding="utf-8")
+    if p.returncode != 0:
+        raise AssertionError(f"cli {mode} failed: {p.stderr}")
+    return [json.loads(l) for l in p.stdout.splitlines() if l]
+
+
+VALIDATION_CASES = [
+    ("types", {"id": {"type": "integer"}, "amount": {"type": "float"}}),
+    ("required", {"name": {"required": True}, "city": {"required": True}}),
+    ("ranges", {"amount": {"min": 0, "max": 1000}}),
+    ("lengths", {"name": {"min_len": 3, "max_len": 5}}),
+    ("enum", {"city": {"one_of": ["London", "Paris"]}}),
+    ("everything", {"id": {"type": "integer", "required": True},
+                    "name": {"required": True, "max_len": 5},
+                    "amount": {"type": "float", "min": 0, "max": 1000},
+                    "city": {"one_of": ["London", "Paris", "Berlin"]}}),
+    ("nothing", {}),
 ]
 
 
@@ -467,6 +681,81 @@ def main():
         check("ragged | python == node", via_node(path, None, None, None), py)
         check("ragged | python == cli", via_cli(path, None, None, None), py)
         check("ragged | oracle == python", py, oracle_rows(path, header_of(path), []))
+
+        # ── validation: oracle vs python vs node vs CLI ──────────────
+        vpath = FIXTURES["validate"]
+        for label, schema in VALIDATION_CASES:
+            want = oracle_validate(vpath, schema)
+            py = validate_via_python(vpath, schema)
+            nd = validate_via_node(vpath, schema)
+            cli, cli_code = validate_via_cli(vpath, schema, tmp)
+            streamed = nd.pop("streamed")
+
+            check(f"validate | oracle == python | {label}", py, want)
+            check(f"validate | python == node   | {label}", nd, py)
+            check(f"validate | python == cli    | {label}", cli, py)
+            check(f"validate | cli exit code is the gate | {label}",
+                  cli_code, 1 if want["rows_invalid"] else 0)
+
+            # The streaming API has to agree with the report built from
+            # it: same rows clean, same rules broken, same order.
+            check(f"validate | validateIter row count | {label}",
+                  len(streamed), want["rows_total"])
+            check(f"validate | validateIter clean rows | {label}",
+                  sum(1 for v in streamed if not v["errors"]), want["rows_valid"])
+            check(f"validate | validateIter rules match the report | {label}",
+                  [e["rule"] for v in streamed for e in v["errors"]][: len(want["errors"])],
+                  [e["rule"] for e in want["errors"]])
+
+            # And the CLI's two row modes must partition the file
+            # exactly the way the report says.
+            valid_rows = cli_validate_rows(vpath, schema, tmp, "--valid")
+            invalid_rows = cli_validate_rows(vpath, schema, tmp, "--invalid")
+            check(f"validate | cli --valid count | {label}", len(valid_rows), want["rows_valid"])
+            check(f"validate | cli --invalid count | {label}", len(invalid_rows), want["rows_invalid"])
+            check(f"validate | cli --valid + --invalid is every row | {label}",
+                  len(valid_rows) + len(invalid_rows), want["rows_total"])
+
+        # Truncation: the stored list is capped, the totals are not — and
+        # all three clients must cap identically.
+        big_schema = VALIDATION_CASES[-1][1]
+        for cap in (1, 3):
+            want = oracle_validate(vpath, big_schema, max_errors=cap)
+            py = validate_via_python(vpath, big_schema, max_errors=cap)
+            nd = validate_via_node(vpath, big_schema, max_errors=cap)
+            nd.pop("streamed")
+            check(f"validate | oracle == python | max_errors={cap}", py, want)
+            check(f"validate | python == node   | max_errors={cap}", nd, py)
+
+        # Structural errors, on the ragged fixture the rest of this
+        # suite already uses.
+        rag_schema = {"a": {"required": True}}
+        want = oracle_validate(FIXTURES["ragged"], rag_schema)
+        py = validate_via_python(FIXTURES["ragged"], rag_schema)
+        nd = validate_via_node(FIXTURES["ragged"], rag_schema)
+        nd.pop("streamed")
+        check("validate | oracle == python | ragged", py, want)
+        check("validate | python == node   | ragged", nd, py)
+
+        # A schema that names a column the file does not have must fail
+        # in every client, not quietly enforce nothing in some of them.
+        bad = {"does_not_exist": {"required": True}}
+        try:
+            validate_via_python(vpath, bad)
+            check("validate | python rejects an unknown column", "no error", "an error")
+        except libscanio.ScanError:
+            check("validate | python rejects an unknown column", True, True)
+        try:
+            validate_via_node(vpath, bad)
+            check("validate | node rejects an unknown column", "no error", "an error")
+        except AssertionError:
+            check("validate | node rejects an unknown column", True, True)
+        schema_path = os.path.join(tmp, "bad_schema.json")
+        with open(schema_path, "w", encoding="utf-8") as f:
+            json.dump(bad, f)
+        rc = subprocess.run([CLI, vpath, "--validate", schema_path],
+                            capture_output=True, encoding="utf-8").returncode
+        check("validate | cli rejects an unknown column", rc, 2)
 
     print(f"\n{passed}/{passed + failed} differential checks passed")
     return 0 if failed == 0 else 1

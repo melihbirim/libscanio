@@ -377,6 +377,60 @@ async function main() {
     fs.unlinkSync(badPath);
   }
 
+  // Import validation. The rules live in Zig precisely so this client
+  // and the Python one cannot drift apart on them; the differential
+  // test checks the two against each other directly.
+  const valPath = path.join(os.tmpdir(), `libscanio_validate_${process.pid}.csv`);
+  fs.writeFileSync(valPath, 'id,name,amount,status\n1,Alice,100,new\nx,Bob,-5,bogus\n3,,20,paid\n');
+  const valSchema = {
+    id: { type: 'integer', required: true },
+    name: { required: true },
+    amount: { type: 'float', min: 0 },
+    status: { one_of: ['new', 'paid', 'shipped'] },
+  };
+  try {
+    const r = libscanio.validate(valPath, valSchema);
+    check('validate: row totals', [r.rowsTotal, r.rowsValid, r.rowsInvalid], [3, 1, 2]);
+    check('validate: ok is false when any row failed', r.ok, false);
+    check('validate: every failure is counted', r.errorsTotal, 4);
+    check('validate: counts are keyed by rule name', r.counts,
+      { bad_type: 1, below_min: 1, not_in_set: 1, missing_required: 1 });
+    check('validate: an error names the row, column and offending value', r.errors[0],
+      { row: 2, column: 0, column_name: 'id', rule: 'bad_type', value: 'x' });
+    check('validate: a clean run reports ok', libscanio.validate(valPath, { name: {} }).ok, true);
+
+    const capped = libscanio.validate(valPath, valSchema, { maxErrors: 2 });
+    check('validate: maxErrors caps the stored list', capped.errors.length, 2);
+    check('validate: ...but not the totals', capped.errorsTotal, 4);
+    check('validate: ...and says so', capped.truncated, true);
+
+    const seen = [];
+    for await (const v of libscanio.validateIter(valPath, valSchema)) seen.push(v);
+    check('validateIter: yields every row, not just the bad ones', seen.length, 3);
+    check('validateIter: rows are numbered from 1, header excluded', seen.map((v) => v.number), [1, 2, 3]);
+    check('validateIter: a passing row carries no errors', seen[0].errors, []);
+    check('validateIter: a failing row carries the row itself', seen[1].row,
+      { id: 'x', name: 'Bob', amount: '-5', status: 'bogus' });
+    check('validateIter: ...and every rule it broke',
+      seen[1].errors.map((e) => e.rule).sort(), ['bad_type', 'below_min', 'not_in_set']);
+
+    await checkRaises('validate: an unknown column is an error, not an unenforced rule',
+      () => libscanio.validate(valPath, { nope: { required: true } }));
+    await checkRaises('validate: a misspelled rule name is an error too',
+      () => libscanio.validate(valPath, { id: { requred: true } }));
+    await checkRaises('validateIter: same, before any row is yielded',
+      async () => { for await (const _ of libscanio.validateIter(valPath, { nope: {} })) break; });
+
+    const inferred = await libscanio.inferSchema(valPath);
+    check('inferSchema: names every column', Object.keys(inferred).sort(),
+      ['amount', 'id', 'name', 'status']);
+    check('inferSchema: types what it can, leaves the rest open', inferred.amount, { type: 'integer' });
+    check('inferSchema: its own output validates the file it came from',
+      libscanio.validate(valPath, inferred).ok, true);
+  } finally {
+    fs.unlinkSync(valPath);
+  }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }

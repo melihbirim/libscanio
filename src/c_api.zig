@@ -894,6 +894,277 @@ export fn scanio_parallel_collect_columnar(
     return cc;
 }
 
+// ── validation ───────────────────────────────────────────────────────
+//
+// Two entry points, matching the two ways an import is actually run.
+// `scanio_validate` is the pre-flight report: one pass, a summary, no
+// rows. `scanio_validator_open/next/close` is the import itself: every
+// row handed back with its failures attached, so the caller writes the
+// good ones to its target and the bad ones to a rejects file in the same
+// pass — never materializing either.
+//
+// Rules are parsed and evaluated in Zig, from a JSON schema. That is the
+// point of putting this behind the C ABI rather than composing it in
+// each binding, the way profile()/describe() are composed: three clients
+// re-implementing "is this an integer" is three subtly different
+// answers, and an import that passes in Python and fails in Node is
+// worse than no validation at all.
+
+const ValidationReport = struct {
+    report: scan.Report,
+    json: [:0]u8,
+};
+
+/// Runs a full validation pass and returns a handle owning the report
+/// JSON. `max_errors` bounds what the report STORES, never what it
+/// counts — pass 0 for the default.
+export fn scanio_validate(
+    path: ?[*:0]const u8,
+    schema_json: ?[*:0]const u8,
+    max_errors: usize,
+) ?*ValidationReport {
+    clearError();
+    const p = path orelse {
+        setError("path is null", .{});
+        return null;
+    };
+    const sj = schema_json orelse {
+        setError("schema_json is null", .{});
+        return null;
+    };
+
+    var schema = openSchema(std.mem.span(p), std.mem.span(sj)) orelse return null;
+    defer schema.deinit();
+
+    var report = scan.validate(c_allocator, std.mem.span(p), &schema, .{
+        .max_errors = if (max_errors == 0) 100 else max_errors,
+    }) catch |e| {
+        setError("validate failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    errdefer report.deinit();
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    scan.writeReportJson(&aw.writer, report) catch {
+        setError("out of memory rendering report", .{});
+        report.deinit();
+        return null;
+    };
+    const json = c_allocator.dupeZ(u8, aw.written()) catch {
+        setError("out of memory rendering report", .{});
+        report.deinit();
+        return null;
+    };
+
+    const handle = c_allocator.create(ValidationReport) catch {
+        setError("out of memory", .{});
+        c_allocator.free(json);
+        report.deinit();
+        return null;
+    };
+    handle.* = .{ .report = report, .json = json };
+    return handle;
+}
+
+export fn scanio_validate_json(vr: ?*ValidationReport) ?[*:0]const u8 {
+    const h = vr orelse return null;
+    return h.json.ptr;
+}
+
+export fn scanio_validate_free(vr: ?*ValidationReport) void {
+    const h = vr orelse return;
+    c_allocator.free(h.json);
+    h.report.deinit();
+    c_allocator.destroy(h);
+}
+
+/// Parses `schema_json` against the file's real header. Opening the file
+/// twice (once to read the header, once to scan) is the same two-open
+/// pattern every name-resolving entry point here already uses.
+fn openSchema(path: []const u8, schema_json: []const u8) ?scan.Schema {
+    var probe = Query.open(c_allocator, path, .{}) catch |e| {
+        setError("cannot open {s}: {s}", .{ path, @errorName(e) });
+        return null;
+    };
+    defer probe.deinit();
+    return scan.parseSchema(c_allocator, probe.header(), schema_json) catch |e| {
+        setError("bad schema: {s}", .{@errorName(e)});
+        return null;
+    };
+}
+
+const ValidatorCtx = struct {
+    validator: scan.Validator,
+    /// Owned by this context, since the Validator borrows the rules'
+    /// column names from it.
+    schema: scan.Schema,
+    field_cstrs: [][]u8 = &.{},
+    field_ptrs: [][*:0]const u8 = &.{},
+    /// Reused across rows: rendered only for a row that actually failed,
+    /// so a clean file never builds a single one of these.
+    errors_json: std.ArrayListUnmanaged(u8) = .{},
+    /// NUL-terminated header names. Its own copy rather than a borrow of
+    /// the Validator's header, so a caller can read column names after
+    /// the scan has run to completion.
+    header_cstrs: [][:0]u8 = &.{},
+};
+
+export fn scanio_validator_open(path: ?[*:0]const u8, schema_json: ?[*:0]const u8) ?*ValidatorCtx {
+    clearError();
+    const p = path orelse {
+        setError("path is null", .{});
+        return null;
+    };
+    const sj = schema_json orelse {
+        setError("schema_json is null", .{});
+        return null;
+    };
+
+    var schema = openSchema(std.mem.span(p), std.mem.span(sj)) orelse return null;
+    errdefer schema.deinit();
+
+    const ctx = c_allocator.create(ValidatorCtx) catch {
+        setError("out of memory", .{});
+        return null;
+    };
+    errdefer c_allocator.destroy(ctx);
+
+    // The Validator borrows the schema, so the schema must live in the
+    // context, not on this stack frame.
+    ctx.* = .{ .validator = undefined, .schema = schema };
+    ctx.validator = scan.Validator.open(c_allocator, std.mem.span(p), &ctx.schema) catch |e| {
+        setError("cannot open {s}: {s}", .{ std.mem.span(p), @errorName(e) });
+        c_allocator.destroy(ctx);
+        schema.deinit();
+        return null;
+    };
+
+    const header = ctx.validator.header();
+    ctx.header_cstrs = c_allocator.alloc([:0]u8, header.len) catch {
+        setError("out of memory", .{});
+        scanio_validator_close(ctx);
+        return null;
+    };
+    for (header, 0..) |name, i| {
+        ctx.header_cstrs[i] = c_allocator.allocSentinel(u8, name.len, 0) catch {
+            setError("out of memory copying header", .{});
+            // Entries past `i` are uninitialized, so trim before the
+            // close routine walks the slice.
+            ctx.header_cstrs = ctx.header_cstrs[0..i];
+            scanio_validator_close(ctx);
+            return null;
+        };
+        @memcpy(ctx.header_cstrs[i], name);
+    }
+    return ctx;
+}
+
+export fn scanio_validator_column_name(vctx: ?*ValidatorCtx, index: usize) ?[*:0]const u8 {
+    const c = vctx orelse return null;
+    if (index >= c.header_cstrs.len) return null;
+    return c.header_cstrs[index].ptr;
+}
+
+/// 1 = a row was produced, 0 = end of file, -1 = error.
+///
+/// `out_errors_json` is set to NULL for a valid row — the common case,
+/// and the one that must stay allocation-free.
+export fn scanio_validator_next(
+    vctx: ?*ValidatorCtx,
+    out_fields: ?*[*]const [*:0]const u8,
+    out_n: ?*usize,
+    out_errors_json: ?*?[*:0]const u8,
+    out_row_number: ?*u64,
+) c_int {
+    clearError();
+    const c = vctx orelse {
+        setError("validator is null", .{});
+        return -1;
+    };
+    const vr = c.validator.next() catch |e| {
+        setError("validate failed: {s}", .{@errorName(e)});
+        return -1;
+    } orelse return 0;
+
+    if (!growFieldBuffers(&c.field_cstrs, &c.field_ptrs, vr.row.fields.len)) {
+        setError("out of memory growing field buffers", .{});
+        return -1;
+    }
+    for (vr.row.fields, 0..) |field, i| {
+        if (c.field_cstrs[i].len < field.len + 1) {
+            const grown = c_allocator.realloc(c.field_cstrs[i], field.len + 1) catch {
+                setError("out of memory copying row", .{});
+                return -1;
+            };
+            c.field_cstrs[i] = grown;
+        }
+        @memcpy(c.field_cstrs[i][0..field.len], field);
+        c.field_cstrs[i][field.len] = 0;
+        c.field_ptrs[i] = @ptrCast(c.field_cstrs[i].ptr);
+    }
+
+    if (out_fields) |of| of.* = c.field_ptrs.ptr;
+    if (out_n) |on| on.* = vr.row.fields.len;
+    if (out_row_number) |orn| orn.* = vr.number;
+
+    if (out_errors_json) |oej| {
+        if (vr.errors.len == 0) {
+            oej.* = null;
+        } else {
+            c.errors_json.clearRetainingCapacity();
+            var aw = std.io.Writer.Allocating.fromArrayList(c_allocator, &c.errors_json);
+            scan.writeRowErrorsJson(&aw.writer, vr.errors) catch {
+                c.errors_json = aw.toArrayList();
+                setError("out of memory rendering row errors", .{});
+                return -1;
+            };
+            c.errors_json = aw.toArrayList();
+            c.errors_json.append(c_allocator, 0) catch {
+                setError("out of memory rendering row errors", .{});
+                return -1;
+            };
+            oej.* = @ptrCast(c.errors_json.items.ptr);
+        }
+    }
+    return 1;
+}
+
+export fn scanio_validator_rows_total(vctx: ?*ValidatorCtx) u64 {
+    const c = vctx orelse return 0;
+    return c.validator.row_number;
+}
+
+export fn scanio_validator_rows_valid(vctx: ?*ValidatorCtx) u64 {
+    const c = vctx orelse return 0;
+    return c.validator.rows_valid;
+}
+
+export fn scanio_validator_rows_invalid(vctx: ?*ValidatorCtx) u64 {
+    const c = vctx orelse return 0;
+    return c.validator.rows_invalid;
+}
+
+export fn scanio_validator_n_columns(vctx: ?*ValidatorCtx) usize {
+    const c = vctx orelse return 0;
+    return c.validator.header().len;
+}
+
+export fn scanio_validator_close(vctx: ?*ValidatorCtx) void {
+    const c = vctx orelse return;
+    c.validator.deinit();
+    c.schema.deinit();
+    c.errors_json.deinit(c_allocator);
+    for (c.header_cstrs) |buf| c_allocator.free(buf);
+    if (c.header_cstrs.len > 0) c_allocator.free(c.header_cstrs);
+    for (c.field_cstrs) |buf| {
+        if (buf.len > 0) c_allocator.free(buf);
+    }
+    if (c.field_cstrs.len > 0) c_allocator.free(c.field_cstrs);
+    if (c.field_ptrs.len > 0) c_allocator.free(c.field_ptrs);
+    c_allocator.destroy(c);
+}
+
 pub export fn scanio_close(ctx: ?*Ctx) void {
     const c = ctx orelse return;
     c.query.deinit();
@@ -1297,4 +1568,82 @@ test "C ABI: max_column bounds the row without breaking the result" {
     try std.testing.expectEqual(@as(c_int, 1), scanio_next(ctx, &fields, &n));
     try std.testing.expectEqualStrings("2", std.mem.span(fields[0]));
     try std.testing.expectEqual(@as(c_int, 0), scanio_next(ctx, &fields, &n));
+}
+
+test "C ABI: validate returns a JSON report and frees cleanly" {
+    const path = "test_c_api_validate.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,10\nx,20\n2,-5\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const v = scanio_validate(path, "{\"id\":{\"type\":\"integer\"},\"amount\":{\"min\":0}}", 0);
+    try std.testing.expect(v != null);
+    defer scanio_validate_free(v);
+
+    const json = std.mem.span(scanio_validate_json(v).?);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rows_total\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rows_valid\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"bad_type\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"below_min\":1") != null);
+}
+
+test "C ABI: a bad schema fails the call rather than validating nothing" {
+    const path = "test_c_api_validate_bad.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id\n1\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    try std.testing.expect(scanio_validate(path, "{\"nope\":{\"required\":true}}", 0) == null);
+    try std.testing.expect(scanio_last_error() != null);
+    try std.testing.expect(scanio_validate(path, "{\"id\":{\"requred\":true}}", 0) == null);
+    try std.testing.expect(scanio_validator_open(path, "not json") == null);
+}
+
+test "C ABI: the streaming validator hands back each row with its errors" {
+    const path = "test_c_api_validator.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,10\nx,20\n3,30\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const v = scanio_validator_open(path, "{\"id\":{\"type\":\"integer\"}}");
+    try std.testing.expect(v != null);
+    defer scanio_validator_close(v);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    var errors: ?[*:0]const u8 = null;
+    var row_no: u64 = 0;
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_validator_next(v, &fields, &n, &errors, &row_no));
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u64, 1), row_no);
+    // A valid row costs nothing: no error JSON is built at all.
+    try std.testing.expect(errors == null);
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_validator_next(v, &fields, &n, &errors, &row_no));
+    try std.testing.expectEqual(@as(u64, 2), row_no);
+    try std.testing.expect(errors != null);
+    const ej = std.mem.span(errors.?);
+    try std.testing.expect(std.mem.indexOf(u8, ej, "\"rule\":\"bad_type\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ej, "\"value\":\"x\"") != null);
+    // The row itself is still there — an importer needs it for a
+    // rejects file, not just the reason.
+    try std.testing.expectEqualStrings("x", std.mem.span(fields[0]));
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_validator_next(v, &fields, &n, &errors, &row_no));
+    try std.testing.expect(errors == null); // reset, not left over from the bad row
+
+    try std.testing.expectEqual(@as(c_int, 0), scanio_validator_next(v, &fields, &n, &errors, &row_no));
+    try std.testing.expectEqual(@as(u64, 3), scanio_validator_rows_total(v));
+    try std.testing.expectEqual(@as(u64, 2), scanio_validator_rows_valid(v));
+    try std.testing.expectEqual(@as(u64, 1), scanio_validator_rows_invalid(v));
+    try std.testing.expectEqual(@as(usize, 2), scanio_validator_n_columns(v));
+}
+
+test "C ABI: validation entry points tolerate null arguments" {
+    try std.testing.expect(scanio_validate(null, "{}", 0) == null);
+    try std.testing.expect(scanio_validate("x.csv", null, 0) == null);
+    try std.testing.expect(scanio_validator_open(null, "{}") == null);
+    try std.testing.expect(scanio_validate_json(null) == null);
+    scanio_validate_free(null);
+    scanio_validator_close(null);
+    try std.testing.expectEqual(@as(c_int, -1), scanio_validator_next(null, null, null, null, null));
+    try std.testing.expectEqual(@as(u64, 0), scanio_validator_rows_total(null));
 }
