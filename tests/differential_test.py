@@ -34,7 +34,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "python"))
 import libscanio  # noqa: E402
 
-CLI = os.path.join(REPO, "zig-out", "bin", "scanio")
+# .exe on Windows — zig-out/bin/scanio does not exist there, and the
+# check below would report the CLI as unbuilt on a runner that had just
+# built it (which is exactly how this failed in CI).
+CLI = os.path.join(REPO, "zig-out", "bin", "scanio.exe" if sys.platform == "win32" else "scanio")
 
 passed = 0
 failed = 0

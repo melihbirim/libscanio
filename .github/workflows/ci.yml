@@ -134,4 +134,8 @@ jobs:
         run: |
           zig build c-lib -Doptimize=ReleaseFast
           zig build cli -Doptimize=ReleaseFast
-          python3 tests/differential_test.py
+          # Windows runners don't reliably have a "python3" alias, only
+          # "python" — the same gotcha build.zig's own python_cmd exists
+          # for. Hardcoding python3 here is what broke this job.
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" tests/differential_test.py
