@@ -161,6 +161,75 @@ See [DESIGN.md](DESIGN.md) for the full chunked-read rationale and the
 CSV/NDJSON/JSON-array before-and-after numbers (196x, 29x, and 26x less
 peak RSS respectively, at 0-50% time cost depending on format).
 
+## Ecosystem comparison — reproducible
+
+Everything below comes from `zig build bench-compare` (see
+[bench/compare.py](../bench/compare.py)), not from a script that no longer
+exists. Every engine answers the same question in its own fresh process —
+"how many rows match `cab_type = yellow`" — so the time includes runtime
+startup and the peak RSS is that engine's alone, read from the OS rather
+than self-reported. All nine agree on the row count; the harness fails if
+they don't, because a fast wrong answer is not a result.
+
+`native python` (the `csv`/`json` modules) and `native node` (`fs` +
+`split`) are in the table on purpose: they are what you write when you
+skip the library entirely, and they are the floor any dependency has to
+beat to justify itself.
+
+Reproduce:
+
+```bash
+zig build bench-compare -Doptimize=ReleaseFast -- --rows 1000000 --reps 5
+# apache-arrow is skipped unless you point the harness at it:
+npm install apache-arrow csv-parse
+zig build bench-compare -Doptimize=ReleaseFast -- --node-modules ./node_modules
+```
+
+Measured on the machine in the header of this file, Zig 0.15.2,
+pyarrow 25.0.1, polars 1.44.1, apache-arrow 21.2.0, Node 22, Python 3.11.
+
+## CSV — 1,000,000 rows, 43MB, WHERE cab_type = yellow
+
+| engine | time | peak RSS | rows |
+|---|---|---|---|
+| libscanio CLI (zig) | 106.4ms | 10.2MB | 333,334 |
+| libscanio python | 1187.3ms | 10.2MB | 333,334 |
+| libscanio python (arrow) | 229.0ms | 90.9MB | 333,334 |
+| libscanio node | 899.6ms | 68.7MB | 333,334 |
+| pyarrow | 438.7ms | 144.7MB | 333,334 |
+| polars | 312.9ms | 163.7MB | 333,334 |
+| apache-arrow (node) | 9028.2ms | 655.5MB | 333,334 |
+| native python (csv/json) | 2207.8ms | 10.2MB | 333,334 |
+| native node (split) | 903.9ms | 174.7MB | 333,334 |
+
+## NDJSON — 1,000,000 rows, 139MB, WHERE cab_type = yellow
+
+| engine | time | peak RSS | rows |
+|---|---|---|---|
+| libscanio CLI (zig) | 324.5ms | 10.2MB | 333,334 |
+| libscanio python | 1417.9ms | 10.2MB | 333,334 |
+| libscanio python (arrow) | 302.0ms | 91.7MB | 333,334 |
+| libscanio node | 1210.3ms | 68.7MB | 333,334 |
+| pyarrow | 650.7ms | 205.2MB | 333,334 |
+| polars | 457.0ms | 231.3MB | 333,334 |
+| apache-arrow (node) | 4909.1ms | 695.2MB | 333,334 |
+| native python (csv/json) | 3410.9ms | 10.2MB | 333,334 |
+| native node (split) | 1914.1ms | 306.5MB | 333,334 |
+
+Reading these: libscanio's streaming paths hold **10.2MB regardless of
+format or file size** while every other engine's memory scales with the
+result — that gap, not the wall-clock column, is the thing the design
+buys. On time, the CLI wins outright because below ~100MB starting the
+runtime costs more than the scan; the Python streaming client is the
+slowest libscanio path by design, paying a ctypes crossing per row to
+keep memory flat. Node's ~69MB floor is V8's, not libscanio's.
+
+`apache-arrow` (JS) has no native CSV or NDJSON reader, so its row has to
+fully materialise every record as a JS object and then pivot to columns —
+a structurally heavier pipeline than pyarrow's parse-straight-to-buffers
+path, which is why it is an order of magnitude behind rather than a
+tuning difference.
+
 ## Reproducing
 
 ```bash

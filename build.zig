@@ -383,6 +383,19 @@ pub fn build(b: *std.Build) void {
     const diff_test_step = b.step("diff-test", "Cross-client differential test (Python vs Node vs CLI vs an oracle)");
     diff_test_step.dependOn(&diff_test.step);
 
+    // Ecosystem comparison — libscanio's three front doors against
+    // pyarrow, polars, apache-arrow and hand-written baselines. Optional
+    // engines skip themselves when their dependency is absent, so this
+    // runs anywhere; see bench/compare.py's doc comment for what the
+    // numbers do and don't mean.
+    const bench_compare = b.addSystemCommand(&.{ python_cmd, "bench/compare.py" });
+    bench_compare.step.dependOn(c_lib_step);
+    bench_compare.step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+    if (node_install_step) |s| bench_compare.step.dependOn(s);
+    if (b.args) |extra| bench_compare.addArgs(extra);
+    const bench_compare_step = b.step("bench-compare", "Compare against pyarrow/polars/apache-arrow and native baselines");
+    bench_compare_step.dependOn(&bench_compare.step);
+
     const node_addon_test = b.addSystemCommand(&.{ "node", "node/test/addon_test.js" });
     if (node_install_step) |s| node_addon_test.step.dependOn(s);
     const node_wrapper_test = b.addSystemCommand(&.{ "node", "node/test/test.js" });

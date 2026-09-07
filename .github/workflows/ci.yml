@@ -129,6 +129,32 @@ jobs:
       # they cannot catch two clients disagreeing about the same file.
       # This job already has Node and the addon; it only needs the C ABI
       # and the CLI to run all three clients side by side.
+      # Runs on every CI run, but gates only on what is NOT noisy on a
+      # shared runner: that every engine returns the SAME row count, and
+      # that libscanio's streaming peak RSS stays under its ceiling.
+      # Wall-clock times are printed to the job summary for eyeballing
+      # and deliberately not asserted on — a hosted runner moves them by
+      # far more than a real regression would, and a perf gate that cries
+      # wolf is a perf gate everyone learns to ignore.
+      - name: Benchmark (report timings, gate on rows + memory ceiling)
+        shell: bash
+        run: |
+          zig build c-lib -Doptimize=ReleaseFast
+          zig build cli -Doptimize=ReleaseFast
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" bench/compare.py --rows 200000 --reps 3 \
+            --max-rss-mb 40 \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --json bench-results.json
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ matrix.os }}
+          path: bench-results.json
+          if-no-files-found: ignore
+
       - name: Cross-client differential test
         shell: bash
         run: |
