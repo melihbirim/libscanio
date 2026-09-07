@@ -141,11 +141,8 @@ jobs:
         run: |
           zig build c-lib -Doptimize=ReleaseFast
           zig build cli -Doptimize=ReleaseFast
-          # The Node engine measures through the addon, so it needs the
-          # same treatment: a Debug addon publishes a Node number that is
-          # orders of magnitude off and looks real. compare.py refuses to
-          # run at all unless the shared library reports ReleaseFast.
-          zig build node -Doptimize=ReleaseFast || true
+          # Reuse the ReleaseFast addon built and tested above with the
+          # platform-specific Node header and import-library paths.
           PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
           "$PY" bench/test_compare.py
           "$PY" bench/compare.py --rows 200000 --reps 3 \
