@@ -129,8 +129,17 @@ fn getBoolArg(env: napi.napi_env, info: napi.napi_callback_info, index: usize, d
     return v;
 }
 
+/// Every worker takes its result struct as the last argument, and every
+/// one of those has an `err` field — so a failure to even spawn the
+/// thread is reported the same way as a failure inside it. Returning
+/// silently left the caller with an empty JSON string and no error,
+/// which reached JavaScript as `SyntaxError: Unexpected end of JSON
+/// input` instead of the real cause.
 fn runOnWorkerStack(comptime WorkFn: anytype, args: anytype) void {
-    const t = std.Thread.spawn(.{ .stack_size = worker_stack_size }, WorkFn, args) catch return;
+    const t = std.Thread.spawn(.{ .stack_size = worker_stack_size }, WorkFn, args) catch |e| {
+        args[args.len - 1].err = e;
+        return;
+    };
     t.join();
 }
 
@@ -152,13 +161,25 @@ fn schemaWork(path: [:0]const u8, out: *SchemaResult) void {
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeByte('[') catch return;
+    w.writeByte('[') catch |e| {
+        out.err = e;
+        return;
+    };
     for (header, 0..) |name, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         jsonEscapedString(w, name);
     }
-    w.writeByte(']') catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.writeByte(']') catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiSchema(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -266,12 +287,51 @@ fn aggregateWork(path: [:0]const u8, column_name: [:0]const u8, where: ?[:0]cons
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.print("{{\"count\":{d},\"sum\":{d},", .{ agg.count, agg.sum }) catch return;
-    if (agg.min) |m| w.print("\"min\":{d},", .{m}) catch return else w.writeAll("\"min\":null,") catch return;
-    if (agg.max) |m| w.print("\"max\":{d},", .{m}) catch return else w.writeAll("\"max\":null,") catch return;
-    if (agg.avg()) |a| w.print("\"avg\":{d},", .{a}) catch return else w.writeAll("\"avg\":null,") catch return;
-    w.print("\"has_values\":{s}}}", .{if (agg.count > 0) "true" else "false"}) catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.print("{{\"count\":{d},\"sum\":{d},", .{ agg.count, agg.sum }) catch |e| {
+        out.err = e;
+        return;
+    };
+    if (agg.min) |m| {
+        w.print("\"min\":{d},", .{m}) catch |e| {
+            out.err = e;
+            return;
+        };
+    } else {
+        w.writeAll("\"min\":null,") catch |e| {
+            out.err = e;
+            return;
+        };
+    }
+    if (agg.max) |m| {
+        w.print("\"max\":{d},", .{m}) catch |e| {
+            out.err = e;
+            return;
+        };
+    } else {
+        w.writeAll("\"max\":null,") catch |e| {
+            out.err = e;
+            return;
+        };
+    }
+    if (agg.avg()) |a| {
+        w.print("\"avg\":{d},", .{a}) catch |e| {
+            out.err = e;
+            return;
+        };
+    } else {
+        w.writeAll("\"avg\":null,") catch |e| {
+            out.err = e;
+            return;
+        };
+    }
+    w.print("\"has_values\":{s}}}", .{if (agg.count > 0) "true" else "false"}) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiAggregate(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -345,31 +405,64 @@ fn scanArrayWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]co
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeAll("{\"names\":[") catch return;
+    w.writeAll("{\"names\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     const proj = columns orelse blk: {
-        const idx = c_allocator.alloc(usize, header.len) catch return;
+        const idx = c_allocator.alloc(usize, header.len) catch |e| {
+            out.err = e;
+            return;
+        };
         for (idx, 0..) |*v, i| v.* = i;
         break :blk idx;
     };
     defer if (columns == null) c_allocator.free(proj);
     for (proj, 0..) |ci, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         jsonEscapedString(w, header[ci]);
     }
-    w.writeAll("],\"rows\":[") catch return;
+    w.writeAll("],\"rows\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     var first = true;
-    while (q.next() catch return) |row| {
-        if (!first) w.writeByte(',') catch return;
+    while (q.next() catch |e| {
+        out.err = e;
+        return;
+    }) |row| {
+        if (!first) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         first = false;
-        w.writeByte('[') catch return;
+        w.writeByte('[') catch |e| {
+            out.err = e;
+            return;
+        };
         for (row.fields, 0..) |f, i| {
-            if (i > 0) w.writeByte(',') catch return;
+            if (i > 0) w.writeByte(',') catch |e| {
+                out.err = e;
+                return;
+            };
             jsonEscapedString(w, f);
         }
-        w.writeByte(']') catch return;
+        w.writeByte(']') catch |e| {
+            out.err = e;
+            return;
+        };
     }
-    w.writeAll("]}") catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.writeAll("]}") catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiScanArray(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -425,29 +518,65 @@ fn topkWork(path: [:0]const u8, column_name: [:0]const u8, k: usize, where: ?[:0
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeAll("{\"names\":[") catch return;
+    w.writeAll("{\"names\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     for (header, 0..) |name, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         jsonEscapedString(w, name);
     }
-    w.writeAll("],\"rows\":[") catch return;
+    w.writeAll("],\"rows\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     const items = tk.getSorted();
     for (items, 0..) |entry, i| {
-        if (i > 0) w.writeByte(',') catch return;
-        w.writeByte('[') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
+        w.writeByte('[') catch |e| {
+            out.err = e;
+            return;
+        };
         for (entry.row.fields, 0..) |f, j| {
-            if (j > 0) w.writeByte(',') catch return;
+            if (j > 0) w.writeByte(',') catch |e| {
+                out.err = e;
+                return;
+            };
             jsonEscapedString(w, f);
         }
-        w.writeByte(']') catch return;
+        w.writeByte(']') catch |e| {
+            out.err = e;
+            return;
+        };
     }
-    w.writeAll("],\"keys\":[") catch return;
+    w.writeAll("],\"keys\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     for (items, 0..) |entry, i| {
-        if (i > 0) w.writeByte(',') catch return;
-        w.print("{d}", .{entry.key}) catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
+        w.print("{d}", .{entry.key}) catch |e| {
+            out.err = e;
+            return;
+        };
     }
-    w.writeAll("]}") catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.writeAll("]}") catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiTopk(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -511,23 +640,50 @@ fn orderByWork(path: [:0]const u8, column_name: [:0]const u8, where: ?[:0]const 
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeAll("{\"names\":[") catch return;
+    w.writeAll("{\"names\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     for (header, 0..) |name, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         jsonEscapedString(w, name);
     }
-    w.writeAll("],\"rows\":[") catch return;
+    w.writeAll("],\"rows\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     for (ordered.rows, 0..) |row, i| {
-        if (i > 0) w.writeByte(',') catch return;
-        w.writeByte('[') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
+        w.writeByte('[') catch |e| {
+            out.err = e;
+            return;
+        };
         for (row.fields, 0..) |f, j| {
-            if (j > 0) w.writeByte(',') catch return;
+            if (j > 0) w.writeByte(',') catch |e| {
+                out.err = e;
+                return;
+            };
             jsonEscapedString(w, f);
         }
-        w.writeByte(']') catch return;
+        w.writeByte(']') catch |e| {
+            out.err = e;
+            return;
+        };
     }
-    w.writeAll("]}") catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.writeAll("]}") catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiOrderBy(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {

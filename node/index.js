@@ -54,10 +54,9 @@ function call(fn, ...args) {
   }
 }
 
-// A row can legitimately carry MORE fields than the header: ragged CSV,
-// or a delimiter inside a quoted field (this scanner splits on the
-// delimiter and does not treat quotes as grouping — see the README's CSV
-// note). Looping to names.length silently DROPPED those values, while
+// A row can legitimately carry MORE fields than the header — ragged CSV
+// is a real thing and this reader handles it. Looping to names.length
+// silently DROPPED those values, while
 // scanArray() (which returns raw arrays) kept them — the same file gave
 // two different answers depending on which function you called. Extra
 // fields now get a positional `colN` key, matching the Python client and
@@ -108,7 +107,10 @@ async function* scan(filePath, options = {}) {
   const names = JSON.parse(namesJson);
   try {
     let rowJson;
-    while ((rowJson = addon().nextRowJson(handle)) !== null) {
+    // Through call(), like every other addon entry point: a mid-scan
+    // failure (a malformed row, an unterminated quote) has to surface as
+    // a ScanError, not as whatever bare Error the addon threw.
+    while ((rowJson = call(addon().nextRowJson, handle)) !== null) {
       yield zipRow(names, JSON.parse(rowJson));
     }
   } finally {
