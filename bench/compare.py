@@ -63,13 +63,44 @@ WHERE = f"{WHERE_COL} = {WHERE_VAL}"
 # quietly skipping work.
 
 RUNNER = r"""
-import json, resource, subprocess, sys, time
+import json, subprocess, sys, time
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+            )
+        ]
+
+    memory_info = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+    memory_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessMemoryCounters), wintypes.DWORD]
+    memory_info.restype = wintypes.BOOL
+else:
+    import resource
+
 cmd = json.loads(sys.argv[1])
 t0 = time.monotonic()
-p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
-el = time.monotonic() - t0
-rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0
-print(json.dumps({"secs": el, "rss_mb": rss, "out": p.stdout, "err": p.stderr[-400:], "rc": p.returncode}))
+with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      encoding="utf-8", errors="replace") as p:
+    out, err = p.communicate()
+    el = time.monotonic() - t0
+    if sys.platform == "win32":
+        # Popen retains its process handle after communicate(), even for
+        # short-lived children. Read the OS peak before releasing it.
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not memory_info(int(p._handle), ctypes.byref(counters), counters.cb):
+            raise ctypes.WinError(ctypes.get_last_error())
+        rss = counters.PeakWorkingSetSize / (1024.0 ** 2)
+    else:
+        divisor = 1024.0 ** 2 if sys.platform == "darwin" else 1024.0
+        rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / divisor
+    print(json.dumps({"secs": el, "rss_mb": rss, "out": out, "err": err[-400:], "rc": p.returncode}))
 """
 
 
@@ -83,6 +114,8 @@ def run_once(cmd, extra_env=None):
             env.update(extra_env)
         p = subprocess.run([sys.executable, runner, json.dumps(cmd)],
                            capture_output=True, encoding="utf-8", errors="replace", env=env)
+        if p.returncode != 0:
+            raise RuntimeError(f"benchmark runner exited {p.returncode}: {p.stderr.strip()}")
         return json.loads(p.stdout)
     finally:
         os.unlink(runner)

@@ -227,6 +227,9 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
         getattr(lib, _fn).argtypes = [ctypes.c_void_p]
         getattr(lib, _fn).restype = ctypes.c_uint64
 
+    lib.scanio_validator_n_columns.argtypes = [ctypes.c_void_p]
+    lib.scanio_validator_n_columns.restype = ctypes.c_size_t
+
     lib.scanio_validator_column_name.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     lib.scanio_validator_column_name.restype = ctypes.c_char_p
 
