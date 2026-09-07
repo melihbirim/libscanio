@@ -28,6 +28,7 @@ const usage =
     \\  --columns <a,b,c>   only these columns, in this order
     \\  --limit <n>         stop after n matching rows
     \\  --count             print just the number of matching rows
+    \\  --not               invert --where: emit the rows it REJECTS
     \\  --format <fmt>      csv (default) or ndjson
     \\  --help
     \\
@@ -64,6 +65,10 @@ pub const Args = struct {
     columns: ?[]const u8 = null,
     limit: ?usize = null,
     count_only: bool = false,
+    /// Invert the whole --where clause: emit its complement. Not a
+    /// per-clause NOT — the case this exists for is "show me the rows
+    /// that failed", which is the negation of the entire AND-list.
+    negate: bool = false,
     format: Format = .csv,
     help: bool = false,
     /// Path to a JSON schema file. Set = run validation instead of a scan.
@@ -99,6 +104,8 @@ pub fn parseArgs(argv: []const []const u8) ArgError!Args {
             return a;
         } else if (std.mem.eql(u8, arg, "--count")) {
             a.count_only = true;
+        } else if (std.mem.eql(u8, arg, "--not")) {
+            a.negate = true;
         } else if (std.mem.eql(u8, arg, "--where")) {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
@@ -145,7 +152,7 @@ pub fn parseArgs(argv: []const []const u8) ArgError!Args {
     }
     // Silently ignoring a flag is worse than refusing it: a caller who
     // wrote `--validate s.json --where x = 1` believes the filter ran.
-    if (a.validate != null and (a.where != null or a.columns != null or a.limit != null or a.count_only)) {
+    if (a.validate != null and (a.where != null or a.columns != null or a.limit != null or a.count_only or a.negate)) {
         return ArgError.ValidateConflict;
     }
     return a;
@@ -270,6 +277,7 @@ pub fn main() !u8 {
 
     var q = scanio.Query.open(allocator, args.path, .{
         .where = predicates,
+        .negate = args.negate,
         .columns = columns,
         .limit = args.limit,
         .stop_after_column = max_col,
@@ -498,4 +506,14 @@ test "parseArgs: --max-errors, including the 'list them all' spelling" {
     // Meaningless without --validate, so refused rather than ignored.
     try testing.expectError(ArgError.ValidateRequired, parseArgs(&.{ "d.csv", "--max-errors", "5" }));
     try testing.expectError(ArgError.BadLimit, parseArgs(&.{ "d.csv", "--validate", "s.json", "--max-errors", "x" }));
+}
+
+test "parseArgs: --not inverts the where clause" {
+    const a = try parseArgs(&.{ "d.csv", "--where", "a = 1", "--not" });
+    try testing.expect(a.negate);
+    const b = try parseArgs(&.{ "d.csv", "--where", "a = 1" });
+    try testing.expect(!b.negate);
+    // --validate has its own --valid/--invalid; --not there would be a
+    // second, silently-ignored way to say the same thing.
+    try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--not" }));
 }

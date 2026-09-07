@@ -32,6 +32,7 @@ def scan(
     columns: Optional[list[str]] = None,
     where: Optional[str] = None,
     limit: Optional[int] = None,
+    negate: bool = False,
 ) -> list[dict[str, str]]:
     """Scan a CSV file and return matching rows. This tool always
     materializes the result list to return it over MCP, so pass `limit`
@@ -48,8 +49,14 @@ def scan(
     where: e.g. "revenue > 1000", "city = Austin AND revenue > 1000", or
     "color IN (yellow, green)". Operators: = != > >= < <= IN. Only AND
     joins clauses — no OR (IN covers "any of these values" without it).
+
+    negate=True returns the rows `where` REJECTS instead of the ones it
+    accepts — the complement. Useful for "show me the rows that failed
+    these checks". It inverts the whole AND-list, not each clause, and
+    with no `where` it returns nothing.
     """
-    return libscanio.scan_array(path, columns=columns, where=where, limit=limit, as_dict=True)
+    return libscanio.scan_array(path, columns=columns, where=where, limit=limit,
+                                as_dict=True, negate=negate)
 
 
 @server.tool()
@@ -60,10 +67,14 @@ def schema(path: str) -> list[str]:
 
 
 @server.tool()
-def count(path: str, where: Optional[str] = None) -> int:
+def count(path: str, where: Optional[str] = None, negate: bool = False) -> int:
     """Row count, optionally filtered. With no `where`, never parses a
-    single field — fast regardless of file size."""
-    return libscanio.count(path, where=where)
+    single field — fast regardless of file size.
+
+    negate=True counts the rows `where` REJECTS instead — the cheapest
+    way to ask how many rows fail a set of checks, since no row data is
+    returned at all. With no `where` it counts nothing."""
+    return libscanio.count(path, where=where, negate=negate)
 
 
 @server.tool()

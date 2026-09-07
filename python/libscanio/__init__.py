@@ -154,6 +154,7 @@ def scan(
     columns: Optional[Sequence[str]] = None,
     where: Optional[str] = None,
     limit: Optional[int] = None,
+    negate: bool = False,
 ) -> Iterator[dict[str, str]]:
     """Scan a CSV file, yielding one dict per matching row.
 
@@ -166,6 +167,15 @@ def scan(
                Only AND joins clauses — no OR (IN covers the common
                "any of these values" case without it).
         limit: Maximum rows to return. Default: no limit.
+        negate: Return the rows `where` REJECTS instead of the ones it
+               accepts — the complement of the result set. This is the
+               negation of the whole AND-list, not a general boolean
+               expression; the case it exists for is "give me the rows
+               that failed these checks". With no `where` it yields
+               nothing, since the negation of "keep everything" is
+               "keep none". A row too short to have a predicate's column
+               counts as rejected, so it lands here rather than being
+               silently dropped from both halves.
 
     Raises:
         ScanError: file not found, malformed WHERE, or unknown column name.
@@ -175,7 +185,7 @@ def scan(
     # this generator's frame for as long as ctx is in use — see
     # _open_full()'s doc comment for why (a real use-after-free bug, not
     # a hypothetical one, lived here until this was fixed).
-    ctx, names, keepalive = _open_full(lib, path, columns, where, limit)  # noqa: F841
+    ctx, names, keepalive = _open_full(lib, path, columns, where, limit, negate)  # noqa: F841
     try:
         fields = ctypes.POINTER(ctypes.c_char_p)()
         n = ctypes.c_size_t()
@@ -196,6 +206,7 @@ def _open_full(
     columns: Optional[Sequence[str]],
     where: Optional[str],
     limit: Optional[int],
+    negate: bool = False,
 ) -> tuple[ctypes.c_void_p, list[str], list]:
     """Shared open logic for scan() and scan_array(): resolve column
     names + WHERE to indices/predicates (via a throwaway probe open,
@@ -248,6 +259,7 @@ def _open_full(
         n_where=len(predicates) if predicates else 0,
         limit=limit if limit is not None else -1,
         max_column=max_column,
+        negate=1 if negate else 0,
     )
     keepalive = keepalive + [predicates, where_arr, columns_arr, opts]
 
@@ -267,6 +279,7 @@ def scan_array(
     where: Optional[str] = None,
     limit: Optional[int] = None,
     as_dict: bool = False,
+    negate: bool = False,
 ) -> list:
     """Like scan(), but for when you actually want every matching row
     back as a Python list/array right now, not streamed. Collects the
@@ -302,8 +315,8 @@ def scan_array(
     """
     lib = load()
     if columns is not None or limit is not None:
-        return _scan_array_single_threaded(lib, path, columns, where, limit, as_dict)
-    return _scan_array_parallel(lib, path, where, as_dict)
+        return _scan_array_single_threaded(lib, path, columns, where, limit, as_dict, negate)
+    return _scan_array_parallel(lib, path, where, as_dict, negate)
 
 
 def _scan_array_single_threaded(
@@ -313,8 +326,9 @@ def _scan_array_single_threaded(
     where: Optional[str],
     limit: Optional[int],
     as_dict: bool,
+    negate: bool = False,
 ) -> list:
-    ctx, names, _keepalive = _open_full(lib, path, columns, where, limit)
+    ctx, names, _keepalive = _open_full(lib, path, columns, where, limit, negate)
     try:
         cc = lib.scanio_collect(ctx)
         if not cc:
@@ -348,7 +362,7 @@ def _scan_array_single_threaded(
         lib.scanio_close(ctx)
 
 
-def _scan_array_parallel(lib: ctypes.CDLL, path: str, where: Optional[str], as_dict: bool) -> list:
+def _scan_array_parallel(lib: ctypes.CDLL, path: str, where: Optional[str], as_dict: bool, negate: bool = False) -> list:
     names = schema(path)
 
     probe_ctx = lib.scanio_open(path.encode(), None)
@@ -362,7 +376,7 @@ def _scan_array_parallel(lib: ctypes.CDLL, path: str, where: Optional[str], as_d
     where_arr = (CPredicate * len(predicates))(*predicates) if predicates else None
     n_where = len(predicates) if predicates else 0
 
-    cc = lib.scanio_parallel_collect_columnar(path.encode(), b",", where_arr, n_where, 0)
+    cc = lib.scanio_parallel_collect_columnar(path.encode(), b",", where_arr, n_where, 1 if negate else 0, 0)
     if not cc:
         _raise_last_error(lib, "parallel scan failed")
     try:
@@ -422,7 +436,7 @@ _ARROW_TYPE_FOR_INFERRED = {
 }
 
 
-def scan_table(path: str, where: Optional[str] = None, infer_types: bool = False):
+def scan_table(path: str, where: Optional[str] = None, infer_types: bool = False, negate: bool = False):
     """Every matching row as a `pyarrow.Table` — zero-copy from the same
     Zig-side columnar (data, offsets) buffers scan_array() uses, but
     with NO per-cell Python object construction at all (scan_array()
@@ -481,7 +495,7 @@ def scan_table(path: str, where: Optional[str] = None, infer_types: bool = False
     where_arr = (CPredicate * len(predicates))(*predicates) if predicates else None
     n_where = len(predicates) if predicates else 0
 
-    cc = lib.scanio_parallel_collect_columnar(path.encode(), b",", where_arr, n_where, 0)
+    cc = lib.scanio_parallel_collect_columnar(path.encode(), b",", where_arr, n_where, 1 if negate else 0, 0)
     if not cc:
         _raise_last_error(lib, "parallel scan failed")
 
@@ -559,7 +573,8 @@ def scan_table(path: str, where: Optional[str] = None, infer_types: bool = False
 
 
 def _open_filtered(
-    lib: ctypes.CDLL, path: str, where: Optional[str], extra_column: Optional[int] = None
+    lib: ctypes.CDLL, path: str, where: Optional[str], extra_column: Optional[int] = None,
+    negate: bool = False,
 ) -> tuple[ctypes.c_void_p, list]:
     """Open with WHERE resolved to predicates — the shared setup schema(),
     count(), aggregate(), and topk() all need before doing their own
@@ -576,7 +591,10 @@ def _open_filtered(
     Returns (ctx, keepalive) — see _open_full()'s doc comment for why
     `keepalive` must stay referenced by the caller until `ctx` is closed,
     not just through this function. Same bug class, same fix."""
-    if not where and extra_column is None:
+    # `negate` has to reach the library even with nothing else to pass:
+    # NOT(keep everything) is zero rows, and the no-options open would
+    # answer with the row total instead.
+    if not where and extra_column is None and not negate:
         ctx = lib.scanio_open(path.encode(), None)
         if not ctx:
             _raise_last_error(lib, f"failed to open {path!r}")
@@ -600,7 +618,8 @@ def _open_filtered(
     needed = [p.column for p in predicates] + ([extra_column] if extra_column is not None else [])
     max_column = max(needed) if needed else -1
     opts = COptions(
-        columns=None, n_columns=0, where=where_arr, n_where=len(predicates), limit=-1, max_column=max_column
+        columns=None, n_columns=0, where=where_arr, n_where=len(predicates), limit=-1,
+        max_column=max_column, negate=1 if negate else 0,
     )
     keepalive = keepalive + [predicates, where_arr, opts]
     ctx = lib.scanio_open(path.encode(), ctypes.byref(opts))
@@ -633,10 +652,16 @@ def schema(path: str) -> list[str]:
         lib.scanio_close(ctx)
 
 
-def count(path: str, where: Optional[str] = None) -> int:
-    """Row count. With no `where`, never parses a single field."""
+def count(path: str, where: Optional[str] = None, negate: bool = False) -> int:
+    """Row count. With no `where`, never parses a single field.
+
+    `negate` counts the rows `where` REJECTS instead — the cheapest way
+    to ask "how many rows fail these checks", since nothing crosses back
+    into Python at all. With no `where` it counts nothing, because the
+    negation of "keep everything" is "keep none".
+    """
     lib = load()
-    ctx, _keepalive = _open_filtered(lib, path, where)
+    ctx, _keepalive = _open_filtered(lib, path, where, None, negate)
     try:
         n = lib.scanio_count(ctx)
         if n < 0:

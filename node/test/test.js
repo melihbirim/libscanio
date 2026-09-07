@@ -431,6 +431,54 @@ async function main() {
     fs.unlinkSync(valPath);
   }
 
+  // negate: the complement of a WHERE clause. The property that matters
+  // is that the two halves PARTITION the file — every row in exactly
+  // one, no row in both, none lost.
+  const negPath = path.join(os.tmpdir(), `libscanio_negate_${process.pid}.csv`);
+  fs.writeFileSync(negPath, 'id,city,amount\n1,London,10\n2,Paris,20\n3,London,30\n4,Berlin,40\n5,Paris,50\n');
+  try {
+    const kept = libscanio.scanArray(negPath, { where: 'city = London' });
+    const dropped = libscanio.scanArray(negPath, { where: 'city = London', negate: true });
+    check('negate: scanArray returns the complement', dropped.length, 3);
+    check('negate: the two halves partition the file',
+      kept.length + dropped.length, libscanio.count(negPath));
+    check('negate: no row appears in both halves',
+      kept.map((r) => r[0]).filter((id) => dropped.some((d) => d[0] === id)), []);
+    check('negate: count agrees with scanArray',
+      libscanio.count(negPath, 'city = London', { negate: true }), dropped.length);
+    check('negate: scan() streams the same rows scanArray() collects',
+      (await collect(libscanio.scan(negPath, { where: 'city = London', negate: true })))
+        .map((r) => Object.values(r)),
+      dropped);
+
+    // NOT(a AND b) inverts the CONJUNCTION, not each clause.
+    check('negate: inverts the whole AND-list, not each clause',
+      libscanio.scanArray(negPath, { where: 'city = London AND amount > 20' }).length, 1);
+    check('negate: ...so everything else is rejected',
+      libscanio.scanArray(negPath, { where: 'city = London AND amount > 20', negate: true }).length, 4);
+
+    check('negate: with no where, nothing matches', libscanio.count(negPath, null, { negate: true }), 0);
+    check('negate: ...and scan yields nothing',
+      await collect(libscanio.scan(negPath, { negate: true })), []);
+    check('negate: composes with columns and limit',
+      libscanio.scanArray(negPath, { columns: ['city'], where: 'city = London', limit: 2, negate: true }),
+      [['Paris'], ['Berlin']]);
+  } finally {
+    fs.unlinkSync(negPath);
+  }
+
+  const negRagged = path.join(os.tmpdir(), `libscanio_negate_ragged_${process.pid}.csv`);
+  fs.writeFileSync(negRagged, 'a,b\n1,10\n2\n3,30\n');
+  try {
+    check('negate: a truncated row counts as rejected',
+      libscanio.count(negRagged, 'b >= 0', { negate: true }), 1);
+    check('negate: ...and is not lost from the partition',
+      libscanio.count(negRagged, 'b >= 0') + libscanio.count(negRagged, 'b >= 0', { negate: true }),
+      libscanio.count(negRagged));
+  } finally {
+    fs.unlinkSync(negRagged);
+  }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }

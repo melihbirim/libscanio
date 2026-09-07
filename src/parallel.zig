@@ -584,6 +584,7 @@ const JsonArrayFilterCtx = struct {
     allocator: Allocator,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
+    negate: bool,
     field_buf: [][]const u8,
     arena: std.heap.ArenaAllocator,
     count: usize = 0,
@@ -597,7 +598,7 @@ const JsonArrayFilterCtx = struct {
             self.field_buf[idx] = renderJsonValue(field.value) catch continue;
         }
         const scan = @import("root.zig");
-        if (query_mod.matches(scan.Row{ .fields = self.field_buf }, self.predicates)) self.count += 1;
+        if (query_mod.matches(scan.Row{ .fields = self.field_buf }, self.predicates, self.negate)) self.count += 1;
     }
 };
 
@@ -608,6 +609,7 @@ const JsonArrayFilterWorker = struct {
     header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
+    negate: bool,
     result: usize = 0,
     err: ?anyerror = null,
 };
@@ -620,7 +622,7 @@ fn jsonArrayFilterWorkerRun(w: *JsonArrayFilterWorker) void {
     var ctx = JsonArrayFilterCtx{
         .allocator = w.allocator,
         .header_index = w.header_index,
-        .predicates = w.predicates,
+        .predicates = w.predicates, .negate = w.negate,
         .field_buf = field_buf,
         .arena = std.heap.ArenaAllocator.init(w.allocator),
     };
@@ -753,6 +755,7 @@ const CsvFilterCtx = struct {
     allocator: Allocator,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     stop_after_column: usize,
     field_buf: std.ArrayListUnmanaged([]const u8) = .{},
     quote_scratch: std.ArrayListUnmanaged(u8) = .{},
@@ -774,7 +777,7 @@ const CsvFilterCtx = struct {
             if (self.field_buf.items.len == self.stop_after_column + 1) break;
         }
         const scan = @import("root.zig");
-        if (query_mod.matches(scan.Row{ .fields = self.field_buf.items }, self.predicates)) self.count += 1;
+        if (query_mod.matches(scan.Row{ .fields = self.field_buf.items }, self.predicates, self.negate)) self.count += 1;
     }
 };
 
@@ -784,13 +787,14 @@ const CsvFilterWorker = struct {
     range: Range,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     stop_after_column: usize,
     result: usize = 0,
     err: ?anyerror = null,
 };
 
 fn csvFilterWorkerRun(w: *CsvFilterWorker) void {
-    var ctx = CsvFilterCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates, .stop_after_column = w.stop_after_column };
+    var ctx = CsvFilterCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates, .negate = w.negate, .stop_after_column = w.stop_after_column };
     defer ctx.deinit();
     forEachLineInRange(w.allocator, w.file, w.range, CsvFilterCtx, &ctx, CsvFilterCtx.onLine) catch |e| {
         w.err = e;
@@ -817,6 +821,7 @@ const NdjsonFilterCtx = struct {
     header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
+    negate: bool,
     field_buf: [][]const u8,
     arena: std.heap.ArenaAllocator,
     count: usize = 0,
@@ -853,7 +858,7 @@ const NdjsonFilterCtx = struct {
             }
         }
         const scan = @import("root.zig");
-        if (query_mod.matches(scan.Row{ .fields = self.field_buf }, self.predicates)) self.count += 1;
+        if (query_mod.matches(scan.Row{ .fields = self.field_buf }, self.predicates, self.negate)) self.count += 1;
     }
 };
 
@@ -874,6 +879,7 @@ const NdjsonFilterWorker = struct {
     header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
+    negate: bool,
     result: usize = 0,
     err: ?anyerror = null,
 };
@@ -887,7 +893,7 @@ fn ndjsonFilterWorkerRun(w: *NdjsonFilterWorker) void {
         .allocator = w.allocator,
         .header = w.header,
         .header_index = w.header_index,
-        .predicates = w.predicates,
+        .predicates = w.predicates, .negate = w.negate,
         .field_buf = field_buf,
         .arena = std.heap.ArenaAllocator.init(w.allocator),
     };
@@ -970,9 +976,15 @@ pub fn parallelCountRowsWhere(
     path: []const u8,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     num_threads_in: usize,
 ) !usize {
-    if (predicates.len == 0) return parallelCountRows(allocator, path, num_threads_in);
+    // No filter means every row matches, so the negation matches none —
+    // the bare-count fast path would otherwise answer with the row total.
+    if (predicates.len == 0) {
+        if (negate) return 0;
+        return parallelCountRows(allocator, path, num_threads_in);
+    }
 
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
@@ -994,7 +1006,7 @@ pub fn parallelCountRowsWhere(
         defer allocator.free(workers);
         const threads = try allocator.alloc(std.Thread, ranges.len);
         defer allocator.free(threads);
-        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates, .negate = negate };
         try spawnAndJoin(threads, jsonArrayFilterWorkerRun, workers);
 
         var total: usize = 0;
@@ -1024,7 +1036,7 @@ pub fn parallelCountRowsWhere(
         defer allocator.free(workers);
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
-        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .stop_after_column = stop_after_column };
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .negate = negate, .stop_after_column = stop_after_column };
         try spawnAndJoin(threads, csvFilterWorkerRun, workers);
         for (workers) |w| {
             if (w.err) |e| return e;
@@ -1037,7 +1049,7 @@ pub fn parallelCountRowsWhere(
         defer allocator.free(workers);
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
-        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates, .negate = negate };
         try spawnAndJoin(threads, ndjsonFilterWorkerRun, workers);
         for (workers) |w| {
             if (w.err) |e| return e;
@@ -1061,6 +1073,7 @@ const CsvScanCtx = struct {
     allocator: Allocator,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     field_buf: std.ArrayListUnmanaged([]const u8) = .{},
     quote_scratch: std.ArrayListUnmanaged(u8) = .{},
     rows: std.ArrayListUnmanaged(OwnedRow) = .{},
@@ -1071,7 +1084,7 @@ const CsvScanCtx = struct {
         while (try it.next()) |field| try self.field_buf.append(self.allocator, field);
         const scan = @import("root.zig");
         const row = scan.Row{ .fields = self.field_buf.items };
-        if (query_mod.matches(row, self.predicates)) {
+        if (query_mod.matches(row, self.predicates, self.negate)) {
             try self.rows.append(self.allocator, try topk_mod.copyRow(self.allocator, row));
         }
     }
@@ -1083,12 +1096,13 @@ const CsvScanWorker = struct {
     range: Range,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     rows: []OwnedRow = &.{},
     err: ?anyerror = null,
 };
 
 fn csvScanWorkerRun(w: *CsvScanWorker) void {
-    var ctx = CsvScanCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates };
+    var ctx = CsvScanCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates, .negate = w.negate };
     defer ctx.field_buf.deinit(w.allocator);
     defer ctx.quote_scratch.deinit(w.allocator);
     forEachLineInRange(w.allocator, w.file, w.range, CsvScanCtx, &ctx, CsvScanCtx.onLine) catch |e| {
@@ -1110,6 +1124,7 @@ const NdjsonScanCtx = struct {
     header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
+    negate: bool,
     field_buf: [][]const u8,
     arena: std.heap.ArenaAllocator,
     rows: std.ArrayListUnmanaged(OwnedRow) = .{},
@@ -1138,7 +1153,7 @@ const NdjsonScanCtx = struct {
         }
         const scan = @import("root.zig");
         const row = scan.Row{ .fields = self.field_buf };
-        if (query_mod.matches(row, self.predicates)) {
+        if (query_mod.matches(row, self.predicates, self.negate)) {
             try self.rows.append(self.allocator, try topk_mod.copyRow(self.allocator, row));
         }
     }
@@ -1151,6 +1166,7 @@ const NdjsonScanWorker = struct {
     header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
+    negate: bool,
     rows: []OwnedRow = &.{},
     err: ?anyerror = null,
 };
@@ -1164,7 +1180,7 @@ fn ndjsonScanWorkerRun(w: *NdjsonScanWorker) void {
         .allocator = w.allocator,
         .header = w.header,
         .header_index = w.header_index,
-        .predicates = w.predicates,
+        .predicates = w.predicates, .negate = w.negate,
         .field_buf = field_buf,
         .arena = std.heap.ArenaAllocator.init(w.allocator),
     };
@@ -1208,6 +1224,7 @@ pub fn parallelScan(
     path: []const u8,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     num_threads_in: usize,
 ) !ScannedRows {
     const file = try std.fs.cwd().openFile(path, .{});
@@ -1217,7 +1234,7 @@ pub fn parallelScan(
 
     if (try sniffFormat(file, file_size) == .json_array) {
         const scan = @import("root.zig");
-        var q = try scan.Query.open(allocator, path, .{ .where = predicates, .format = .ndjson });
+        var q = try scan.Query.open(allocator, path, .{ .where = predicates, .negate = negate, .format = .ndjson });
         defer q.deinit();
         var rows: std.ArrayListUnmanaged(OwnedRow) = .{};
         errdefer {
@@ -1253,7 +1270,7 @@ pub fn parallelScan(
         defer allocator.free(workers);
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
-        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates };
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .negate = negate };
         try spawnAndJoin(threads, csvScanWorkerRun, workers);
 
         var first_err: ?anyerror = null;
@@ -1278,7 +1295,7 @@ pub fn parallelScan(
         defer allocator.free(workers);
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
-        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates, .negate = negate };
         try spawnAndJoin(threads, ndjsonScanWorkerRun, workers);
 
         var first_err: ?anyerror = null;
@@ -1351,6 +1368,7 @@ const CsvScanColumnarCtx = struct {
     allocator: Allocator,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     field_buf: std.ArrayListUnmanaged([]const u8) = .{},
     quote_scratch: std.ArrayListUnmanaged(u8) = .{},
     columns: []ColumnBuf,
@@ -1362,7 +1380,7 @@ const CsvScanColumnarCtx = struct {
         while (try it.next()) |field| try self.field_buf.append(self.allocator, field);
         const scan = @import("root.zig");
         const row = scan.Row{ .fields = self.field_buf.items };
-        if (!query_mod.matches(row, self.predicates)) return;
+        if (!query_mod.matches(row, self.predicates, self.negate)) return;
         for (self.field_buf.items, 0..) |field, ci| {
             if (ci >= self.columns.len) break; // wider row than the header — extra trailing fields ignored, same as row-major collect()
             try self.columns[ci].data.appendSlice(self.allocator, field);
@@ -1393,6 +1411,7 @@ const CsvScanColumnarWorker = struct {
     range: Range,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     n_cols: usize,
     columns: []ColumnBuf = &.{},
     n_rows: usize = 0,
@@ -1404,7 +1423,7 @@ fn csvScanColumnarWorkerRun(w: *CsvScanColumnarWorker) void {
         w.err = e;
         return;
     };
-    var ctx = CsvScanColumnarCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates, .columns = columns };
+    var ctx = CsvScanColumnarCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates, .negate = w.negate, .columns = columns };
     defer ctx.field_buf.deinit(w.allocator);
     defer ctx.quote_scratch.deinit(w.allocator);
     forEachLineInRange(w.allocator, w.file, w.range, CsvScanColumnarCtx, &ctx, CsvScanColumnarCtx.onLine) catch |e| {
@@ -1421,6 +1440,7 @@ const NdjsonScanColumnarCtx = struct {
     header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
+    negate: bool,
     field_buf: [][]const u8,
     arena: std.heap.ArenaAllocator,
     columns: []ColumnBuf,
@@ -1459,7 +1479,7 @@ const NdjsonScanColumnarCtx = struct {
         }
         const scan = @import("root.zig");
         const row = scan.Row{ .fields = self.field_buf };
-        if (!query_mod.matches(row, self.predicates)) return;
+        if (!query_mod.matches(row, self.predicates, self.negate)) return;
         for (self.field_buf, 0..) |field, ci| {
             try self.columns[ci].data.appendSlice(self.allocator, field);
             try self.columns[ci].offsets.append(self.allocator, @intCast(self.columns[ci].data.items.len));
@@ -1475,6 +1495,7 @@ const NdjsonScanColumnarWorker = struct {
     header: [][]const u8,
     header_index: *const std.StringHashMapUnmanaged(usize),
     predicates: []const query_mod.Predicate,
+    negate: bool,
     columns: []ColumnBuf = &.{},
     n_rows: usize = 0,
     err: ?anyerror = null,
@@ -1494,7 +1515,7 @@ fn ndjsonScanColumnarWorkerRun(w: *NdjsonScanColumnarWorker) void {
         .allocator = w.allocator,
         .header = w.header,
         .header_index = w.header_index,
-        .predicates = w.predicates,
+        .predicates = w.predicates, .negate = w.negate,
         .field_buf = field_buf,
         .arena = std.heap.ArenaAllocator.init(w.allocator),
         .columns = columns,
@@ -1599,6 +1620,7 @@ pub fn parallelScanColumnar(
     path: []const u8,
     delimiter: u8,
     predicates: []const query_mod.Predicate,
+    negate: bool,
     num_threads_in: usize,
 ) !ColumnarScanResult {
     const file = try std.fs.cwd().openFile(path, .{});
@@ -1608,7 +1630,7 @@ pub fn parallelScanColumnar(
 
     if (try sniffFormat(file, file_size) == .json_array) {
         const scan = @import("root.zig");
-        var q = try scan.Query.open(allocator, path, .{ .where = predicates, .format = .ndjson });
+        var q = try scan.Query.open(allocator, path, .{ .where = predicates, .negate = negate, .format = .ndjson });
         defer q.deinit();
         const n_cols = q.header().len;
         const columns = try newColumnBufs(allocator, n_cols);
@@ -1648,7 +1670,7 @@ pub fn parallelScanColumnar(
         defer allocator.free(workers);
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
-        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .n_cols = n_cols };
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .negate = negate, .n_cols = n_cols };
         try spawnAndJoin(threads, csvScanColumnarWorkerRun, workers);
 
         var first_err: ?anyerror = null;
@@ -1669,7 +1691,7 @@ pub fn parallelScanColumnar(
         defer allocator.free(workers);
         const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
-        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates };
+        for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates, .negate = negate };
         try spawnAndJoin(threads, ndjsonScanColumnarWorkerRun, workers);
 
         var first_err: ?anyerror = null;
@@ -1864,7 +1886,7 @@ test "parallelCountRowsWhere: CSV, single numeric predicate matches Query.count(
     const single_count = try q.count();
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .gt, "1000")};
-    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, 4);
+    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, false, 4);
     try std.testing.expectEqual(single_count, parallel_count);
     try std.testing.expectEqual(@as(usize, 2), parallel_count);
 }
@@ -1875,7 +1897,7 @@ test "parallelCountRowsWhere: CSV, no predicates falls back to the fast path" {
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id\n1\n2\n3\n" });
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    try std.testing.expectEqual(@as(usize, 3), try parallelCountRowsWhere(allocator, path, ',', &.{}, 4));
+    try std.testing.expectEqual(@as(usize, 3), try parallelCountRowsWhere(allocator, path, ',', &.{}, false, 4));
 }
 
 test "parallelCountRowsWhere: CSV, AND of two predicates matches Query.count() on a real multi-chunk file" {
@@ -1905,7 +1927,7 @@ test "parallelCountRowsWhere: CSV, AND of two predicates matches Query.count() o
         query_mod.Predicate.init(1, .eq, "Austin"),
         query_mod.Predicate.init(2, .gt, "100000"),
     };
-    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, 8);
+    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, false, 8);
     try std.testing.expectEqual(single_count, parallel_count);
 }
 
@@ -1926,7 +1948,7 @@ test "parallelCountRowsWhere: NDJSON, single predicate matches Query.count()" {
     const single_count = try q.count();
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(2, .gt, "1000")};
-    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, 4);
+    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, false, 4);
     try std.testing.expectEqual(single_count, parallel_count);
     try std.testing.expectEqual(@as(usize, 2), parallel_count);
 }
@@ -1951,7 +1973,7 @@ test "parallelCountRowsWhere: NDJSON, real multi-chunk file matches Query.count(
     const single_count = try q.count();
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
-    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, 8);
+    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, false, 8);
     try std.testing.expectEqual(single_count, parallel_count);
     try std.testing.expectEqual(@as(usize, 20_000), parallel_count);
 }
@@ -1968,7 +1990,7 @@ test "parallelCountRowsWhere: JSON array, single predicate matches Query.count()
     const single_count = try q.count();
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .gt, "1000")};
-    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, 4);
+    const parallel_count = try parallelCountRowsWhere(allocator, path, ',', &predicates, false, 4);
     try std.testing.expectEqual(single_count, parallel_count);
     try std.testing.expectEqual(@as(usize, 2), parallel_count);
 }
@@ -1986,7 +2008,7 @@ test "parallelCountRowsWhere: JSON array, pretty-printed multi-line still filter
     defer std.fs.cwd().deleteFile(path) catch {};
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
-    try std.testing.expectEqual(@as(usize, 2), try parallelCountRowsWhere(allocator, path, ',', &predicates, 4));
+    try std.testing.expectEqual(@as(usize, 2), try parallelCountRowsWhere(allocator, path, ',', &predicates, false, 4));
 }
 
 test "parallelScan: CSV, single-threaded returns matching rows with full field data" {
@@ -1996,7 +2018,7 @@ test "parallelScan: CSV, single-threaded returns matching rows with full field d
     defer std.fs.cwd().deleteFile(path) catch {};
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
-    var result = try parallelScan(allocator, path, ',', &predicates, 1);
+    var result = try parallelScan(allocator, path, ',', &predicates, false, 1);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
@@ -2012,7 +2034,7 @@ test "parallelScan: CSV, no predicates returns every row" {
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id\n1\n2\n3\n" });
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    var result = try parallelScan(allocator, path, ',', &.{}, 4);
+    var result = try parallelScan(allocator, path, ',', &.{}, false, 4);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 3), result.rows.len);
 }
@@ -2038,7 +2060,7 @@ test "parallelScan: CSV, real multi-chunk file — result set matches Query.coun
     const expected_count = try q.count();
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
-    var result = try parallelScan(allocator, path, ',', &predicates, 8);
+    var result = try parallelScan(allocator, path, ',', &predicates, false, 8);
     defer result.deinit();
 
     try std.testing.expectEqual(expected_count, result.rows.len);
@@ -2073,7 +2095,7 @@ test "parallelScan: NDJSON matches Query result set, fields internally consisten
     const expected_count = try q.count();
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
-    var result = try parallelScan(allocator, path, ',', &predicates, 8);
+    var result = try parallelScan(allocator, path, ',', &predicates, false, 8);
     defer result.deinit();
 
     try std.testing.expectEqual(expected_count, result.rows.len);
@@ -2092,7 +2114,7 @@ test "parallelScan: JSON array matches Query result set" {
     defer std.fs.cwd().deleteFile(path) catch {};
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
-    var result = try parallelScan(allocator, path, ',', &predicates, 4);
+    var result = try parallelScan(allocator, path, ',', &predicates, false, 4);
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
@@ -2104,7 +2126,7 @@ test "parallelScan: empty file returns EmptyFile" {
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "" });
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    try std.testing.expectError(ParallelError.EmptyFile, parallelScan(allocator, path, ',', &.{}, 4));
+    try std.testing.expectError(ParallelError.EmptyFile, parallelScan(allocator, path, ',', &.{}, false, 4));
 }
 
 fn columnarCellValue(result: ColumnarScanResult, col: usize, row: usize) []const u8 {
@@ -2129,10 +2151,10 @@ test "parallelScanColumnar: CSV matches parallelScan's OwnedRow output on a real
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
 
-    var rowResult = try parallelScan(allocator, path, ',', &predicates, 8);
+    var rowResult = try parallelScan(allocator, path, ',', &predicates, false, 8);
     defer rowResult.deinit();
 
-    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, 8);
+    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, false, 8);
     defer colResult.deinit();
 
     try std.testing.expectEqual(rowResult.rows.len, colResult.n_rows);
@@ -2210,7 +2232,7 @@ test "parallelScanColumnar: allocation count stays far below rows*cols (double-c
     var counting = CountingAllocator{ .child = backing };
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
 
-    var colResult = try parallelScanColumnar(counting.allocator(), path, ',', &predicates, 4);
+    var colResult = try parallelScanColumnar(counting.allocator(), path, ',', &predicates, false, 4);
     defer colResult.deinit();
 
     try std.testing.expectEqual(n_rows, colResult.n_rows);
@@ -2240,7 +2262,7 @@ test "parallelScanColumnar: NDJSON matches expected count and field consistency"
     const expected_count = try q.count();
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
-    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, 8);
+    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, false, 8);
     defer colResult.deinit();
 
     try std.testing.expectEqual(expected_count, colResult.n_rows);
@@ -2261,7 +2283,7 @@ test "parallelScanColumnar: JSON array matches expected count" {
     defer std.fs.cwd().deleteFile(path) catch {};
 
     const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "Austin")};
-    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, 4);
+    var colResult = try parallelScanColumnar(allocator, path, ',', &predicates, false, 4);
     defer colResult.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), colResult.n_rows);
@@ -2275,7 +2297,7 @@ test "parallelScanColumnar: no predicates still scans every row" {
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id\n1\n2\n3\n" });
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    var colResult = try parallelScanColumnar(allocator, path, ',', &.{}, 4);
+    var colResult = try parallelScanColumnar(allocator, path, ',', &.{}, false, 4);
     defer colResult.deinit();
     try std.testing.expectEqual(@as(usize, 3), colResult.n_rows);
 }
@@ -2286,7 +2308,7 @@ test "parallelScanColumnar: empty file returns EmptyFile" {
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "" });
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    try std.testing.expectError(ParallelError.EmptyFile, parallelScanColumnar(allocator, path, ',', &.{}, 4));
+    try std.testing.expectError(ParallelError.EmptyFile, parallelScanColumnar(allocator, path, ',', &.{}, false, 4));
 }
 
 test "mergeColumnarWorkers: every allocation-failure point frees each worker exactly once" {
@@ -2359,7 +2381,7 @@ test "parallelScanColumnar: ragged CSV keeps every column's offsets in step with
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b,c\n1,2,3\n4,5\n6\n7,8,9,EXTRA\n" });
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    var res = try parallelScanColumnar(allocator, path, ',', &.{}, 1);
+    var res = try parallelScanColumnar(allocator, path, ',', &.{}, false, 1);
     defer res.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), res.n_rows);
@@ -2399,10 +2421,10 @@ test "quoted CSV: every parallel worker agrees with the single-threaded Scanner"
     const preds = [_]query_mod.Predicate{.{ .column = 2, .op = .eq, .value = "London" }};
 
     // CsvFilterCtx
-    try std.testing.expectEqual(@as(usize, 1), try parallelCountRowsWhere(allocator, path, ',', &preds, 1));
+    try std.testing.expectEqual(@as(usize, 1), try parallelCountRowsWhere(allocator, path, ',', &preds, false, 1));
 
     // CsvScanCtx — three fields per row, quotes stripped, commas kept.
-    var rows = try parallelScan(allocator, path, ',', &.{}, 1);
+    var rows = try parallelScan(allocator, path, ',', &.{}, false, 1);
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
     for (rows.rows) |r| try std.testing.expectEqual(@as(usize, 3), r.fields.len);
@@ -2411,7 +2433,7 @@ test "quoted CSV: every parallel worker agrees with the single-threaded Scanner"
     try std.testing.expectEqualStrings("Berlin, DE", rows.rows[2].fields[2]);
 
     // CsvScanColumnarCtx — same values, column-major.
-    var cols = try parallelScanColumnar(allocator, path, ',', &.{}, 1);
+    var cols = try parallelScanColumnar(allocator, path, ',', &.{}, false, 1);
     defer cols.deinit();
     try std.testing.expectEqual(@as(usize, 3), cols.n_rows);
     try std.testing.expectEqual(@as(usize, 3), cols.n_cols);
@@ -2437,6 +2459,105 @@ test "quoted CSV: an unterminated quote is an error rather than a torn row" {
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b\n1,\"oops\n" });
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    try std.testing.expectError(error.UnterminatedQuote, parallelScan(allocator, path, ',', &.{}, 1));
-    try std.testing.expectError(error.UnterminatedQuote, parallelScanColumnar(allocator, path, ',', &.{}, 1));
+    try std.testing.expectError(error.UnterminatedQuote, parallelScan(allocator, path, ',', &.{}, false, 1));
+    try std.testing.expectError(error.UnterminatedQuote, parallelScanColumnar(allocator, path, ',', &.{}, false, 1));
+}
+
+test "negate: every parallel path returns the complement, and the two halves partition the file" {
+    // Six separate workers evaluate predicates (CSV/NDJSON/JSON-array x
+    // count/scan/columnar). A flag honoured by five of them and dropped
+    // by the sixth is exactly the divergence this file's shared-splitter
+    // work was about, so each one is checked here.
+    const allocator = std.testing.allocator;
+    const scan = @import("root.zig");
+
+    const csv_path = "test_par_negate.csv";
+    var data: std.ArrayListUnmanaged(u8) = .{};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "id,city\n");
+    const cities = [_][]const u8{ "London", "Paris", "Berlin" };
+    for (0..3000) |i| {
+        try data.writer(allocator).print("{d},{s}\n", .{ i, cities[i % 3] });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = csv_path, .data = data.items });
+    defer std.fs.cwd().deleteFile(csv_path) catch {};
+
+    const preds = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "London")};
+
+    for ([_]usize{ 1, 4 }) |threads| {
+        const kept = try parallelCountRowsWhere(allocator, csv_path, ',', &preds, false, threads);
+        const rejected = try parallelCountRowsWhere(allocator, csv_path, ',', &preds, true, threads);
+        try std.testing.expectEqual(@as(usize, 1000), kept);
+        try std.testing.expectEqual(@as(usize, 2000), rejected);
+        try std.testing.expectEqual(@as(usize, 3000), kept + rejected);
+
+        var rows = try parallelScan(allocator, csv_path, ',', &preds, true, threads);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2000), rows.rows.len);
+        for (rows.rows) |r| {
+            try std.testing.expect(!std.mem.eql(u8, r.fields[1], "London"));
+        }
+
+        var cols = try parallelScanColumnar(allocator, csv_path, ',', &preds, true, threads);
+        defer cols.deinit();
+        try std.testing.expectEqual(@as(usize, 2000), cols.n_rows);
+    }
+
+    // And it agrees with the single-threaded Query, which is the only
+    // thing that makes the parallel answer trustworthy.
+    var q = try scan.Query.open(allocator, csv_path, .{ .where = &preds, .negate = true });
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 2000), try q.count());
+}
+
+test "negate: no predicates means the parallel count is zero, not the row total" {
+    const allocator = std.testing.allocator;
+    const path = "test_par_negate_empty.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a\n1\n2\n3\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+    // The bare-count fast path would answer 3 here.
+    try std.testing.expectEqual(@as(usize, 0), try parallelCountRowsWhere(allocator, path, ',', &.{}, true, 4));
+    try std.testing.expectEqual(@as(usize, 3), try parallelCountRowsWhere(allocator, path, ',', &.{}, false, 4));
+}
+
+test "negate: NDJSON and JSON-array parallel paths honour it too" {
+    const allocator = std.testing.allocator;
+
+    const nd_path = "test_par_negate.ndjson";
+    var nd: std.ArrayListUnmanaged(u8) = .{};
+    defer nd.deinit(allocator);
+    const cities = [_][]const u8{ "London", "Paris", "Berlin" };
+    for (0..900) |i| {
+        try nd.writer(allocator).print("{{\"id\": {d}, \"city\": \"{s}\"}}\n", .{ i, cities[i % 3] });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = nd_path, .data = nd.items });
+    defer std.fs.cwd().deleteFile(nd_path) catch {};
+
+    const preds = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "London")};
+    try std.testing.expectEqual(@as(usize, 600), try parallelCountRowsWhere(allocator, nd_path, ',', &preds, true, 4));
+    var nd_rows = try parallelScan(allocator, nd_path, ',', &preds, true, 4);
+    defer nd_rows.deinit();
+    try std.testing.expectEqual(@as(usize, 600), nd_rows.rows.len);
+
+    // JSON array: both entry points delegate to a serial Query, so this
+    // is the check that the flag survives that delegation.
+    const ja_path = "test_par_negate.json";
+    var ja: std.ArrayListUnmanaged(u8) = .{};
+    defer ja.deinit(allocator);
+    try ja.appendSlice(allocator, "[");
+    for (0..300) |i| {
+        if (i > 0) try ja.append(allocator, ',');
+        try ja.writer(allocator).print("{{\"id\": {d}, \"city\": \"{s}\"}}", .{ i, cities[i % 3] });
+    }
+    try ja.appendSlice(allocator, "]");
+    try std.fs.cwd().writeFile(.{ .sub_path = ja_path, .data = ja.items });
+    defer std.fs.cwd().deleteFile(ja_path) catch {};
+
+    try std.testing.expectEqual(@as(usize, 200), try parallelCountRowsWhere(allocator, ja_path, ',', &preds, true, 4));
+    var ja_rows = try parallelScan(allocator, ja_path, ',', &preds, true, 4);
+    defer ja_rows.deinit();
+    try std.testing.expectEqual(@as(usize, 200), ja_rows.rows.len);
+    var ja_cols = try parallelScanColumnar(allocator, ja_path, ',', &preds, true, 4);
+    defer ja_cols.deinit();
+    try std.testing.expectEqual(@as(usize, 200), ja_cols.n_rows);
 }

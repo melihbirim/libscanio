@@ -42,6 +42,20 @@ typedef struct {
      * an early column, since trailing unneeded fields are never split
      * at all. */
     long long max_column;
+    /* Non-zero returns the COMPLEMENT of `where`: every row the filter
+     * REJECTS, rather than every row it accepts. This is the negation of
+     * the whole AND-list — NOT(p1 AND p2 AND ...) — not a general
+     * boolean expression, which is why it is one flag and not an
+     * expression tree. With no `where` at all it matches nothing, since
+     * the negation of "keep everything" is "keep none".
+     *
+     * A row too short to have a predicate's column does not match, so
+     * under negation it DOES: a truncated row cannot satisfy
+     * `amount >= 0`, and belongs with the rejects.
+     *
+     * Last field in the struct, so code that zero-fills
+     * scanio_options_t keeps its existing behaviour. */
+    int negate;
 } scanio_options_t;
 
 /* Opens a CSV file for scanning. Returns NULL on error — call

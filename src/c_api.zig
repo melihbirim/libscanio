@@ -97,6 +97,11 @@ const COptions = extern struct {
     /// ROADMAP.md), since trailing unneeded fields are never scanned at
     /// all rather than split-then-discarded.
     max_column: i64 = -1,
+    /// Non-zero returns the COMPLEMENT of `where` — every row the filter
+    /// REJECTS. Added last in the struct so a caller that zero-fills
+    /// COptions (every existing one does) keeps today's behaviour
+    /// without knowing this field exists.
+    negate: c_int = 0,
 };
 
 /// Owns everything needed to answer scanio_next()/scanio_count() calls:
@@ -241,6 +246,7 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
     }
 
     const stop_after_column: ?usize = if (options) |o| (if (o.max_column >= 0) @intCast(o.max_column) else null) else null;
+    const negate: bool = if (options) |o| o.negate != 0 else false;
 
     const ctx = c_allocator.create(Ctx) catch {
         setError("out of memory allocating scanner context", .{});
@@ -251,6 +257,7 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
         .query = Query.open(c_allocator, std.mem.span(p), .{
             .columns = columns,
             .where = predicates,
+            .negate = negate,
             .limit = limit,
             .stop_after_column = stop_after_column,
         }) catch |e| {
@@ -822,6 +829,7 @@ export fn scanio_parallel_collect_columnar(
     delimiter: u8,
     where: ?[*]const CPredicate,
     n_where: usize,
+    negate: c_int,
     num_threads: usize,
 ) ?*CollectColumnarCtx {
     clearError();
@@ -894,7 +902,7 @@ export fn scanio_parallel_collect_columnar(
     // just takes ownership of its output directly — zero re-copy, since
     // CollectColumnarCtx.columns IS scan.ColumnBuf, not a
     // separate type that needs converting.
-    var result = scan.parallelScanColumnar(c_allocator, std.mem.span(p), delimiter, predicates, num_threads) catch |e| {
+    var result = scan.parallelScanColumnar(c_allocator, std.mem.span(p), delimiter, predicates, negate != 0, num_threads) catch |e| {
         setError("parallel scan failed: {s}", .{@errorName(e)});
         return null;
     };
@@ -1536,7 +1544,7 @@ test "C ABI: scanio_parallel_collect_columnar matches scanio_collect_columnar on
     defer scanio_collect_columnar_close(single);
     scanio_close(ctx);
 
-    const par = scanio_parallel_collect_columnar(path, ',', &preds, 1, 4);
+    const par = scanio_parallel_collect_columnar(path, ',', &preds, 1, 0, 4);
     try std.testing.expect(par != null);
     defer scanio_collect_columnar_close(par);
 
@@ -1660,4 +1668,55 @@ test "C ABI: validation entry points tolerate null arguments" {
     scanio_validator_close(null);
     try std.testing.expectEqual(@as(c_int, -1), scanio_validator_next(null, null, null, null, null));
     try std.testing.expectEqual(@as(u64, 0), scanio_validator_rows_total(null));
+}
+
+test "C ABI: negate returns the complement, and zero-filled options keep the old behaviour" {
+    const path = "test_c_api_negate.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city\n1,London\n2,Paris\n3,London\n4,Berlin\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var pred = CPredicate{ .column = 1, .op = 0, .value = "London", .values = null, .n_values = 0 };
+
+    // The field is last in COptions and defaults to 0, so a caller built
+    // before it existed gets exactly what it always got.
+    var keep_opts = COptions{ .columns = null, .n_columns = 0, .where = @ptrCast(&pred), .n_where = 1, .limit = -1 };
+    const keep = scanio_open(path, &keep_opts);
+    try std.testing.expect(keep != null);
+    try std.testing.expectEqual(@as(i64, 2), scanio_count(keep));
+    scanio_close(keep);
+
+    var drop_opts = COptions{ .columns = null, .n_columns = 0, .where = @ptrCast(&pred), .n_where = 1, .limit = -1, .negate = 1 };
+    const drop = scanio_open(path, &drop_opts);
+    try std.testing.expect(drop != null);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next(drop, &fields, &n));
+    try std.testing.expectEqualStrings("Paris", std.mem.span(fields[1]));
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next(drop, &fields, &n));
+    try std.testing.expectEqualStrings("Berlin", std.mem.span(fields[1]));
+    try std.testing.expectEqual(@as(c_int, 0), scanio_next(drop, &fields, &n));
+    scanio_close(drop);
+}
+
+test "C ABI: the parallel columnar path takes the same flag" {
+    const path = "test_c_api_negate_par.csv";
+    var data = std.ArrayListUnmanaged(u8){};
+    defer data.deinit(c_allocator);
+    try data.appendSlice(c_allocator, "id,city\n");
+    const cities = [_][]const u8{ "London", "Paris" };
+    for (0..600) |i| try data.writer(c_allocator).print("{d},{s}\n", .{ i, cities[i % 2] });
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var pred = CPredicate{ .column = 1, .op = 0, .value = "London", .values = null, .n_values = 0 };
+    const kept = scanio_parallel_collect_columnar(path, ',', @ptrCast(&pred), 1, 0, 4);
+    try std.testing.expect(kept != null);
+    defer scanio_collect_columnar_close(kept);
+    const dropped = scanio_parallel_collect_columnar(path, ',', @ptrCast(&pred), 1, 1, 4);
+    try std.testing.expect(dropped != null);
+    defer scanio_collect_columnar_close(dropped);
+
+    try std.testing.expectEqual(@as(usize, 300), scanio_collect_columnar_n_rows(kept));
+    try std.testing.expectEqual(@as(usize, 300), scanio_collect_columnar_n_rows(dropped));
 }

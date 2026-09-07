@@ -197,7 +197,7 @@ fn napiSchema(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) na
 
 const CountResult = struct { count: i64 = 0, err: ?anyerror = null };
 
-fn countWork(path: [:0]const u8, where: ?[:0]const u8, out: *CountResult) void {
+fn countWork(path: [:0]const u8, where: ?[:0]const u8, negate: bool, out: *CountResult) void {
     var predicates: []Predicate = &.{};
     var header: [][]const u8 = &.{};
     defer if (header.len > 0) freeHeader(c_allocator, header);
@@ -216,6 +216,7 @@ fn countWork(path: [:0]const u8, where: ?[:0]const u8, out: *CountResult) void {
 
     var q = Query.open(c_allocator, path, .{
         .where = predicates,
+        .negate = negate,
         // count() never returns field data — always safe to bound to
         // just the WHERE predicates' columns. Real, measured win: ~7x
         // faster on this fixture's WHERE-filtered count (330ms -> ~45ms)
@@ -238,8 +239,10 @@ fn napiCount(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) nap
     const where = getOptionalStringArg(env, info, 1, c_allocator) catch null;
     defer if (where) |w| c_allocator.free(w);
 
+    const negate = getBoolArg(env, info, 2, false);
+
     var result = CountResult{};
-    runOnWorkerStack(countWork, .{ path, where, &result });
+    runOnWorkerStack(countWork, .{ path, where, negate, &result });
     if (result.err) |e| return failErr(env, e);
     return napiInt64(env, result.count);
 }
@@ -370,7 +373,7 @@ fn writeRowsJson(w: *std.io.Writer, header: []const []const u8, columns: ?[]cons
     try w.writeAll("]}");
 }
 
-fn scanArrayWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, out: *RowsResult) void {
+fn scanArrayWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, negate: bool, out: *RowsResult) void {
     const header = probeHeader(c_allocator, path) catch |e| {
         out.err = e;
         return;
@@ -394,6 +397,7 @@ fn scanArrayWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]co
 
     var q = Query.open(c_allocator, path, .{
         .where = predicates,
+        .negate = negate,
         .columns = columns,
         .limit = if (limit < 0) null else @intCast(limit),
     }) catch |e| {
@@ -473,9 +477,10 @@ fn napiScanArray(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c)
     const columns_json = getOptionalStringArg(env, info, 2, c_allocator) catch null;
     defer if (columns_json) |c| c_allocator.free(c);
     const limit = getIntArg(env, info, 3, i64, -1);
+    const negate = getBoolArg(env, info, 4, false);
 
     var result = RowsResult{};
-    runOnWorkerStack(scanArrayWork, .{ path, where, columns_json, limit, &result });
+    runOnWorkerStack(scanArrayWork, .{ path, where, columns_json, limit, negate, &result });
     if (result.err) |e| return failErr(env, e);
     defer c_allocator.free(result.json);
     return napiString(env, result.json);
@@ -845,7 +850,7 @@ fn unregisterHandle(id: u64) ?*ScanHandle {
     return ScanRegistry.unregister(id);
 }
 
-fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, out: *OpenScanResult) void {
+fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, negate: bool, out: *OpenScanResult) void {
     const header = probeHeader(c_allocator, path) catch |e| {
         out.err = e;
         return;
@@ -868,6 +873,7 @@ fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]con
 
     const q = Query.open(c_allocator, path, .{
         .where = predicates,
+        .negate = negate,
         .columns = columns,
         .limit = if (limit < 0) null else @intCast(limit),
     }) catch |e| {
@@ -956,9 +962,10 @@ fn napiOpenScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) 
     const columns_json = getOptionalStringArg(env, info, 2, c_allocator) catch null;
     defer if (columns_json) |c| c_allocator.free(c);
     const limit = getIntArg(env, info, 3, i64, -1);
+    const negate = getBoolArg(env, info, 4, false);
 
     var result = OpenScanResult{};
-    runOnWorkerStack(openScanWork, .{ path, where, columns_json, limit, &result });
+    runOnWorkerStack(openScanWork, .{ path, where, columns_json, limit, negate, &result });
     if (result.err) |e| return failErr(env, e);
 
     var obj: napi.napi_value = undefined;

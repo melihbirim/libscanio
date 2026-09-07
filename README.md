@@ -110,6 +110,49 @@ while (scanio_next(s, &fields, &n) == 1) {
 scanio_close(s);
 ```
 
+## The rows a filter rejects
+
+Every filter has a complement, and for an import that complement is the
+half you care about: not "which rows do I want" but "which rows can I not
+take". `negate` returns it.
+
+```python
+clean    = libscanio.scan_table("orders.csv", where=RULES)                 # -> the loader
+rejects  = libscanio.scan_array("orders.csv", where=RULES, negate=True)    # -> a rejects file
+how_many = libscanio.count("orders.csv", where=RULES, negate=True)         # -> a gate
+```
+
+```js
+const rejects = libscanio.scanArray('orders.csv', { where: RULES, negate: true });
+const bad     = libscanio.count('orders.csv', RULES, { negate: true });
+```
+
+```bash
+scanio orders.csv --where "amount >= 0" --not            # the rows that failed
+scanio orders.csv --where "amount >= 0" --not --count    # just how many
+```
+
+It inverts the **whole** `where` clause — `NOT(a AND b)` — not each
+clause individually, which is why it is one flag rather than a boolean
+expression language. Two consequences worth knowing:
+
+* **With no `where` it matches nothing**, because the negation of "keep
+  everything" is "keep none". `negate` without a filter is almost always
+  a mistake, and returning zero rows says so rather than silently
+  ignoring the flag.
+* **A row too short to hold a predicate's column counts as rejected.** It
+  cannot satisfy `amount >= 0`, so it lands with the rejects instead of
+  disappearing from both halves.
+
+The two halves always partition the file — every row in exactly one, none
+in both, none lost. `zig build diff-test` asserts that across Python,
+Node, the CLI and an independent oracle on every run.
+
+Why this matters for imports: the rejects are the *small* side. On a
+186MB/3M-row file, pulling the ~1% that failed costs **0.18s**; pulling
+the 99% that passed costs 16s. Take the complement and hand the clean
+side straight to Arrow or a bulk loader without it ever entering Python.
+
 ## Validating an import
 
 CSV files usually arrive to be *loaded*, not queried, and the question a

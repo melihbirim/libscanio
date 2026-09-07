@@ -73,8 +73,16 @@ function schema(filePath) {
 }
 
 /** Row count, optionally filtered. With no `where`, never parses a field. */
-function count(filePath, where = null) {
-  return Number(call(addon().countJson, filePath, where));
+/**
+ * Row count. With no `where`, never parses a single field.
+ *
+ * `negate: true` counts the rows `where` REJECTS instead — the cheapest
+ * way to ask "how many rows fail these checks", since no row data
+ * crosses back into JavaScript at all. With no `where` it counts
+ * nothing, because the negation of "keep everything" is "keep none".
+ */
+function count(filePath, where = null, options = {}) {
+  return Number(call(addon().countJson, filePath, where, options.negate ?? false));
 }
 
 /**
@@ -99,11 +107,19 @@ function aggregate(filePath, column, where = null) {
  * `columns`: project to these column names, in order. `where`: "col OP
  * val [AND col OP val ...]" or "col IN (a, b, c)". `limit`: stop after
  * this many matching rows.
+ *
+ * `negate: true` yields the rows `where` REJECTS instead of the ones it
+ * accepts — the complement of the result set. It negates the whole
+ * AND-list, not individual clauses; the case it exists for is "give me
+ * the rows that failed these checks". With no `where` it yields nothing,
+ * since the negation of "keep everything" is "keep none". A row too
+ * short to have a predicate's column counts as rejected, so it lands
+ * here rather than vanishing from both halves.
  */
 async function* scan(filePath, options = {}) {
-  const { columns, where, limit } = options;
+  const { columns, where, limit, negate = false } = options;
   const columnsJson = columns ? JSON.stringify(columns) : null;
-  const { handle, namesJson } = call(addon().openScan, filePath, where ?? null, columnsJson, limit ?? -1);
+  const { handle, namesJson } = call(addon().openScan, filePath, where ?? null, columnsJson, limit ?? -1, negate);
   const names = JSON.parse(namesJson);
   try {
     let rowJson;
@@ -130,9 +146,11 @@ async function* scan(filePath, options = {}) {
  * @returns {Array<Array<string>> | Array<Object>}
  */
 function scanArray(filePath, options = {}) {
-  const { columns, where, limit, asObjects } = options;
+  const { columns, where, limit, asObjects, negate = false } = options;
   const columnsJson = columns ? JSON.stringify(columns) : null;
-  const { names, rows } = JSON.parse(call(addon().scanArrayJson, filePath, where ?? null, columnsJson, limit ?? -1));
+  const { names, rows } = JSON.parse(
+    call(addon().scanArrayJson, filePath, where ?? null, columnsJson, limit ?? -1, negate)
+  );
   return asObjects ? rows.map((r) => zipRow(names, r)) : rows;
 }
 

@@ -78,6 +78,13 @@ pub const QueryOptions = struct {
     /// Implicitly AND-ed together. Empty = no filter.
     where: []const Predicate = &.{},
     limit: ?usize = null,
+    /// Return the COMPLEMENT of `where` — every row the filter rejects,
+    /// instead of every row it accepts. With no `where` at all this
+    /// matches nothing (the negation of "keep everything"), which is
+    /// unusual enough to be worth stating: `negate` without a filter is
+    /// almost always a caller mistake, and returning zero rows is the
+    /// honest reading of it rather than a silently ignored flag.
+    negate: bool = false,
     /// Null = infer from the path's extension (.ndjson/.jsonl -> ndjson,
     /// anything else -> csv).
     format: ?Format = null,
@@ -168,6 +175,7 @@ pub const Query = struct {
     source: Source,
     columns: ?[]const usize,
     where: []const Predicate,
+    negate: bool = false,
     limit: ?usize,
     returned: usize = 0,
     /// Reused across next() calls when columns != null, same
@@ -191,7 +199,13 @@ pub const Query = struct {
                 break :blk .{ .ndjson = nd };
             },
         };
-        return .{ .source = source, .columns = options.columns, .where = options.where, .limit = options.limit };
+        return .{
+            .source = source,
+            .columns = options.columns,
+            .where = options.where,
+            .negate = options.negate,
+            .limit = options.limit,
+        };
     }
 
     pub fn deinit(self: *Query) void {
@@ -214,7 +228,7 @@ pub const Query = struct {
             if (self.returned >= lim) return null;
         }
         while (try self.source.next()) |row| {
-            if (!matches(row, self.where)) continue;
+            if (!matches(row, self.where, self.negate)) continue;
             self.returned += 1;
             return self.project(row);
         }
@@ -249,13 +263,15 @@ pub const Query = struct {
         // answer anyway for the case that matters (a small limit stops
         // after a few rows instead of counting record boundaries through
         // the whole file).
-        if (self.where.len == 0 and remaining == null) {
+        // ...and no negation: NOT(keep everything) is zero rows, which
+        // the newline-counting path would answer with the row total.
+        if (self.where.len == 0 and remaining == null and !self.negate) {
             return self.source.countFastPath();
         }
 
         var n: usize = 0;
         while (try self.source.next()) |row| {
-            if (!matches(row, self.where)) continue;
+            if (!matches(row, self.where, self.negate)) continue;
             n += 1;
             self.returned += 1;
             if (remaining) |r| {
@@ -277,12 +293,34 @@ pub const Query = struct {
     }
 };
 
-pub fn matches(row: Row, predicates: []const Predicate) bool {
+/// True if `row` should be kept. `negate` inverts the whole conjunction
+/// — NOT(p1 AND p2 AND ...) — which is the complement of the result set,
+/// not a general boolean expression. That distinction is the reason this
+/// is one flag and not an expression tree: the case that actually needed
+/// OR was "give me the rows that FAILED these checks", and the negation
+/// of an AND-list covers it exactly.
+///
+/// `negate` is a required argument rather than a defaulted one on
+/// purpose: every call site has to decide, so a new filter path cannot
+/// silently ignore it and return the wrong half of the file.
+///
+/// A row too short to have a predicate's column does not match — so
+/// under negation it DOES. That is the right answer for the case this
+/// exists for: a truncated row cannot satisfy `amount >= 0`, so it
+/// belongs in the rejects.
+pub fn matches(row: Row, predicates: []const Predicate, negate: bool) bool {
+    var m = true;
     for (predicates) |p| {
-        const field = row.get(p.column) orelse return false;
-        if (!evalOne(field, p)) return false;
+        const field = row.get(p.column) orelse {
+            m = false;
+            break;
+        };
+        if (!evalOne(field, p)) {
+            m = false;
+            break;
+        }
     }
-    return true;
+    return m != negate; // XOR
 }
 
 fn evalOne(field: []const u8, p: Predicate) bool {
@@ -648,4 +686,120 @@ test "parseNumeric: non-finite text is data, not arithmetic" {
     try std.testing.expectEqual(@as(?f64, null), parseNumeric("-inf"));
     try std.testing.expectEqual(@as(?f64, null), parseNumeric("Infinity"));
     try std.testing.expectEqual(@as(?f64, null), parseNumeric("hello"));
+}
+
+test "negate returns exactly the rows the filter rejects" {
+    const allocator = std.testing.allocator;
+    const path = "test_negate.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city\n1,London\n2,Paris\n3,London\n4,Berlin\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]Predicate{Predicate.init(1, .eq, "London")};
+
+    var kept = try Query.open(allocator, path, .{ .where = &preds });
+    defer kept.deinit();
+    var rejected = try Query.open(allocator, path, .{ .where = &preds, .negate = true });
+    defer rejected.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), try kept.count());
+    try std.testing.expectEqual(@as(usize, 2), try rejected.count());
+
+    // The two halves partition the file: every row is in exactly one.
+    var all = try Query.open(allocator, path, .{});
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 4), try all.count());
+
+    var it = try Query.open(allocator, path, .{ .where = &preds, .negate = true });
+    defer it.deinit();
+    const r1 = (try it.next()).?;
+    try std.testing.expectEqualStrings("Paris", r1.get(1).?);
+    const r2 = (try it.next()).?;
+    try std.testing.expectEqualStrings("Berlin", r2.get(1).?);
+    try std.testing.expectEqual(@as(?Row, null), try it.next());
+}
+
+test "negate with no filter matches nothing, rather than silently counting every row" {
+    // NOT(keep everything) is zero rows. The newline-counting fast path
+    // would answer with the row total, so it has to be skipped here —
+    // this is the test that says so.
+    const allocator = std.testing.allocator;
+    const path = "test_negate_empty.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a\n1\n2\n3\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{ .negate = true });
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 0), try q.count());
+
+    var it = try Query.open(allocator, path, .{ .negate = true });
+    defer it.deinit();
+    try std.testing.expectEqual(@as(?Row, null), try it.next());
+}
+
+test "a row too short to test the column counts as rejected" {
+    // It cannot satisfy the predicate, so it belongs in the complement —
+    // which is the answer an import wants: a truncated row is a reject,
+    // not a silent pass.
+    const allocator = std.testing.allocator;
+    const path = "test_negate_ragged.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b\n1,10\n2\n3,30\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]Predicate{Predicate.init(1, .gte, "0")};
+    var kept = try Query.open(allocator, path, .{ .where = &preds });
+    defer kept.deinit();
+    var rejected = try Query.open(allocator, path, .{ .where = &preds, .negate = true });
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try kept.count());
+    try std.testing.expectEqual(@as(usize, 1), try rejected.count());
+}
+
+test "negate composes with projection and limit" {
+    const allocator = std.testing.allocator;
+    const path = "test_negate_proj.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city\n1,London\n2,Paris\n3,Berlin\n4,Madrid\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]Predicate{Predicate.init(1, .eq, "London")};
+    const cols = [_]usize{1};
+    var q = try Query.open(allocator, path, .{ .where = &preds, .negate = true, .columns = &cols, .limit = 2 });
+    defer q.deinit();
+
+    const r1 = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), r1.fields.len);
+    try std.testing.expectEqualStrings("Paris", r1.get(0).?);
+    _ = (try q.next()).?;
+    try std.testing.expectEqual(@as(?Row, null), try q.next()); // limit reached
+}
+
+test "negate is honoured for NDJSON too, not just CSV" {
+    const allocator = std.testing.allocator;
+    const path = "test_negate.ndjson";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data =
+        \\{"id": 1, "city": "London"}
+        \\{"id": 2, "city": "Paris"}
+        \\{"id": 3, "city": "London"}
+        \\
+    });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const preds = [_]Predicate{Predicate.init(1, .eq, "London")};
+    var q = try Query.open(allocator, path, .{ .where = &preds, .negate = true });
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try q.count());
+}
+
+test "matches(): the flag is XOR over the whole conjunction" {
+    const fields = [_][]const u8{ "1", "London" };
+    const row = Row{ .fields = &fields };
+    const hit = [_]Predicate{Predicate.init(1, .eq, "London")};
+    const miss = [_]Predicate{Predicate.init(1, .eq, "Paris")};
+
+    try std.testing.expect(matches(row, &hit, false));
+    try std.testing.expect(!matches(row, &hit, true));
+    try std.testing.expect(!matches(row, &miss, false));
+    try std.testing.expect(matches(row, &miss, true));
+    // Empty predicate list: keeps everything, so its negation keeps none.
+    try std.testing.expect(matches(row, &.{}, false));
+    try std.testing.expect(!matches(row, &.{}, true));
 }

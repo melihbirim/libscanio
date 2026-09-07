@@ -93,6 +93,9 @@ class COptions(ctypes.Structure):
         ("n_where", ctypes.c_size_t),
         ("limit", ctypes.c_int64),
         ("max_column", ctypes.c_int64),
+        # Last, matching the C struct: a zero-filled COptions keeps the
+        # pre-negate behaviour without the caller knowing this exists.
+        ("negate", ctypes.c_int),
     ]
 
 
@@ -183,6 +186,7 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
         ctypes.c_char,
         ctypes.POINTER(CPredicate),
         ctypes.c_size_t,
+        ctypes.c_int,  # negate
         ctypes.c_size_t,
     ]
     lib.scanio_parallel_collect_columnar.restype = ctypes.c_void_p

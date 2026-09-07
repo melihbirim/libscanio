@@ -107,7 +107,27 @@ def eval_one(field, op, value):
             ">=": fb >= vb, "<": fb < vb, "<=": fb <= vb}[op]
 
 
-def oracle_rows(path, header, preds, columns=None, limit=None):
+def parse_where_for_oracle(where):
+    """The WHERE string as (column, op, value) triples, for the oracle.
+    Deliberately a separate hand-rolled parse from the library's own —
+    an oracle that shared the parser would not be independent of it."""
+    preds = []
+    if not where:
+        return preds
+    for part in where.split(" AND "):
+        if " IN " in part:
+            col, rest = part.split(" IN ", 1)
+            preds.append((col.strip(), "IN", [v.strip() for v in rest.strip()[1:-1].split(",")]))
+        else:
+            for op in (">=", "<=", "!=", ">", "<", "="):
+                if op in part:
+                    c, v = part.split(op, 1)
+                    preds.append((c.strip(), op, v.strip()))
+                    break
+    return preds
+
+
+def oracle_rows(path, header, preds, columns=None, limit=None, negate=False):
     """Rows the query should return, as lists of field values."""
     out = []
     for fields in read_raw(path):
@@ -123,7 +143,9 @@ def oracle_rows(path, header, preds, columns=None, limit=None):
             if not eval_one(fields[idx], op, val):
                 ok = False
                 break
-        if not ok:
+        # negate inverts the whole conjunction, so a row that failed
+        # ANY clause is the one to keep.
+        if ok == negate:
             continue
         if columns:
             out.append([fields[header.index(c)] if header.index(c) < len(fields) else "" for c in columns])
@@ -188,7 +210,7 @@ def header_of(path):
 # ── the three clients ─────────────────────────────────────────────────
 
 
-def via_python(path, where, columns, limit):
+def via_python(path, where, columns, limit, negate=False):
     kw = {}
     if where:
         kw["where"] = where
@@ -196,6 +218,8 @@ def via_python(path, where, columns, limit):
         kw["columns"] = columns
     if limit is not None:
         kw["limit"] = limit
+    if negate:
+        kw["negate"] = True
     names = columns or header_of(path)
     out = []
     for row in libscanio.scan(path, **kw):
@@ -242,12 +266,13 @@ def node_api_calls(path):
 
 NODE_DRIVER = r"""
 const ls = require(process.argv[2]);
-const [, , , file, where, columns, limit] = process.argv;
+const [, , , file, where, columns, limit, negate] = process.argv;
 (async () => {
   const opts = {};
   if (where !== '-') opts.where = where;
   if (columns !== '-') opts.columns = columns.split(',');
   if (limit !== '-') opts.limit = Number(limit);
+  if (negate === '1') opts.negate = true;
   const rows = [];
   for await (const r of ls.scan(file, opts)) rows.push(r);
   process.stdout.write(JSON.stringify(rows));
@@ -255,7 +280,7 @@ const [, , , file, where, columns, limit] = process.argv;
 """
 
 
-def via_node(path, where, columns, limit):
+def via_node(path, where, columns, limit, negate=False):
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
         f.write(NODE_DRIVER)
         driver = f.name
@@ -263,7 +288,7 @@ def via_node(path, where, columns, limit):
         p = subprocess.run(
             ["node", driver, os.path.join(REPO, "node", "index.js"), path,
              where or "-", ",".join(columns) if columns else "-",
-             str(limit) if limit is not None else "-"],
+             str(limit) if limit is not None else "-", "1" if negate else "0"],
             capture_output=True, encoding="utf-8")
         if p.returncode != 0:
             raise AssertionError(f"node driver failed: {p.stderr}")
@@ -273,10 +298,12 @@ def via_node(path, where, columns, limit):
         os.unlink(driver)
 
 
-def via_cli(path, where, columns, limit):
+def via_cli(path, where, columns, limit, negate=False):
     cmd = [CLI, path, "--format", "ndjson"]
     if where:
         cmd += ["--where", where]
+    if negate:
+        cmd += ["--not"]
     if columns:
         cmd += ["--columns", ",".join(columns)]
     if limit is not None:
@@ -598,19 +625,7 @@ def main():
             path = FIXTURES[kind]
             header = header_of(path)
             for where, columns, limit in QUERIES:
-                preds = []
-                if where:
-                    for part in where.split(" AND "):
-                        if " IN " in part:
-                            col, rest = part.split(" IN ", 1)
-                            vals = [v.strip() for v in rest.strip()[1:-1].split(",")]
-                            preds.append((col.strip(), "IN", vals))
-                        else:
-                            for op in (">=", "<=", "!=", ">", "<", "="):
-                                if op in part:
-                                    c, v = part.split(op, 1)
-                                    preds.append((c.strip(), op, v.strip()))
-                                    break
+                preds = parse_where_for_oracle(where)
                 want = oracle_rows(path, header, preds, columns, limit)
                 label = f"{kind} where={where!r} cols={columns} limit={limit}"
                 py = via_python(path, where, columns, limit)
@@ -756,6 +771,77 @@ def main():
         rc = subprocess.run([CLI, vpath, "--validate", schema_path],
                             capture_output=True, encoding="utf-8").returncode
         check("validate | cli rejects an unknown column", rc, 2)
+
+        # ── negate: every query, run inverted ────────────────────────
+        #
+        # The same QUERIES matrix, complemented. Two properties are
+        # checked per case: all three clients agree with the oracle on
+        # the complement, and the complement plus the original partition
+        # the file exactly — no row in both halves, none lost from both.
+        for kind in ("csv", "ndjson", "quoted"):
+            path = FIXTURES[kind]
+            header = header_of(path)
+            for where, columns, limit in QUERIES:
+                if where is None or limit is not None:
+                    # No filter means the complement is empty (covered by
+                    # its own check below); a limit truncates one half so
+                    # the partition property no longer holds.
+                    continue
+                preds = parse_where_for_oracle(where)
+                want = oracle_rows(path, header, preds, columns, None, negate=True)
+                label = f"{kind} NOT({where!r}) cols={columns}"
+                py = via_python(path, where, columns, None, negate=True)
+                nd = via_node(path, where, columns, None, negate=True)
+                cl = via_cli(path, where, columns, None, negate=True)
+                check(f"negate | oracle == python   | {label}", py, want)
+                check(f"negate | python == node     | {label}", nd, py)
+                check(f"negate | python == cli      | {label}", cl, py)
+
+                kept = via_python(path, where, columns, None)
+                total = len(via_python(path, None, columns, None))
+                check(f"negate | the two halves partition the file | {label}",
+                      len(kept) + len(py), total)
+
+                n_kept = libscanio.count(path, where)
+                n_dropped = libscanio.count(path, where, negate=True)
+                check(f"negate | count agrees with scan | {label}", n_dropped, len(py))
+                check(f"negate | counts partition too | {label}", n_kept + n_dropped, total)
+
+                # scan_array()'s parallel/columnar engine is a different
+                # code path from scan()'s row-at-a-time one, so the flag
+                # has to be checked there too or it can be honoured by
+                # one and dropped by the other.
+                arr = libscanio.scan_array(path, where=where, negate=True)
+                check(f"negate | scan_array == scan | {label}", len(arr), len(py))
+
+        # No filter: the complement of "keep everything" is empty. Every
+        # client has a shortcut path for the no-WHERE case, so each one
+        # is a separate chance to answer with the row total instead.
+        for kind in ("csv", "ndjson"):
+            path = FIXTURES[kind]
+            check(f"negate | no filter yields nothing | {kind} python",
+                  via_python(path, None, None, None, negate=True), [])
+            check(f"negate | no filter yields nothing | {kind} node",
+                  via_node(path, None, None, None, negate=True), [])
+            check(f"negate | no filter yields nothing | {kind} cli",
+                  via_cli(path, None, None, None, negate=True), [])
+            check(f"negate | no filter counts zero | {kind}",
+                  libscanio.count(path, None, negate=True), 0)
+
+        # Ragged rows: a row too short to test the column cannot satisfy
+        # the predicate, so it belongs in the complement — and must not
+        # fall out of both halves.
+        path = FIXTURES["ragged"]
+        for where in ("a = 1", "c = 3"):
+            py = via_python(path, where, None, None, negate=True)
+            check(f"negate | ragged | oracle == python | {where!r}",
+                  py, oracle_rows(path, header_of(path), parse_where_for_oracle(where), negate=True))
+            check(f"negate | ragged | python == node | {where!r}",
+                  via_node(path, where, None, None, negate=True), py)
+            check(f"negate | ragged | python == cli | {where!r}",
+                  via_cli(path, where, None, None, negate=True), py)
+            check(f"negate | ragged | halves still partition | {where!r}",
+                  len(via_python(path, where, None, None)) + len(py), libscanio.count(path))
 
     print(f"\n{passed}/{passed + failed} differential checks passed")
     return 0 if failed == 0 else 1

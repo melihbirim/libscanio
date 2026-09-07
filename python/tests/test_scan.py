@@ -533,5 +533,62 @@ try:
 finally:
     os.unlink(BLANK_P)
 
+# ---------------------------------------------------------------------
+# negate: the complement of a WHERE clause. The property that matters is
+# that the two halves PARTITION the file — every row in exactly one, no
+# row in both, none lost.
+NEG_P = "_test_negate.csv"
+with open(NEG_P, "w", encoding="utf-8") as f:
+    f.write("id,city,amount\n1,London,10\n2,Paris,20\n3,London,30\n4,Berlin,40\n5,Paris,50\n")
+try:
+    kept = libscanio.scan_array(NEG_P, where="city = London")
+    dropped = libscanio.scan_array(NEG_P, where="city = London", negate=True)
+    check("negate: scan_array returns the complement", len(dropped), 3)
+    check("negate: the two halves partition the file",
+          len(kept) + len(dropped), libscanio.count(NEG_P))
+    check("negate: no row appears in both halves",
+          set(r[0] for r in kept) & set(r[0] for r in dropped), set())
+    check("negate: count agrees with scan_array",
+          libscanio.count(NEG_P, "city = London", negate=True), len(dropped))
+    check("negate: scan() streams the same rows scan_array() collects",
+          [tuple(r.values()) for r in libscanio.scan(NEG_P, where="city = London", negate=True)],
+          [tuple(r) for r in dropped])
+
+    # NOT(a AND b) is the negation of the CONJUNCTION, not of each clause —
+    # a row failing either half belongs in the complement.
+    both = libscanio.scan_array(NEG_P, where="city = London AND amount > 20")
+    neither = libscanio.scan_array(NEG_P, where="city = London AND amount > 20", negate=True)
+    check("negate: inverts the whole AND-list, not each clause", len(both), 1)
+    check("negate: ...so everything else is rejected", len(neither), 4)
+
+    check("negate: with no where, nothing matches", libscanio.count(NEG_P, negate=True), 0)
+    check("negate: ...and scan yields nothing", list(libscanio.scan(NEG_P, negate=True)), [])
+    check("negate: composes with columns and limit",
+          libscanio.scan_array(NEG_P, columns=["city"], where="city = London",
+                               limit=2, negate=True),
+          [("Paris",), ("Berlin",)])
+    try:
+        import pyarrow  # noqa: F401
+        check("negate: scan_table (zero-copy Arrow) returns the same complement",
+              libscanio.scan_table(NEG_P, where="city = London", negate=True).num_rows, 3)
+    except ImportError:
+        pass
+finally:
+    os.unlink(NEG_P)
+
+# A row too short to test the column cannot satisfy the predicate, so it
+# belongs with the rejects — the answer an import wants.
+NEG_R = "_test_negate_ragged.csv"
+with open(NEG_R, "w", encoding="utf-8") as f:
+    f.write("a,b\n1,10\n2\n3,30\n")
+try:
+    check("negate: a truncated row counts as rejected",
+          libscanio.count(NEG_R, "b >= 0", negate=True), 1)
+    check("negate: ...and is not lost from the partition",
+          libscanio.count(NEG_R, "b >= 0") + libscanio.count(NEG_R, "b >= 0", negate=True),
+          libscanio.count(NEG_R))
+finally:
+    os.unlink(NEG_R)
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)
