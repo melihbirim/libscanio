@@ -103,6 +103,8 @@ ENGINES = {
               ("pyarrow", "PyArrow (Python)"), ("polars", "Polars (Python)"),
               ("apache-arrow", "Apache Arrow JS + CSV/JSON parser")],
     "stream": [("libscanio-python", "libscanio Python"),
+               ("pyarrow", "PyArrow batches → Python rows"),
+               ("polars", "Polars batches → Python rows"),
                ("native-python", "Python csv/json"),
                ("libscanio-node", "libscanio Node"),
                ("native-node", "Node readline (fixture CSV/JSON)")],
@@ -140,7 +142,7 @@ def expected_result(rows, workload):
     return expected
 
 
-def engine_command(engine, workload, path, fmt, timing):
+def engine_command(engine, workload, path, fmt, timing, batch_size=8192):
     if engine == "libscanio-cli":
         return [CLI, path, "--where", WHERE, "--count"]
     runtime = "node" if engine.endswith("-node") or engine == "apache-arrow" else "python"
@@ -149,7 +151,10 @@ def engine_command(engine, workload, path, fmt, timing):
         impl = engine
     script = os.path.join(REPO, "bench", "engine.js" if runtime == "node" else "engine.py")
     prefix = ["node", "--expose-gc"] if runtime == "node" else [sys.executable]
-    return prefix + [script, impl, workload, path, fmt, timing]
+    cmd = prefix + [script, impl, workload, path, fmt, timing]
+    if runtime == "python":
+        cmd += ["--batch-size", str(batch_size)]
+    return cmd
 
 
 def measure(cmd, reps, expected, timing="cold", extra_env=None):
@@ -195,6 +200,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--rows", type=int, default=500_000)
     ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--batch-size", type=int, default=8192,
+                    help="streaming Polars/PyArrow batch row limit (default: 8192)")
     ap.add_argument("--json", dest="json_out")
     ap.add_argument("--summary")
     ap.add_argument("--engines", help="comma-separated IDs: libscanio-cli,libscanio-python,libscanio-node,pyarrow,polars,apache-arrow,native-python,native-node")
@@ -205,8 +212,8 @@ def main():
     ap.add_argument("--allow-debug", action="store_true")
     ap.add_argument("--node-modules", default=os.environ.get("LIBSCANIO_BENCH_NODE_MODULES", ""))
     args = ap.parse_args()
-    if args.rows < 1 or args.reps < 1:
-        ap.error("--rows and --reps must be positive")
+    if args.rows < 1 or args.reps < 1 or args.batch_size < 1:
+        ap.error("--rows, --reps, and --batch-size must be positive")
     workloads = args.workloads.split(",")
     if not workloads or any(w not in WORKLOADS for w in workloads):
         ap.error("--workloads must select count,arrow,stream")
@@ -233,6 +240,11 @@ def main():
     emit("\nCold: process startup + imports + query + exit. Warm: second query after one untimed query; imports excluded. CLI warm: N/A.")
     emit("Peak RSS (MiB): cold process, including runtime and imports. OS file cache is not cleared; cold means process, not disk.")
     emit("Eight string columns in both formats. Engine default threading; no common thread cap. Compare within a workload only.")
+    stream_settings = {"batch_size": args.batch_size,
+                       "pyarrow_batch_readahead": 0, "pyarrow_fragment_readahead": 0,
+                       "polars_lazy": True, "polars_maintain_order": True,
+                       "polars_engine": "streaming"}
+    emit(f"Streaming batches: {args.batch_size:,} rows; PyArrow batch/fragment read-ahead=0; Polars lazy=True, maintain_order=True, engine=streaming (internal buffering is engine-managed). Python consumers share the same row checksum loop.")
     emit("\nVersions: " + ", ".join(f"{k}={v}" for k, v in versions.items()))
     with tempfile.TemporaryDirectory() as tmp:
         for fmt in ("csv", "ndjson"):
@@ -259,11 +271,11 @@ def main():
                         results.append(record)
                         continue
                     try:
-                        cold, rss = measure(engine_command(engine, workload, path, fmt, "cold"),
+                        cold, rss = measure(engine_command(engine, workload, path, fmt, "cold", args.batch_size),
                                             args.reps, expected, extra_env=env)
                         warm = None
                         if args.timing == "both" and engine != "libscanio-cli":
-                            warm, _ = measure(engine_command(engine, workload, path, fmt, "warm"),
+                            warm, _ = measure(engine_command(engine, workload, path, fmt, "warm", args.batch_size),
                                               args.reps, expected, timing="warm", extra_env=env)
                         over = bool(args.max_rss_mb and workload != "arrow" and
                                     engine in ("libscanio-cli", "libscanio-python") and rss > args.max_rss_mb)
@@ -286,6 +298,7 @@ def main():
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump({"schema_version": 2, "versions": versions, "reps": args.reps,
+                       "stream_settings": stream_settings,
                        "timing": args.timing, "results": results}, f, indent=2)
     return int(failed)
 

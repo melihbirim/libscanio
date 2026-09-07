@@ -171,7 +171,7 @@ table as interchangeable outputs.
 |---|---|---|
 | Filtered count | One scalar count; no matching table collected | libscanio CLI/Python/Node, PyArrow `count_rows`, Polars `select(pl.len())` |
 | Materialized Arrow | All matching rows, all eight columns, string values, retained in an Arrow table | libscanio `scan_table(infer_types=False)`, PyArrow `to_table`, Polars `collect().to_arrow()`, optional Arrow JS + parser |
-| Streaming import | Consume each matching row and all eight fields; sum their string lengths without retaining the result | libscanio Python/Node, Python csv/json, Node readline |
+| Streaming import | Consume each matching row and all eight fields; sum their string lengths without retaining the result | libscanio Python/Node, PyArrow batches, Polars batches, Python csv/json, Node readline |
 
 The Arrow group measures logical string columns (Arrow string or large
 string), including conversion into Arrow where required. Both CSV and
@@ -181,6 +181,19 @@ or replaced with an explicit schema in the competing table readers.
 The Node baseline parses only this fixture's unquoted CSV; it is not a
 production CSV parser. Arrow JS includes CSV/JSON parsing and pivoting
 objects into columns, so its label names that complete pipeline.
+
+The streaming group uses one identical Python checksum loop for libscanio,
+Polars, PyArrow, and native Python. Polars uses `collect_batches()` followed
+by `iter_rows(named=True)`; PyArrow uses `scanner().to_batches()` followed
+by `batch.to_pylist()`. Batch-to-row conversion is timed, and batches are
+consumed incrementally without collecting the complete result.
+`--batch-size` defaults to 8,192 rows for both adapters. PyArrow batch and
+fragment read-ahead are zero; Polars uses `lazy=True`, `maintain_order=True`,
+and `engine="streaming"`, with internal buffering managed by Polars.
+These settings appear in Markdown and JSON output. A batch size is not a
+total memory ceiling: parsers, worker buffers, and Python row conversion
+also contribute to RSS. Polars currently marks `collect_batches()` as
+unstable; CI pins the tested version.
 
 Each table reports two distinct timing boundaries:
 
@@ -218,6 +231,8 @@ npm install apache-arrow csv-parse
 python bench/compare.py --node-modules ./node_modules
 # Cold-only runs and machine-readable results:
 python bench/compare.py --timing cold --json bench-results.json
+# Compare Python streaming consumers at an explicit batch size:
+python bench/compare.py --workloads stream --engines libscanio-python,pyarrow,polars,native-python --batch-size 8192
 ```
 
 JSON schema version 2 records workload, engine ID, status, cold/warm
@@ -231,7 +246,9 @@ consumption patterns and a numeric NDJSON fixture; they should not be
 compared directly to this matrix or used to claim an overall winner.
 
 API references: [Polars collect](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.collect.html),
-[PyArrow Dataset](https://arrow.apache.org/docs/python/generated/pyarrow.dataset.Dataset.html).
+[PyArrow Dataset](https://arrow.apache.org/docs/python/generated/pyarrow.dataset.Dataset.html),
+[Polars collect_batches](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.collect_batches.html),
+[PyArrow Scanner](https://arrow.apache.org/docs/python/generated/pyarrow.dataset.Scanner.html).
 
 ## Reproducing
 

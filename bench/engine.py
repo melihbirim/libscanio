@@ -5,9 +5,16 @@ import json
 import os
 import sys
 import time
+import argparse
 
 engine, workload, path, fmt, timing = sys.argv[1:6]
-verify = "--verify" in sys.argv[6:]
+options = argparse.ArgumentParser()
+options.add_argument("--verify", action="store_true")
+options.add_argument("--batch-size", type=int, default=8192)
+args = options.parse_args(sys.argv[6:])
+if args.batch_size < 1:
+    options.error("--batch-size must be positive")
+verify = args.verify
 fields = "trip_id cab_type passengers distance fare tip total vendor".split()
 where = "cab_type = yellow"
 if engine == "libscanio":
@@ -44,9 +51,12 @@ def query():
         lf = lf.filter(pl.col("cab_type") == "yellow")
         if workload == "count":
             return lf.select(pl.len()).collect(engine="streaming").item()
-        # Conversion is part of the timed operation: all three APIs
-        # deliver an Arrow table, not engine-specific intermediate data.
-        return lf.collect(engine="streaming").to_arrow()
+        if workload == "arrow":
+            # Conversion is included in the Arrow workload's timer.
+            return lf.collect(engine="streaming").to_arrow()
+        batches = lf.collect_batches(chunk_size=args.batch_size,
+                                     maintain_order=True, lazy=True, engine="streaming")
+        rows = (row for batch in batches for row in batch.iter_rows(named=True))
     elif engine == "pyarrow":
         schema = pa.schema([(f, pa.string()) for f in fields])
         file_format = (ds.CsvFileFormat(convert_options=pacsv.ConvertOptions(
@@ -55,13 +65,17 @@ def query():
         predicate = pc.field("cab_type") == "yellow"
         if workload == "count":
             return dataset.count_rows(filter=predicate)
-        return dataset.to_table(filter=predicate)
+        if workload == "arrow":
+            return dataset.to_table(filter=predicate)
+        batches = dataset.scanner(filter=predicate, batch_size=args.batch_size,
+                                  batch_readahead=0, fragment_readahead=0).to_batches()
+        rows = (row for batch in batches for row in batch.to_pylist())
     else:
         rows = native_rows()
     n = checksum = 0
     for row in rows:
         n += 1
-        # Same sink in both Python implementations; every selected field
+        # Same sink in all Python implementations; every selected field
         # is consumed. Fixtures are ASCII, so lengths also equal bytes.
         checksum += sum(len(row[f]) for f in fields)
     return {"rows": n, "checksum": checksum}

@@ -75,7 +75,9 @@ class RunnerTests(unittest.TestCase):
                         if workload == "arrow" and engine in ("libscanio-python", "polars") and not available["pyarrow"]:
                             continue
                         with self.subTest(format=fmt, workload=workload, engine=engine):
-                            command = engine_command(engine, workload, path, fmt, "cold")
+                            # Force batch boundaries in the streaming adapters;
+                            # seven inputs produce three matching rows.
+                            command = engine_command(engine, workload, path, fmt, "cold", batch_size=2)
                             measure(command, 1, expected_result(7, workload))
                             if workload == "arrow":
                                 result = run_once(command + ["--verify"])
