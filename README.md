@@ -10,16 +10,24 @@ CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project, limit, 
 
 CSV + NDJSON + JSON arrays, filter/project/limit/count, count/sum/min/max/avg aggregates, O(N log K) top-K, single-column ORDER BY, per-column type inference (`describe()`), a bounded-memory parallel scan/count/filtered-scan path (`scan_table()` uses 2.3-2.8x less memory than `pyarrow` under N-way concurrent load, the real Python-API-level comparison — see ROADMAP.md), zero-copy Arrow output (`scan_table()`, Python), a C ABI, Python and [Node](node/) bindings, and an [MCP server](mcp/) exposing all of it as agent-callable tools. No group-by, multi-column ORDER BY, or Rust binding yet. See [ROADMAP.md](ROADMAP.md).
 
-**CSV quoting is not supported.** Fields are split on the delimiter;
-quotes are ordinary characters, not grouping. `1,"Smith, John",London`
-is four fields, not three — so a value containing your delimiter shifts
-every column after it on that row, and a filter on those columns will be
-wrong rather than merely unmatched. This is a real limitation, not a bug
-to report: it is what makes the split a single pass with no state. If
-your data has quoted delimiters, normalise it first (or use
+**CSV quoting: RFC 4180, minus multi-line records.** A field whose first
+byte is `"` is a quoted field: the delimiter inside it is data
+(`1,"Smith, John",London` is three fields), and `""` is one literal `"`.
+A quote anywhere other than the first byte is ordinary data, so
+`he said "hi"` comes back verbatim. Writing CSV (`scanio --format csv`)
+re-quotes only the fields that need it, so a scan round-trips.
+
+The one thing that is **not** supported is a quoted field containing a
+newline. The reader is line-oriented and the parallel path splits the
+file into byte ranges at newlines, so such a record would be torn in half
+before any splitter saw it. Rather than hand back two half-rows, it is
+`UnterminatedQuote` — a loud failure on a file this reader cannot
+represent. If your data has embedded newlines, normalise it first (or use
 [csvql](https://github.com/melihbirim/csvql), which parses SQL and CSV
-properly). Rows with more or fewer fields than the header are handled and
-tested — extras get a positional `colN` key, missing ones are absent.
+properly).
+
+Rows with more or fewer fields than the header are handled and tested —
+extras get a positional `colN` key, missing ones are absent.
 
 ## Quickstart
 

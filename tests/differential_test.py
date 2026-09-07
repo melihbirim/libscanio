@@ -23,6 +23,7 @@ Requires: node on PATH, the C ABI lib and the N-API addon built.
     zig build node   -Doptimize=ReleaseFast
     zig build cli    -Doptimize=ReleaseFast
 """
+import csv
 import json
 import math
 import os
@@ -138,10 +139,12 @@ def oracle_rows(path, header, preds, columns=None, limit=None):
 
 
 def read_raw(path):
-    """Split a fixture the way libscanio does — NOT the way csv.reader
-    does. Quotes are not grouping characters here; see the README's CSV
-    note. The oracle has to model the real contract, not the one we might
-    wish for."""
+    """Split a fixture independently of libscanio. For CSV that means
+    Python's own csv.reader: since the reader gained RFC 4180 quoting,
+    the stdlib module is a genuinely independent implementation of the
+    same contract, which is exactly what an oracle should be. (The one
+    case they disagree on — a quoted field spanning a newline — the
+    reader rejects outright and no fixture contains.)"""
     if path.endswith(".ndjson"):
         header = None
         for line in open(path, encoding="utf-8"):
@@ -155,8 +158,8 @@ def read_raw(path):
     else:
         with open(path, encoding="utf-8") as f:
             lines = [ln.rstrip("\n").rstrip("\r") for ln in f if ln.strip() != ""]
-        for line in lines[1:]:
-            yield line.split(",")
+        for fields in list(csv.reader(lines))[1:]:
+            yield fields
 
 
 def render(v):
@@ -178,7 +181,7 @@ def header_of(path):
                 if line.strip():
                     return list(json.loads(line).keys())
     with open(path, encoding="utf-8") as f:
-        return f.readline().rstrip("\n").rstrip("\r").split(",")
+        return next(csv.reader([f.readline().rstrip("\n").rstrip("\r")]))
 
 
 # ── the three clients ─────────────────────────────────────────────────
@@ -322,6 +325,20 @@ def write_fixtures(tmp):
             f.write(json.dumps({"id": i, "name": name, "amount": amt, "city": city}) + "\n")
     FIXTURES["ndjson"] = nd_path
 
+    # RFC 4180 quoting: a delimiter inside quotes, a doubled quote, a
+    # quote that is ordinary data because it is not at the field start,
+    # and an empty quoted field. Column names are quoted too — the
+    # header goes through the same splitter as every other row.
+    quoted = os.path.join(tmp, "quoted.csv")
+    with open(quoted, "w", encoding="utf-8") as f:
+        f.write('id,"name",amount,city\n')
+        f.write('1,"Smith, John",100,London\n')
+        f.write('2,"He said ""hi""",-5,Paris\n')
+        f.write('3,he said "hi",0,London\n')
+        f.write('4,"",1000,"Berlin, DE"\n')
+        f.write('5,Eve,7,"Zürich"\n')
+    FIXTURES["quoted"] = quoted
+
     ragged = os.path.join(tmp, "ragged.csv")
     with open(ragged, "w", encoding="utf-8") as f:
         f.write("a,b,c\n1,2,3\n4,5\n6\n7,8,9,EXTRA\n")
@@ -363,7 +380,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         write_fixtures(tmp)
 
-        for kind in ("csv", "ndjson"):
+        for kind in ("csv", "ndjson", "quoted"):
             path = FIXTURES[kind]
             header = header_of(path)
             for where, columns, limit in QUERIES:
@@ -390,7 +407,7 @@ def main():
                 check(f"python == cli      | {label}", cl, py)
 
         # count() must agree with the number of rows the scan returns.
-        for kind in ("csv", "ndjson", "ragged"):
+        for kind in ("csv", "ndjson", "quoted", "ragged"):
             path = FIXTURES[kind]
             for where in (None, "a = 1" if kind == "ragged" else "city = London"):
                 n_scan = len(via_python(path, where, None, None))
@@ -404,7 +421,7 @@ def main():
         # separate code paths in each client (Node re-derives topk/orderBy
         # rows from its own JSON, Python from the C ABI's row buffers), so
         # scan() agreeing proves nothing about them.
-        for kind in ("csv", "ndjson"):
+        for kind in ("csv", "ndjson", "quoted"):
             path = FIXTURES[kind]
             nd = node_api_calls(path)
             check(f"schema    | {kind}", nd["schema"], libscanio.schema(path))

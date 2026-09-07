@@ -34,6 +34,7 @@ const Allocator = std.mem.Allocator;
 const query_mod = @import("query.zig");
 const json_parser = @import("json_parser.zig");
 const topk_mod = @import("topk.zig");
+const csv = @import("csv.zig");
 pub const OwnedRow = topk_mod.OwnedRow;
 const simd_count = @import("simd_count.zig");
 
@@ -754,25 +755,23 @@ const CsvFilterCtx = struct {
     predicates: []const query_mod.Predicate,
     stop_after_column: usize,
     field_buf: std.ArrayListUnmanaged([]const u8) = .{},
+    quote_scratch: std.ArrayListUnmanaged(u8) = .{},
     count: usize = 0,
 
     fn deinit(self: *CsvFilterCtx) void {
         self.field_buf.deinit(self.allocator);
+        self.quote_scratch.deinit(self.allocator);
     }
 
     fn onLine(self: *CsvFilterCtx, line: []const u8) !void {
         self.field_buf.clearRetainingCapacity();
-        var start: usize = 0;
-        var i: usize = 0;
-        while (i <= line.len) : (i += 1) {
-            if (i == line.len or line[i] == self.delimiter) {
-                try self.field_buf.append(self.allocator, line[start..i]);
-                // Everything past stop_after_column is provably never
-                // read by any predicate — stop splitting this row's
-                // remaining bytes entirely, not just discard them.
-                if (self.field_buf.items.len == self.stop_after_column + 1) break;
-                start = i + 1;
-            }
+        var it = try csv.FieldIterator.init(self.allocator, line, self.delimiter, &self.quote_scratch);
+        while (try it.next()) |field| {
+            try self.field_buf.append(self.allocator, field);
+            // Everything past stop_after_column is provably never read
+            // by any predicate — stop splitting this row's remaining
+            // bytes entirely, not just discard them.
+            if (self.field_buf.items.len == self.stop_after_column + 1) break;
         }
         const scan = @import("root.zig");
         if (query_mod.matches(scan.Row{ .fields = self.field_buf.items }, self.predicates)) self.count += 1;
@@ -1063,18 +1062,13 @@ const CsvScanCtx = struct {
     delimiter: u8,
     predicates: []const query_mod.Predicate,
     field_buf: std.ArrayListUnmanaged([]const u8) = .{},
+    quote_scratch: std.ArrayListUnmanaged(u8) = .{},
     rows: std.ArrayListUnmanaged(OwnedRow) = .{},
 
     fn onLine(self: *CsvScanCtx, line: []const u8) !void {
         self.field_buf.clearRetainingCapacity();
-        var start: usize = 0;
-        var i: usize = 0;
-        while (i <= line.len) : (i += 1) {
-            if (i == line.len or line[i] == self.delimiter) {
-                try self.field_buf.append(self.allocator, line[start..i]);
-                start = i + 1;
-            }
-        }
+        var it = try csv.FieldIterator.init(self.allocator, line, self.delimiter, &self.quote_scratch);
+        while (try it.next()) |field| try self.field_buf.append(self.allocator, field);
         const scan = @import("root.zig");
         const row = scan.Row{ .fields = self.field_buf.items };
         if (query_mod.matches(row, self.predicates)) {
@@ -1096,6 +1090,7 @@ const CsvScanWorker = struct {
 fn csvScanWorkerRun(w: *CsvScanWorker) void {
     var ctx = CsvScanCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates };
     defer ctx.field_buf.deinit(w.allocator);
+    defer ctx.quote_scratch.deinit(w.allocator);
     forEachLineInRange(w.allocator, w.file, w.range, CsvScanCtx, &ctx, CsvScanCtx.onLine) catch |e| {
         for (ctx.rows.items) |r| r.deinit();
         ctx.rows.deinit(w.allocator);
@@ -1357,19 +1352,14 @@ const CsvScanColumnarCtx = struct {
     delimiter: u8,
     predicates: []const query_mod.Predicate,
     field_buf: std.ArrayListUnmanaged([]const u8) = .{},
+    quote_scratch: std.ArrayListUnmanaged(u8) = .{},
     columns: []ColumnBuf,
     n_rows: usize = 0,
 
     fn onLine(self: *CsvScanColumnarCtx, line: []const u8) !void {
         self.field_buf.clearRetainingCapacity();
-        var start: usize = 0;
-        var i: usize = 0;
-        while (i <= line.len) : (i += 1) {
-            if (i == line.len or line[i] == self.delimiter) {
-                try self.field_buf.append(self.allocator, line[start..i]);
-                start = i + 1;
-            }
-        }
+        var it = try csv.FieldIterator.init(self.allocator, line, self.delimiter, &self.quote_scratch);
+        while (try it.next()) |field| try self.field_buf.append(self.allocator, field);
         const scan = @import("root.zig");
         const row = scan.Row{ .fields = self.field_buf.items };
         if (!query_mod.matches(row, self.predicates)) return;
@@ -1416,6 +1406,7 @@ fn csvScanColumnarWorkerRun(w: *CsvScanColumnarWorker) void {
     };
     var ctx = CsvScanColumnarCtx{ .allocator = w.allocator, .delimiter = w.delimiter, .predicates = w.predicates, .columns = columns };
     defer ctx.field_buf.deinit(w.allocator);
+    defer ctx.quote_scratch.deinit(w.allocator);
     forEachLineInRange(w.allocator, w.file, w.range, CsvScanColumnarCtx, &ctx, CsvScanColumnarCtx.onLine) catch |e| {
         deinitColumnBufs(w.allocator, columns);
         w.err = e;
@@ -2386,4 +2377,66 @@ test "parallelScanColumnar: ragged CSV keeps every column's offsets in step with
     try std.testing.expectEqualStrings("3", row1);
     try std.testing.expectEqualStrings("", row2);
     try std.testing.expectEqualStrings("9", row4);
+}
+
+test "quoted CSV: every parallel worker agrees with the single-threaded Scanner" {
+    // The three CSV workers here and Scanner.splitInto used to be four
+    // separate copies of the same splitter. They now share csv.zig, and
+    // this is the test that says so: a delimiter inside quotes must not
+    // split a field, in the filter worker (count), the row-major worker
+    // (scan) and the columnar worker alike.
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_quoted.csv";
+    const data =
+        "id,name,city\n" ++
+        "1,\"Smith, John\",London\n" ++
+        "2,\"He said \"\"hi\"\"\",Paris\n" ++
+        "3,plain,\"Berlin, DE\"\n";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const scan = @import("root.zig");
+    const preds = [_]query_mod.Predicate{.{ .column = 2, .op = .eq, .value = "London" }};
+
+    // CsvFilterCtx
+    try std.testing.expectEqual(@as(usize, 1), try parallelCountRowsWhere(allocator, path, ',', &preds, 1));
+
+    // CsvScanCtx — three fields per row, quotes stripped, commas kept.
+    var rows = try parallelScan(allocator, path, ',', &.{}, 1);
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+    for (rows.rows) |r| try std.testing.expectEqual(@as(usize, 3), r.fields.len);
+    try std.testing.expectEqualStrings("Smith, John", rows.rows[0].fields[1]);
+    try std.testing.expectEqualStrings("He said \"hi\"", rows.rows[1].fields[1]);
+    try std.testing.expectEqualStrings("Berlin, DE", rows.rows[2].fields[2]);
+
+    // CsvScanColumnarCtx — same values, column-major.
+    var cols = try parallelScanColumnar(allocator, path, ',', &.{}, 1);
+    defer cols.deinit();
+    try std.testing.expectEqual(@as(usize, 3), cols.n_rows);
+    try std.testing.expectEqual(@as(usize, 3), cols.n_cols);
+    const name = cols.columns[1];
+    try std.testing.expectEqualStrings("Smith, John", name.data.items[name.offsets.items[0]..name.offsets.items[1]]);
+    try std.testing.expectEqualStrings("He said \"hi\"", name.data.items[name.offsets.items[1]..name.offsets.items[2]]);
+
+    // And the single-threaded Scanner reads it identically.
+    var sc = try scan.Scanner.open(allocator, path);
+    defer sc.deinit();
+    var i: usize = 0;
+    while (try sc.next()) |row| : (i += 1) {
+        try std.testing.expectEqual(@as(usize, 3), row.fields.len);
+        try std.testing.expectEqualStrings(rows.rows[i].fields[1], row.get(1).?);
+        try std.testing.expectEqualStrings(rows.rows[i].fields[2], row.get(2).?);
+    }
+    try std.testing.expectEqual(@as(usize, 3), i);
+}
+
+test "quoted CSV: an unterminated quote is an error rather than a torn row" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_unterminated.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b\n1,\"oops\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    try std.testing.expectError(error.UnterminatedQuote, parallelScan(allocator, path, ',', &.{}, 1));
+    try std.testing.expectError(error.UnterminatedQuote, parallelScanColumnar(allocator, path, ',', &.{}, 1));
 }

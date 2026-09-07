@@ -333,6 +333,50 @@ async function main() {
     fs.unlinkSync(aggPath);
   }
 
+  // RFC 4180 quoting, and — just as important — what happens on the one
+  // shape the reader cannot represent. Every entry point used to report
+  // a mid-scan failure differently: scan() threw a bare Error, and
+  // scanArray/topk/orderBy/aggregate swallowed it in the addon and left
+  // JavaScript to fail on `JSON.parse('')` with "Unexpected end of JSON
+  // input" — an error message that named nothing about the real cause.
+  const qPath = path.join(os.tmpdir(), `libscanio_quoted_${process.pid}.csv`);
+  fs.writeFileSync(qPath, 'id,"name",city\n1,"Smith, John",London\n2,"He said ""hi""",Paris\n3,he said "hi",Berlin\n');
+  try {
+    check('quoted CSV: header quoting is stripped', libscanio.schema(qPath), ['id', 'name', 'city']);
+    check('quoted CSV: a delimiter inside quotes does not split the field',
+      await collect(libscanio.scan(qPath)), [
+        { id: '1', name: 'Smith, John', city: 'London' },
+        { id: '2', name: 'He said "hi"', city: 'Paris' },
+        { id: '3', name: 'he said "hi"', city: 'Berlin' },
+      ]);
+    check('quoted CSV: scanArray agrees with scan',
+      libscanio.scanArray(qPath), [
+        ['1', 'Smith, John', 'London'],
+        ['2', 'He said "hi"', 'Paris'],
+        ['3', 'he said "hi"', 'Berlin'],
+      ]);
+    check('quoted CSV: a quoted value is filterable by its real content',
+      (await collect(libscanio.scan(qPath, { where: 'name = Smith, John' }))).length, 1);
+  } finally {
+    fs.unlinkSync(qPath);
+  }
+
+  // The one shape this reader cannot represent: a record spanning lines.
+  const badPath = path.join(os.tmpdir(), `libscanio_badquote_${process.pid}.csv`);
+  fs.writeFileSync(badPath, 'a,b\n1,"oops\n');
+  try {
+    await checkRaises('unterminated quote: scan reports it as a ScanError',
+      () => collect(libscanio.scan(badPath)));
+    await checkRaises('unterminated quote: scanArray reports it, not a JSON parse error',
+      () => libscanio.scanArray(badPath));
+    await checkRaises('unterminated quote: aggregate reports it', () => libscanio.aggregate(badPath, 'b'));
+    await checkRaises('unterminated quote: topk reports it', () => libscanio.topk(badPath, 'b', 2));
+    await checkRaises('unterminated quote: orderBy reports it', () => libscanio.orderBy(badPath, 'b'));
+    await checkRaises('unterminated quote: describe reports it', () => libscanio.describe(badPath));
+  } finally {
+    fs.unlinkSync(badPath);
+  }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }

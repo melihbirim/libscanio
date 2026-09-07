@@ -21,6 +21,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const simd_count = @import("simd_count.zig");
+const csv = @import("csv.zig");
+/// Re-exported so the CLI (a separate module that depends on this one)
+/// writes CSV with the same quoting rules this one reads it with,
+/// instead of compiling a second copy of the splitter.
+pub const csv_fields = csv;
 
 /// Default read-buffer size, overridable per-Scanner via ScannerOptions
 /// (and per-Query via QueryOptions.csv_chunk_size). Bigger = fewer read()
@@ -141,6 +146,10 @@ pub const Scanner = struct {
     header: [][]const u8,
     field_buf: [][]const u8,
     stop_after_column: ?usize,
+    /// Unescaping buffer for quoted fields containing `""`. Reused across
+    /// rows; see csv.FieldIterator for why one reservation per line keeps
+    /// the field slices valid.
+    quote_scratch: std.ArrayListUnmanaged(u8) = .{},
 
     pub fn open(allocator: Allocator, path: []const u8) !Scanner {
         return openWithOptions(allocator, path, .{});
@@ -179,6 +188,9 @@ pub const Scanner = struct {
         // for cleanup on an error return — deinit() only runs for a
         // scanner that was successfully returned.
         errdefer scanner.line_scratch.deinit(allocator);
+        // splitOwned reserves capacity in quote_scratch before it can
+        // fail on the next allocation, so the same rule applies to it.
+        errdefer scanner.quote_scratch.deinit(allocator);
 
         const header_line = (try scanner.nextLine()) orelse return ScanError.EmptyFile;
         scanner.header_line = try allocator.dupe(u8, header_line);
@@ -188,8 +200,10 @@ pub const Scanner = struct {
     }
 
     pub fn deinit(self: *Scanner) void {
+        for (self.header) |h| self.allocator.free(@constCast(h));
         self.allocator.free(self.header);
         self.allocator.free(self.header_line);
+        self.quote_scratch.deinit(self.allocator);
         if (self.field_buf.len > 0) self.allocator.free(self.field_buf);
         self.line_scratch.deinit(self.allocator);
         self.allocator.free(self.buf);
@@ -298,21 +312,17 @@ pub const Scanner = struct {
     /// worth revisiting for schemas with long text fields.
     fn splitInto(self: *Scanner, line: []const u8) !usize {
         var count: usize = 0;
-        var start: usize = 0;
-        var i: usize = 0;
-        while (i <= line.len) : (i += 1) {
-            if (i == line.len or line[i] == self.delimiter) {
-                try self.ensureFieldCapacity(count + 1);
-                self.field_buf[count] = line[start..i];
-                count += 1;
-                // Everything past stop_after_column is provably never
-                // read by this Query (see ScannerOptions' doc comment) —
-                // stop scanning the rest of the line's bytes entirely,
-                // not just skip storing them.
-                if (self.stop_after_column) |stop| {
-                    if (count == stop + 1) return count;
-                }
-                start = i + 1;
+        var it = try csv.FieldIterator.init(self.allocator, line, self.delimiter, &self.quote_scratch);
+        while (try it.next()) |field| {
+            try self.ensureFieldCapacity(count + 1);
+            self.field_buf[count] = field;
+            count += 1;
+            // Everything past stop_after_column is provably never read by
+            // this Query (see ScannerOptions' doc comment) — stop scanning
+            // the rest of the line's bytes entirely, not just skip storing
+            // them.
+            if (self.stop_after_column) |stop| {
+                if (count == stop + 1) return count;
             }
         }
         return count;
@@ -332,16 +342,28 @@ pub const Scanner = struct {
     }
 
     /// One-shot split that owns its own slice (used only for the header).
+    /// Header fields, each an OWNED copy.
+    ///
+    /// They used to be views into `header_line`, which was fine when a
+    /// field was always a verbatim slice of it. A quoted header field
+    /// containing `""` is unescaped into the shared scratch buffer
+    /// instead, and that buffer is reused by the very next row — so the
+    /// header has to own its own bytes now. Freed per element in
+    /// deinit().
     fn splitOwned(self: *Scanner, line: []const u8) ![][]const u8 {
         var list = std.ArrayListUnmanaged([]const u8){};
-        errdefer list.deinit(self.allocator);
-        var start: usize = 0;
-        var i: usize = 0;
-        while (i <= line.len) : (i += 1) {
-            if (i == line.len or line[i] == self.delimiter) {
-                try list.append(self.allocator, line[start..i]);
-                start = i + 1;
-            }
+        errdefer {
+            for (list.items) |f| self.allocator.free(@constCast(f));
+            list.deinit(self.allocator);
+        }
+        var it = try csv.FieldIterator.init(self.allocator, line, self.delimiter, &self.quote_scratch);
+        while (try it.next()) |field| {
+            // Two allocations, so the copy needs its own errdefer: if the
+            // append is the one that fails, the copy is not in the list
+            // for the block above to free.
+            const owned = try self.allocator.dupe(u8, field);
+            errdefer self.allocator.free(owned);
+            try list.append(self.allocator, owned);
         }
         return list.toOwnedSlice(self.allocator);
     }

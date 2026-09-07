@@ -376,9 +376,8 @@ finally:
 
 # ---------------------------------------------------------------------
 # A row with MORE fields than the header used to raise IndexError out of
-# scan(), killing the iteration. Real files hit this: ragged CSV, or a
-# delimiter inside a quoted field (quotes are not grouping here — see the
-# README's CSV note). Extra fields get a positional colN key, which is
+# scan(), killing the iteration. Real files hit this. Extra fields get a
+# positional colN key, which is
 # what the Node client and the scanio CLI emit for the same row.
 RAGGED_P = "_test_ragged.csv"
 with open(RAGGED_P, "w") as f:
@@ -402,6 +401,53 @@ try:
           len(libscanio.order_by(RAGGED_P, "id")), 3)
 finally:
     os.unlink(RAGGED_P)
+
+# RFC 4180 quoting. The header goes through the same splitter as every
+# other row, so a quoted column name has to come back unquoted too.
+QUOTED_P = "_test_quoted.csv"
+with open(QUOTED_P, "w", encoding="utf-8") as f:
+    f.write('id,"name",city\n')
+    f.write('1,"Smith, John",London\n')
+    f.write('2,"He said ""hi""",Paris\n')
+    f.write('3,he said "hi",Berlin\n')
+try:
+    check("quoted CSV: header quoting is stripped", libscanio.schema(QUOTED_P), ["id", "name", "city"])
+    rows = list(libscanio.scan(QUOTED_P))
+    check("quoted CSV: a delimiter inside quotes does not split the field", rows, [
+        {"id": "1", "name": "Smith, John", "city": "London"},
+        {"id": "2", "name": 'He said "hi"', "city": "Paris"},
+        {"id": "3", "name": 'he said "hi"', "city": "Berlin"},
+    ])
+    check("quoted CSV: scan_array agrees with scan",
+          libscanio.scan_array(QUOTED_P),
+          [("1", "Smith, John", "London"), ("2", 'He said "hi"', "Paris"), ("3", 'he said "hi"', "Berlin")])
+    check("quoted CSV: a quoted value is filterable by its real content",
+          len(list(libscanio.scan(QUOTED_P, where="name = Smith, John"))), 1)
+    # The parallel/columnar path is a different splitter call site than
+    # scan()'s, so Arrow output gets its own check.
+    try:
+        t = libscanio.scan_table(QUOTED_P)
+        check("quoted CSV: scan_table (zero-copy Arrow) agrees",
+              t.column("name").to_pylist(), ["Smith, John", 'He said "hi"', 'he said "hi"'])
+    except ImportError:
+        pass  # pyarrow not installed
+finally:
+    os.unlink(QUOTED_P)
+
+# The one shape this reader cannot represent: a record spanning lines.
+# Every entry point must say so rather than hand back a torn row.
+BADQ_P = "_test_badquote.csv"
+with open(BADQ_P, "w", encoding="utf-8") as f:
+    f.write('a,b\n1,"oops\n')
+try:
+    check_raises("unterminated quote: scan reports it", lambda: list(libscanio.scan(BADQ_P)))
+    check_raises("unterminated quote: scan_array reports it", lambda: libscanio.scan_array(BADQ_P))
+    check_raises("unterminated quote: aggregate reports it", lambda: libscanio.aggregate(BADQ_P, "b"))
+    check_raises("unterminated quote: topk reports it", lambda: libscanio.topk(BADQ_P, "b", 2))
+    check_raises("unterminated quote: order_by reports it", lambda: libscanio.order_by(BADQ_P, "b"))
+    check_raises("unterminated quote: describe reports it", lambda: libscanio.describe(BADQ_P))
+finally:
+    os.unlink(BADQ_P)
 
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

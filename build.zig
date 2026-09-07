@@ -59,6 +59,17 @@ pub fn build(b: *std.Build) void {
     const run_c_api_tests = b.addRunArtifact(c_api_tests);
     test_step.dependOn(&run_c_api_tests.step);
 
+    // Shared CSV field splitter — its own module so `zig build test`
+    // covers the quoting rules directly, not only through a Scanner.
+    const csv_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/csv.zig"),
+    });
+    const csv_tests = b.addTest(.{ .root_module = csv_mod });
+    const run_csv_tests = b.addRunArtifact(csv_tests);
+    test_step.dependOn(&run_csv_tests.step);
+
     // WHERE-string parsing for the N-API Node binding — its own module
     // (not node_binding.zig itself, which needs node_api.h available to
     // even compile) so `zig build test` covers it without needing Node

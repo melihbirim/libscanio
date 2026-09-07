@@ -18,6 +18,7 @@
 const std = @import("std");
 const scanio = @import("scanio");
 const where_parser = @import("where_parser.zig");
+const csv = scanio.csv_fields;
 
 const usage =
     \\usage: scanio <file> [options]
@@ -122,7 +123,10 @@ fn writeRow(out: *std.io.Writer, row: scanio.Row, names: []const []const u8, for
         .csv => {
             for (row.fields, 0..) |f, i| {
                 if (i > 0) try out.writeByte(',');
-                try out.writeAll(f);
+                // Re-quote: the scanner strips RFC 4180 quoting, so a
+                // bare write would emit a field containing a comma as
+                // two fields.
+                try csv.writeField(out, f, ',');
             }
         },
         .ndjson => {
@@ -315,4 +319,19 @@ test "resolveColumns: names resolve to indices in the order given" {
 
     try testing.expectEqual(@as(?[]usize, null), try resolveColumns(testing.allocator, &header, null));
     try testing.expectError(error.UnknownColumn, resolveColumns(testing.allocator, &header, "id,nope"));
+}
+
+test "writeRow: CSV output re-quotes anything that would not parse back" {
+    // The scanner strips quoting, so `--format csv` has to put it back or
+    // `scanio a.csv | scanio -` would silently gain a column.
+    const allocator = std.testing.allocator;
+    var w: std.io.Writer.Allocating = .init(allocator);
+    defer w.deinit();
+
+    const fields = [_][]const u8{ "1", "Smith, John", "he said \"hi\"", "plain" };
+    try writeRow(&w.writer, scanio.Row{ .fields = &fields }, &.{}, .csv);
+    try std.testing.expectEqualStrings(
+        "1,\"Smith, John\",\"he said \"\"hi\"\"\",plain\n",
+        w.written(),
+    );
 }

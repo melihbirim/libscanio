@@ -130,10 +130,9 @@ def _parse_where(
 def _zip_row(names: "Sequence[str]", values: list) -> dict:
     """Map a row's field values onto the header names.
 
-    A row can legitimately carry MORE fields than the header: ragged CSV,
-    or a delimiter inside a quoted field (this scanner splits on the
-    delimiter and does not treat quotes as grouping — see the README's
-    CSV note). Indexing `names[i]` for those raised IndexError and killed
+    A row can legitimately carry MORE fields than the header — ragged
+    CSV is a real thing and this reader handles it. Indexing `names[i]`
+    for those raised IndexError and killed
     the whole iteration mid-scan; they now get a positional `colN` key,
     so the data survives and matches what the `scanio` CLI emits for the
     same row. Fewer fields than the header stays as it was: the missing
