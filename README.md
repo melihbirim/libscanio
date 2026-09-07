@@ -170,6 +170,8 @@ from the CLI, where report mode doubles as a shell gate:
 scanio orders.csv --validate schema.json            # JSON report; exit 1 if any row failed
 scanio orders.csv --validate schema.json --valid    # ...or stream just the rows that passed
 scanio orders.csv --validate schema.json --invalid  # ...or just the ones that didn't
+
+scanio orders.csv --validate schema.json --max-errors 0 > errors.json   # list every failure, not the first 100
 ```
 
 Runnable end-to-end examples of exactly this — the summary, the

@@ -38,6 +38,8 @@ const usage =
     \\                      Prints a JSON report; exits 1 if any row failed.
     \\  --valid             ...and instead stream only the rows that passed
     \\  --invalid           ...or only the rows that failed
+    \\  --max-errors <n>    how many failures the report LISTS (default 100).
+    \\                      Counts are always complete; 0 means no limit.
     \\
     \\Report mode is a gate: it exits 1 if any row failed, so it drops
     \\straight into a script. The two row modes are filters and exit 0
@@ -66,6 +68,9 @@ pub const Args = struct {
     help: bool = false,
     /// Path to a JSON schema file. Set = run validation instead of a scan.
     validate: ?[]const u8 = null,
+    /// How many individual failures the report lists. Null = the
+    /// library default (100); 0 = list every one of them.
+    max_errors: ?usize = null,
     /// What to emit under --validate. Report is the default; the two row
     /// modes are what makes this usable in a pipeline —
     /// `scanio in.csv --validate s.json --valid > clean.csv`.
@@ -118,6 +123,10 @@ pub fn parseArgs(argv: []const []const u8) ArgError!Args {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
             a.validate = argv[i];
+        } else if (std.mem.eql(u8, arg, "--max-errors")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            a.max_errors = std.fmt.parseInt(usize, argv[i], 10) catch return ArgError.BadLimit;
         } else if (std.mem.eql(u8, arg, "--valid")) {
             a.validate_output = .valid;
         } else if (std.mem.eql(u8, arg, "--invalid")) {
@@ -131,7 +140,9 @@ pub fn parseArgs(argv: []const []const u8) ArgError!Args {
     if (a.path.len == 0) return ArgError.MissingPath;
     // --valid/--invalid select what a validation run emits; on their own
     // they would silently do nothing.
-    if (a.validate == null and a.validate_output != .report) return ArgError.ValidateRequired;
+    if (a.validate == null and (a.validate_output != .report or a.max_errors != null)) {
+        return ArgError.ValidateRequired;
+    }
     // Silently ignoring a flag is worse than refusing it: a caller who
     // wrote `--validate s.json --where x = 1` believes the filter ran.
     if (a.validate != null and (a.where != null or a.columns != null or a.limit != null or a.count_only)) {
@@ -340,7 +351,11 @@ fn runValidate(
     defer schema.deinit();
 
     if (args.validate_output == .report) {
-        var report = scanio.validate(allocator, args.path, &schema, .{}) catch |e| {
+        var report = scanio.validate(allocator, args.path, &schema, .{
+            // 0 means "list them all", which the library spells as a
+            // cap nothing can reach — its own 0 means "use the default".
+            .max_errors = if (args.max_errors) |m| (if (m == 0) std.math.maxInt(usize) else m) else 100,
+        }) catch |e| {
             try err_out.print("scanio: validate failed: {s}\n", .{@errorName(e)});
             try err_out.flush();
             return 1;
@@ -471,4 +486,16 @@ test "parseArgs: --validate refuses the scan flags it cannot honour" {
     try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--columns", "a" }));
     try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--limit", "3" }));
     try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--count" }));
+}
+
+test "parseArgs: --max-errors, including the 'list them all' spelling" {
+    const a = try parseArgs(&.{ "d.csv", "--validate", "s.json", "--max-errors", "5" });
+    try testing.expectEqual(@as(usize, 5), a.max_errors.?);
+    const b = try parseArgs(&.{ "d.csv", "--validate", "s.json", "--max-errors", "0" });
+    try testing.expectEqual(@as(usize, 0), b.max_errors.?);
+    const c = try parseArgs(&.{ "d.csv", "--validate", "s.json" });
+    try testing.expect(c.max_errors == null);
+    // Meaningless without --validate, so refused rather than ignored.
+    try testing.expectError(ArgError.ValidateRequired, parseArgs(&.{ "d.csv", "--max-errors", "5" }));
+    try testing.expectError(ArgError.BadLimit, parseArgs(&.{ "d.csv", "--validate", "s.json", "--max-errors", "x" }));
 }

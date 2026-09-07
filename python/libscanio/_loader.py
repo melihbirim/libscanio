@@ -236,5 +236,8 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_close.argtypes = [ctypes.c_void_p]
     lib.scanio_close.restype = None
 
+    lib.scanio_build_mode.argtypes = []
+    lib.scanio_build_mode.restype = ctypes.c_char_p
+
     lib.scanio_last_error.argtypes = []
     lib.scanio_last_error.restype = ctypes.c_char_p

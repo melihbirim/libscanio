@@ -268,12 +268,34 @@ def main():
                          "The bounded-memory claim is the one property here that is NOT "
                          "noisy on a shared runner, so it is the one worth gating on.")
     ap.add_argument("--summary", help="also append the tables to this file (GITHUB_STEP_SUMMARY)")
+    ap.add_argument("--allow-debug", action="store_true",
+                    help="run even though libscanio was not built in ReleaseFast. "
+                         "For checking the harness itself; never for a published number.")
     ap.add_argument("--node-modules", default=os.environ.get("LIBSCANIO_BENCH_NODE_MODULES", ""),
                     help="directory holding apache-arrow and csv-parse (enables the Arrow/JS engine)")
     args = ap.parse_args()
 
     if not os.path.exists(CLI):
         print(f"missing {CLI} — run: zig build cli -Doptimize=ReleaseFast", file=sys.stderr)
+        return 1
+
+    # Refuse to publish a Debug number. `zig build diff-test`/`node`/`cli`
+    # reinstall their artifacts at the DEFAULT optimize mode, silently
+    # overwriting a ReleaseFast build in zig-out — a Debug library
+    # measures orders of magnitude slower and looks like a real result.
+    # This has produced wrong numbers more than once; it is cheaper to
+    # fail here than to notice afterwards.
+    sys.path.insert(0, os.path.join(REPO, "python"))
+    try:
+        import libscanio as _ls
+        mode = _ls.build_mode()
+    except Exception as e:  # noqa: BLE001 — library not built yet is its own message
+        print(f"cannot load libscanio to check its build mode: {e}", file=sys.stderr)
+        return 1
+    if mode != "ReleaseFast" and not args.allow_debug:
+        print(f"libscanio.so was built in {mode}, not ReleaseFast — refusing to publish "
+              f"a benchmark from it. Run: zig build c-lib -Doptimize=ReleaseFast "
+              f"(and node/cli likewise), or pass --allow-debug.", file=sys.stderr)
         return 1
 
     results = []

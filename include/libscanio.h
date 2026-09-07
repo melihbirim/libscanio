@@ -196,6 +196,14 @@ const char *scanio_validator_column_name(scanio_validator_t *v, size_t index);
 
 void scanio_validator_close(scanio_validator_t *v);
 
+/* The optimize mode this library was built with — "Debug",
+ * "ReleaseSafe", "ReleaseFast" or "ReleaseSmall". For a benchmark to
+ * assert on before publishing a number: several build steps reinstall
+ * their artifacts at the DEFAULT optimize mode, which silently
+ * overwrites a ReleaseFast build, and a Debug library measures orders of
+ * magnitude slower while looking like a real result. */
+const char *scanio_build_mode(void);
+
 /* Human-readable reason for the most recent NULL/-1 return on this
  * thread, or NULL if the last call succeeded. The returned pointer is
  * only valid until the next libscanio call on this thread — copy it if

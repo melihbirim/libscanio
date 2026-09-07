@@ -31,7 +31,7 @@ import datetime
 
 from ._loader import CAgg, COptions, CPredicate, load
 
-__all__ = ["scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "validate", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
+__all__ = ["scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
@@ -607,6 +607,18 @@ def _open_filtered(
     if not ctx:
         _raise_last_error(lib, f"failed to open {path!r}")
     return ctx, keepalive
+
+
+def build_mode() -> str:
+    """The optimize mode the loaded shared library was built with —
+    "Debug", "ReleaseSafe", "ReleaseFast" or "ReleaseSmall".
+
+    For benchmarks to assert on. `zig build diff-test`/`node`/`cli`
+    reinstall their artifacts at the DEFAULT optimize mode, which
+    silently overwrites a ReleaseFast build in zig-out; a Debug library
+    measures 40-100x slower and looks like a real result.
+    """
+    return load().scanio_build_mode().decode()
 
 
 def schema(path: str) -> list[str]:

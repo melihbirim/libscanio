@@ -45,6 +45,20 @@ fn clearError() void {
     last_error = null;
 }
 
+/// The optimize mode this library was built with — "Debug",
+/// "ReleaseSafe", "ReleaseFast" or "ReleaseSmall".
+///
+/// Exists because of a repeated, expensive measurement bug, not for
+/// introspection: `zig build diff-test`/`node`/`cli` reinstall their
+/// artifacts at the DEFAULT optimize mode, silently overwriting a
+/// ReleaseFast build in zig-out. Three separate benchmark runs in one
+/// session were quietly measuring a Debug library and reported numbers
+/// 40-100x off before anyone noticed the .so had changed size. A
+/// benchmark can now refuse to run instead of publishing that.
+pub export fn scanio_build_mode() [*:0]const u8 {
+    return @tagName(@import("builtin").mode);
+}
+
 pub export fn scanio_last_error() ?[*:0]const u8 {
     const msg = last_error orelse return null;
     // Re-render into a NUL-terminated copy on demand rather than keeping
