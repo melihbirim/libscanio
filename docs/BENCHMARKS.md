@@ -161,74 +161,77 @@ See [DESIGN.md](DESIGN.md) for the full chunked-read rationale and the
 CSV/NDJSON/JSON-array before-and-after numbers (196x, 29x, and 26x less
 peak RSS respectively, at 0-50% time cost depending on format).
 
-## Ecosystem comparison — reproducible
+## Ecosystem comparison — equivalent workloads
 
-Everything below comes from `zig build bench-compare` (see
-[bench/compare.py](../bench/compare.py)), not from a script that no longer
-exists. Every engine answers the same question in its own fresh process —
-"how many rows match `cab_type = yellow`" — so the time includes runtime
-startup and the peak RSS is that engine's alone, read from the OS rather
-than self-reported. All nine agree on the row count; the harness fails if
-they don't, because a fast wrong answer is not a result.
+`bench/compare.py` separates three contracts. Compare engines **within a
+category**, rather than treating a count, a Python iterator, and an Arrow
+table as interchangeable outputs.
 
-`native python` (the `csv`/`json` modules) and `native node` (`fs` +
-`split`) are in the table on purpose: they are what you write when you
-skip the library entirely, and they are the floor any dependency has to
-beat to justify itself.
+| Category | Required result | Engines |
+|---|---|---|
+| Filtered count | One scalar count; no matching table collected | libscanio CLI/Python/Node, PyArrow `count_rows`, Polars `select(pl.len())` |
+| Materialized Arrow | All matching rows, all eight columns, string values, retained in an Arrow table | libscanio `scan_table(infer_types=False)`, PyArrow `to_table`, Polars `collect().to_arrow()`, optional Arrow JS + parser |
+| Streaming import | Consume each matching row and all eight fields; sum their string lengths without retaining the result | libscanio Python/Node, Python csv/json, Node readline |
+
+The Arrow group measures logical string columns (Arrow string or large
+string), including conversion into Arrow where required. Both CSV and
+NDJSON fixtures contain the same string values. This is an import/text
+workload, **not a numeric analytics benchmark**. Type inference is disabled
+or replaced with an explicit schema in the competing table readers.
+The Node baseline parses only this fixture's unquoted CSV; it is not a
+production CSV parser. Arrow JS includes CSV/JSON parsing and pivoting
+objects into columns, so its label names that complete pipeline.
+
+Each table reports two distinct timing boundaries:
+
+- **Cold process:** launch, imports, query, output, and process exit.
+- **Warm query:** a second query in a separate process after one untimed
+  query; imports and warmup are excluded. Query construction and Arrow
+  conversion are included. The CLI has no persistent query API, so its
+  warm result is N/A.
+- **Peak RSS (MiB):** the cold process's lifetime maximum, including
+  runtime/import memory. Warm RSS is deliberately not mixed into it.
+
+OS caches are not cleared: cold means a fresh process, not cold storage.
+Every engine uses its default threading. Results are medians across
+`--reps` fresh processes for each timing mode. Engines run sequentially;
+small differences can reflect cache/order/CPU variation. No timing gate
+is enforced in CI.
+
+Every repetition must match an independent fixture-derived row count;
+streaming consumers must also match a checksum covering every field.
+Small-fixture tests check exact Arrow values across engines. An installed
+engine failing, missing output, or any mismatch makes the run fail.
+Unavailable optional dependencies are recorded as skipped. The 40 MiB CI
+ceiling applies only to libscanio's CLI/Python count and streaming paths,
+not materialized tables or the Node runtime.
 
 Reproduce:
 
 ```bash
-zig build bench-compare -Doptimize=ReleaseFast -- --rows 1000000 --reps 5
-# apache-arrow is skipped unless you point the harness at it:
+python -m pip install polars==1.44.1 pyarrow==25.0.1
+zig build bench-compare -Doptimize=ReleaseFast -- --rows 200000 --reps 3
+# Select a category or stable engine IDs:
+python bench/compare.py --workloads arrow --engines libscanio-python,pyarrow,polars
+# Optional JavaScript Arrow comparison:
 npm install apache-arrow csv-parse
-zig build bench-compare -Doptimize=ReleaseFast -- --node-modules ./node_modules
+python bench/compare.py --node-modules ./node_modules
+# Cold-only runs and machine-readable results:
+python bench/compare.py --timing cold --json bench-results.json
 ```
 
-Measured on the machine in the header of this file, Zig 0.15.2,
-pyarrow 25.0.1, polars 1.44.1, apache-arrow 21.2.0, Node 22, Python 3.11.
+JSON schema version 2 records workload, engine ID, status, cold/warm
+seconds, cold RSS, fixture size/count, expected result, and runtime
+versions. Summary Markdown uses the same categories. CI installs the
+Python competitors and runs the matrix on Windows, macOS, and Linux.
 
-## CSV — 1,000,000 rows, 43MB, WHERE cab_type = yellow
+A fresh local [categorized result snapshot](BENCHMARK_MATRIX.md) replaces
+the old mixed-workload tables. Those historical numbers used different
+consumption patterns and a numeric NDJSON fixture; they should not be
+compared directly to this matrix or used to claim an overall winner.
 
-| engine | time | peak RSS | rows |
-|---|---|---|---|
-| libscanio CLI (zig) | 106.4ms | 10.2MB | 333,334 |
-| libscanio python | 1187.3ms | 10.2MB | 333,334 |
-| libscanio python (arrow) | 229.0ms | 90.9MB | 333,334 |
-| libscanio node | 899.6ms | 68.7MB | 333,334 |
-| pyarrow | 438.7ms | 144.7MB | 333,334 |
-| polars | 312.9ms | 163.7MB | 333,334 |
-| apache-arrow (node) | 9028.2ms | 655.5MB | 333,334 |
-| native python (csv/json) | 2207.8ms | 10.2MB | 333,334 |
-| native node (split) | 903.9ms | 174.7MB | 333,334 |
-
-## NDJSON — 1,000,000 rows, 139MB, WHERE cab_type = yellow
-
-| engine | time | peak RSS | rows |
-|---|---|---|---|
-| libscanio CLI (zig) | 324.5ms | 10.2MB | 333,334 |
-| libscanio python | 1417.9ms | 10.2MB | 333,334 |
-| libscanio python (arrow) | 302.0ms | 91.7MB | 333,334 |
-| libscanio node | 1210.3ms | 68.7MB | 333,334 |
-| pyarrow | 650.7ms | 205.2MB | 333,334 |
-| polars | 457.0ms | 231.3MB | 333,334 |
-| apache-arrow (node) | 4909.1ms | 695.2MB | 333,334 |
-| native python (csv/json) | 3410.9ms | 10.2MB | 333,334 |
-| native node (split) | 1914.1ms | 306.5MB | 333,334 |
-
-Reading these: libscanio's streaming paths hold **10.2MB regardless of
-format or file size** while every other engine's memory scales with the
-result — that gap, not the wall-clock column, is the thing the design
-buys. On time, the CLI wins outright because below ~100MB starting the
-runtime costs more than the scan; the Python streaming client is the
-slowest libscanio path by design, paying a ctypes crossing per row to
-keep memory flat. Node's ~69MB floor is V8's, not libscanio's.
-
-`apache-arrow` (JS) has no native CSV or NDJSON reader, so its row has to
-fully materialise every record as a JS object and then pivot to columns —
-a structurally heavier pipeline than pyarrow's parse-straight-to-buffers
-path, which is why it is an order of magnitude behind rather than a
-tuning difference.
+API references: [Polars collect](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.collect.html),
+[PyArrow Dataset](https://arrow.apache.org/docs/python/generated/pyarrow.dataset.Dataset.html).
 
 ## Reproducing
 

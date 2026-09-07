@@ -136,6 +136,13 @@ jobs:
       # and deliberately not asserted on — a hosted runner moves them by
       # far more than a real regression would, and a perf gate that cries
       # wolf is a perf gate everyone learns to ignore.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python comparison engines
+        run: python -m pip install polars==1.44.1 pyarrow==25.0.1
+
       - name: Benchmark (report timings, gate on rows + memory ceiling)
         shell: bash
         run: |
