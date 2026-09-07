@@ -30,6 +30,16 @@ import subprocess
 import sys
 import tempfile
 
+# text=True decodes a child's stdout with the LOCALE encoding, which is
+# cp1252 on a Windows runner — it turned Node's and the CLI's correct
+# UTF-8 output into mojibake before the comparison, and reported the
+# Python client (the one that was right) as the odd one out. Every
+# subprocess below therefore passes encoding="utf-8" explicitly. Our own
+# report needs the same treatment or the failure text is unreadable in
+# the CI log.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "python"))
 import libscanio  # noqa: E402
@@ -218,7 +228,7 @@ def node_api_calls(path):
         driver = f.name
     try:
         p = subprocess.run(["node", driver, os.path.join(REPO, "node", "index.js"), path],
-                           capture_output=True, text=True)
+                           capture_output=True, encoding="utf-8")
         if p.returncode != 0:
             raise AssertionError(f"node api driver failed: {p.stderr}")
         return json.loads(p.stdout)
@@ -250,7 +260,7 @@ def via_node(path, where, columns, limit):
             ["node", driver, os.path.join(REPO, "node", "index.js"), path,
              where or "-", ",".join(columns) if columns else "-",
              str(limit) if limit is not None else "-"],
-            capture_output=True, text=True)
+            capture_output=True, encoding="utf-8")
         if p.returncode != 0:
             raise AssertionError(f"node driver failed: {p.stderr}")
         names = columns or header_of(path)
@@ -267,7 +277,7 @@ def via_cli(path, where, columns, limit):
         cmd += ["--columns", ",".join(columns)]
     if limit is not None:
         cmd += ["--limit", str(limit)]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, encoding="utf-8")
     if p.returncode != 0:
         raise AssertionError(f"cli failed: {p.stderr}")
     names = columns or header_of(path)
@@ -387,7 +397,7 @@ def main():
                 n_count = libscanio.count(path, where) if where else libscanio.count(path)
                 check(f"count == len(scan) | {kind} where={where!r}", n_count, n_scan)
                 cli_cmd = [CLI, path, "--count"] + (["--where", where] if where else [])
-                cli_n = int(subprocess.run(cli_cmd, capture_output=True, text=True).stdout.strip())
+                cli_n = int(subprocess.run(cli_cmd, capture_output=True, encoding="utf-8").stdout.strip())
                 check(f"count == cli count | {kind} where={where!r}", cli_n, n_count)
 
         # The rest of the API surface: aggregate/topk/orderBy/schema are
