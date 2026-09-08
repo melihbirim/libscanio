@@ -6,7 +6,7 @@ Zig engine exposed through a CPython extension.
 ## Install
 
 ```sh
-pip install libscanio==0.1.1
+pip install libscanio==0.1.2
 ```
 
 Prebuilt wheels support CPython 3.10–3.14 on Linux x64/ARM64 (glibc 2.28+),
