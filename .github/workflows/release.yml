@@ -1,15 +1,9 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      npm_only_tag:
-        description: 'Retry npm from an existing release tag; blank builds only'
-        required: false
-        default: ''
-        type: string
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
   pull_request:
     paths:
       - '.github/workflows/release.yml'
@@ -20,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name || github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,19 +28,17 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/test_check_release.py
-      - name: Match release tag to package versions
+      - name: Match tag to package versions
         id: version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.npm_only_tag }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
         run: python scripts/check_release.py
 
   packages:
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.npm_only_tag == '')
     needs: validate
     uses: ./.github/workflows/packages.yml
 
-  build:
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.npm_only_tag == '')
+  build-clib:
     needs: validate
     runs-on: ubuntu-latest
     strategy:
@@ -98,11 +90,69 @@ jobs:
           name: c-${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
+  # `scanio` CLI — see src/cli.zig's doc comment for why this is a shipped
+  # artifact, not just a dev convenience. Cross-compiled the same way as
+  # build-clib above, packaged the same way csvql's own release.yml packages
+  # its CLI binary.
+  build-cli:
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            asset: scanio-linux-x86_64
+            ext: ""
+            pkg: tar.gz
+          - target: aarch64-linux-gnu
+            asset: scanio-linux-aarch64
+            ext: ""
+            pkg: tar.gz
+          - target: x86_64-macos
+            asset: scanio-macos-x86_64
+            ext: ""
+            pkg: tar.gz
+          - target: aarch64-macos
+            asset: scanio-macos-aarch64
+            ext: ""
+            pkg: tar.gz
+          - target: x86_64-windows-gnu
+            asset: scanio-windows-x86_64
+            ext: ".exe"
+            pkg: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build scanio CLI for ${{ matrix.target }}
+        run: zig build cli -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.pkg == 'tar.gz'
+        run: |
+          mkdir -p release
+          cp zig-out/bin/scanio release/${{ matrix.asset }}
+          cd release && tar -czf ${{ matrix.asset }}.tar.gz ${{ matrix.asset }}
+
+      - name: Package (zip — Windows)
+        if: matrix.pkg == 'zip'
+        run: |
+          mkdir -p release
+          cp zig-out/bin/scanio${{ matrix.ext }} release/${{ matrix.asset }}.exe
+          cd release && zip ${{ matrix.asset }}.zip ${{ matrix.asset }}.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.asset }}
+          path: release/${{ matrix.asset }}.${{ matrix.pkg }}
+
   release:
-    if: github.event_name == 'release'
     permissions:
       contents: write
-    needs: [build, packages]
+    needs: [validate, build-clib, build-cli, packages]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -110,6 +160,10 @@ jobs:
         with:
           path: artifacts
           pattern: c-*
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: cli-*
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
@@ -126,12 +180,13 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ github.ref_name }}
+          name: libscanio ${{ needs.validate.outputs.version }}
+          generate_release_notes: true
           fail_on_unmatched_files: true
 
   publish-pypi:
-    if: github.event_name == 'release'
-    needs: [validate, packages, build]
+    needs: [validate, packages]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -146,15 +201,10 @@ jobs:
           skip-existing: true
 
   publish-npm:
-    if: >-
-      always() && needs.validate.result == 'success' &&
-      ((github.event_name == 'release' && needs.packages.result == 'success' && needs.build.result == 'success') ||
-       (github.event_name == 'workflow_dispatch' && inputs.npm_only_tag != ''))
-    needs: [validate, packages, build]
+    needs: [validate, packages]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
-      contents: read
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -162,21 +212,91 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@11
       - uses: actions/download-artifact@v4
-        if: github.event_name == 'release'
         with:
           name: npm-package
           path: dist
-      - name: Download existing release tarball for npm retry
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.npm_only_tag }}
-          VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          mkdir -p dist
-          gh release download "$RELEASE_TAG" --pattern "libscanio-$VERSION.tgz" --dir dist
-          tar -xOf "dist/libscanio-$VERSION.tgz" package/package.json > package-metadata.json
-          node -e 'const p=require("./package-metadata.json"); if(p.name!=="libscanio" || p.version!==process.env.VERSION) throw Error("Release package version mismatch")'
       - name: Publish tested tarball with provenance
         run: npm publish ./dist/*.tgz --access public --provenance
+
+  update-homebrew:
+    needs: [validate, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for release assets to be available
+        run: sleep 15
+
+      - name: Download release assets and compute SHA256
+        id: hashes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          BASE="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
+          curl -fsSL -o macos-aarch64.tar.gz "${BASE}/scanio-macos-aarch64.tar.gz"
+          curl -fsSL -o macos-x86_64.tar.gz  "${BASE}/scanio-macos-x86_64.tar.gz"
+          curl -fsSL -o linux-x86_64.tar.gz  "${BASE}/scanio-linux-x86_64.tar.gz"
+          echo "sha_macos_arm=$(sha256sum macos-aarch64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "sha_macos_x86=$(sha256sum macos-x86_64.tar.gz  | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "sha_linux_x86=$(sha256sum linux-x86_64.tar.gz  | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          script: |
+            const version  = "${{ needs.validate.outputs.version }}";
+            const shaArm   = "${{ steps.hashes.outputs.sha_macos_arm }}";
+            const shaX86   = "${{ steps.hashes.outputs.sha_macos_x86 }}";
+            const shaLinux = "${{ steps.hashes.outputs.sha_linux_x86 }}";
+            const base     = `https://github.com/melihbirim/libscanio/releases/download/v${version}`;
+
+            const formula = `class Libscanio < Formula
+              desc "Scan huge CSV files without loading them into memory"
+              homepage "https://github.com/melihbirim/libscanio"
+              version "${version}"
+              license "MIT"
+
+              on_macos do
+                on_arm do
+                  url "${base}/scanio-macos-aarch64.tar.gz"
+                  sha256 "${shaArm}"
+                end
+                on_intel do
+                  url "${base}/scanio-macos-x86_64.tar.gz"
+                  sha256 "${shaX86}"
+                end
+              end
+
+              on_linux do
+                on_intel do
+                  url "${base}/scanio-linux-x86_64.tar.gz"
+                  sha256 "${shaLinux}"
+                end
+              end
+
+              def install
+                bin.install Dir["scanio-*"].first => "scanio"
+              end
+
+              test do
+                (testpath/"test.csv").write("name,age\\nAlice,30\\nBob,25\\n")
+                output = shell_output("#{bin}/scanio test.csv --where \\"age > 26\\"")
+                assert_match "Alice", output
+              end
+            end
+            `;
+
+            const { data: current } = await github.rest.repos.getContent({
+              owner: "melihbirim",
+              repo:  "homebrew-libscanio",
+              path:  "Formula/libscanio.rb",
+            });
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner:   "melihbirim",
+              repo:    "homebrew-libscanio",
+              path:    "Formula/libscanio.rb",
+              message: `chore: update formula to v${version}`,
+              content: Buffer.from(formula).toString("base64"),
+              sha:     current.sha,
+            });

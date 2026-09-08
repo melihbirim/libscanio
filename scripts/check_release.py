@@ -24,12 +24,6 @@ if __name__ == "__main__":
     python_project = tomllib.loads((root / "python/pyproject.toml").read_text())["project"]
     node_package = json.loads((root / "node/package.json").read_text())
     tag = os.environ.get("RELEASE_TAG", "")
-    if os.environ.get("GITHUB_EVENT_NAME") == "release":
-        if not tag:
-            raise ValueError("Release event is missing its tag")
-        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-        if event["release"]["prerelease"]:
-            raise ValueError("Prerelease publication is not configured")
     version = check(python_project, node_package, tag)
     if output := os.environ.get("GITHUB_OUTPUT"):
         with open(output, "a") as stream:
