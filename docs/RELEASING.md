@@ -70,7 +70,7 @@ Never move a published version's tag to different code.
 
 ## Build without publishing
 
-Run `Release` manually in Actions to build the same artifacts without uploading
+Run `Release` manually in Actions with `npm_only_tag` blank to build the same artifacts without uploading
 to registries or modifying a GitHub release. `Build packages` also runs on
 relevant pull requests and can be run manually; it builds only Python and npm
 artifacts and never publishes.
@@ -87,3 +87,14 @@ Arrow ownership tests. Node binaries run both binding suites on native runners;
 the assembled tarball is installed and smoke-tested on Linux. Source distributions
 are not published because the Python source package requires the parent Zig
 repository to build.
+
+## Retry npm after an interrupted publication
+
+If PyPI succeeded but npm failed, fix the cause and rerun only npm. When the
+workflow itself needs a correction, merge the correction on main without moving
+the existing release tag. Run `Release` manually on main with `npm_only_tag` set
+to that tag (for example, `v0.1.1`). This downloads the exact npm tarball already
+attached to the GitHub release, verifies its package name/version, and publishes
+it using trusted publishing. It does not rebuild or republish Python wheels.
+The tag must match the current manifests. Normal blank manual runs remain
+build-only. If npm already has the version, it refuses to overwrite it.

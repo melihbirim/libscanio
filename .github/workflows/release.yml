@@ -2,6 +2,12 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      npm_only_tag:
+        description: 'Retry npm from an existing release tag; blank builds only'
+        required: false
+        default: ''
+        type: string
   release:
     types: [published]
   pull_request:
@@ -31,16 +37,16 @@ jobs:
       - name: Match release tag to package versions
         id: version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.npm_only_tag }}
         run: python scripts/check_release.py
 
   packages:
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.npm_only_tag == '')
     needs: validate
     uses: ./.github/workflows/packages.yml
 
   build:
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.npm_only_tag == '')
     needs: validate
     runs-on: ubuntu-latest
     strategy:
@@ -140,11 +146,15 @@ jobs:
           skip-existing: true
 
   publish-npm:
-    if: github.event_name == 'release'
+    if: >-
+      always() && needs.validate.result == 'success' &&
+      ((github.event_name == 'release' && needs.packages.result == 'success' && needs.build.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && inputs.npm_only_tag != ''))
     needs: [validate, packages, build]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
+      contents: read
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -152,8 +162,21 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@11
       - uses: actions/download-artifact@v4
+        if: github.event_name == 'release'
         with:
           name: npm-package
           path: dist
+      - name: Download existing release tarball for npm retry
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.npm_only_tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" --pattern "libscanio-$VERSION.tgz" --dir dist
+          tar -xOf "dist/libscanio-$VERSION.tgz" package/package.json > package-metadata.json
+          node -e 'const p=require("./package-metadata.json"); if(p.name!=="libscanio" || p.version!==process.env.VERSION) throw Error("Release package version mismatch")'
       - name: Publish tested tarball with provenance
-        run: npm publish dist/*.tgz --access public --provenance
+        run: npm publish ./dist/*.tgz --access public --provenance
