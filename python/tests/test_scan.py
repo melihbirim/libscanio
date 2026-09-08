@@ -43,6 +43,9 @@ def check_raises(label, fn, exc=libscanio.ScanError):
         print(f"FAIL  {label}\n    no exception raised")
 
 
+check("shared library reports its optimization mode",
+      libscanio.build_mode() in {"Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"}, True)
+
 tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
 tmp.write("customer_id,name,revenue\n1,Alice,500\n2,Bob,1500\n3,Carol,2500\n")
 tmp.close()

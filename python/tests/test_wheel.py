@@ -27,6 +27,10 @@ assert libscanio.validate(b'a\\n1\\n', {'a': {'min': 0}}) is True
 assert libscanio.validate(b'a\\n-1\\n', {'a': {'min': 0}}) is False
 r = libscanio.validate(b'a\\n-1\\n', {'a': {'min': 0}}, mode='full')
 assert r == [{'values': ['-1'], 'errors': [{'column': 0, 'column_name': 'a', 'rule': 'below_min', 'value': '-1'}]}]
-print('Installed wheel: extension and shared library passed')
+from pathlib import Path
+assert Path(libscanio.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())
+print('Installed wheel: running the complete Python binding suite', flush=True)
+import runpy
+runpy.run_path(sys.argv[2], run_name='__main__')
 '''
-    subprocess.check_call([sys.executable, '-I', '-c', code, str(target)], cwd=work)
+    subprocess.check_call([sys.executable, '-I', '-c', code, str(target), str(root / 'python' / 'tests' / 'test_scan.py')], cwd=work)
