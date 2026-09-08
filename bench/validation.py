@@ -69,7 +69,7 @@ def main():
                 for label, lib in order:
                     _loader._lib_cache = lib
                     start = time.perf_counter()
-                    report = scan.validate(path, schema, max_errors=100)
+                    report = scan.validate_report(path, schema, max_errors=100)
                     elapsed = time.perf_counter() - start
                     got = snapshot(report)
                     assert report.rows_total == args.rows

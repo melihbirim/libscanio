@@ -540,7 +540,7 @@ def oracle_validate(path, schema, max_errors=100):
 
 
 def validate_via_python(path, schema, max_errors=100):
-    r = libscanio.validate(path, schema, max_errors=max_errors)
+    r = libscanio.validate_report(path, schema, max_errors=max_errors)
     return {"rows_total": r.rows_total, "rows_valid": r.rows_valid,
             "rows_invalid": r.rows_invalid, "errors_total": r.errors_total,
             "truncated": r.truncated, "counts": r.counts,

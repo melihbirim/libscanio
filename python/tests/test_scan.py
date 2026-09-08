@@ -466,7 +466,7 @@ VAL_SCHEMA = {
     "status": {"one_of": ["new", "paid", "shipped"]},
 }
 try:
-    r = libscanio.validate(VAL_P, VAL_SCHEMA)
+    r = libscanio.validate_report(VAL_P, VAL_SCHEMA)
     check("validate: row totals", (r.rows_total, r.rows_valid, r.rows_invalid), (3, 1, 2))
     check("validate: ok is False when any row failed", r.ok, False)
     check("validate: every failure is counted", r.errors_total, 4)
@@ -477,14 +477,14 @@ try:
            r.errors[0].rule, r.errors[0].value),
           (2, 0, "id", "bad_type", "x"))
     check("validate: a clean run reports ok",
-          libscanio.validate(VAL_P, {"name": {}}).ok, True)
+          libscanio.validate_report(VAL_P, {"name": {}}).ok, True)
 
     # The cap bounds what is STORED, never what is counted — the whole
     # point is that a wholly-broken file still produces a report.
-    capped = libscanio.validate(VAL_P, {"id": {"type": "integer"}}, max_errors=0)
+    capped = libscanio.validate_report(VAL_P, {"id": {"type": "integer"}}, max_errors=0)
     check("validate: max_errors=0 falls back to the default, not to zero errors",
           len(capped.errors), 1)
-    r2 = libscanio.validate(VAL_P, VAL_SCHEMA, max_errors=2)
+    r2 = libscanio.validate_report(VAL_P, VAL_SCHEMA, max_errors=2)
     check("validate: max_errors caps the stored list", len(r2.errors), 2)
     check("validate: ...but not the totals", r2.errors_total, 4)
     check("validate: ...and says so", r2.truncated, True)
@@ -502,9 +502,9 @@ try:
           sum(1 for _, errs in seen if not errs), r.rows_valid)
 
     check_raises("validate: an unknown column is an error, not an unenforced rule",
-                 lambda: libscanio.validate(VAL_P, {"nope": {"required": True}}))
+                 lambda: libscanio.validate_report(VAL_P, {"nope": {"required": True}}))
     check_raises("validate: a misspelled rule name is an error too",
-                 lambda: libscanio.validate(VAL_P, {"id": {"requred": True}}))
+                 lambda: libscanio.validate_report(VAL_P, {"id": {"requred": True}}))
     check_raises("validate_iter: same, before any row is yielded",
                  lambda: list(libscanio.validate_iter(VAL_P, {"nope": {}})))
 
@@ -515,7 +515,7 @@ try:
     check("infer_schema: required=True marks them all",
           libscanio.infer_schema(VAL_P, required=True)["id"], {"required": True})
     check("infer_schema: its own output validates the file it came from",
-          libscanio.validate(VAL_P, inferred).ok, True)
+          libscanio.validate_report(VAL_P, inferred).ok, True)
 finally:
     os.unlink(VAL_P)
 
@@ -525,10 +525,10 @@ BLANK_P = "_test_validate_blank.csv"
 with open(BLANK_P, "w", encoding="utf-8") as f:
     f.write("id,note\n1,\n2,   \n3,hello\n")
 try:
-    r = libscanio.validate(BLANK_P, {"note": {"type": "integer"}})
+    r = libscanio.validate_report(BLANK_P, {"note": {"type": "integer"}})
     check("validate: blank cells are not type errors", r.errors_total, 1)
     check("validate: ...only the real value is", r.errors[0].value, "hello")
-    r = libscanio.validate(BLANK_P, {"note": {"required": True}})
+    r = libscanio.validate_report(BLANK_P, {"note": {"required": True}})
     check("validate: required treats a whitespace-only cell as blank", r.errors_total, 2)
 finally:
     os.unlink(BLANK_P)
@@ -699,6 +699,41 @@ with tempfile.TemporaryDirectory() as tmp_import:
         source.write_bytes(data)
         check_raises('native import malformed input', lambda: libscanio.validate_to_files(str(source), {}, str(good), str(bad)))
         check('native import removes partial outputs', (good.exists(),bad.exists()), (False,False))
+
+
+# Uploaded-byte validation: no output files and only failures cross the ABI.
+rules = {"a": {"type": "integer", "required": True}}
+for fmt, valid, invalid in [
+    ("csv", b"a,b\n1,ok\n2,yes\n", b"a,b\n1,ok\nbad,no\nwrong,yes\n"),
+    ("ndjson", b'{"a":1,"b":"ok"}\n', b'{"a":1,"b":"ok"}\n{"a":"bad","b":"no"}\n{"a":"wrong","b":"yes"}\n'),
+    ("json", b'[{"a":1,"b":"ok"}]', b'[{"a":1,"b":"ok"},{"a":"bad","b":"no"},{"a":"wrong","b":"yes"}]'),
+]:
+    check(f'{fmt} fast valid bool', libscanio.validate(valid, rules, format=fmt) is True, True)
+    check(f'{fmt} fast invalid bool', libscanio.validate(invalid, rules, format=fmt) is False, True)
+    check(f'{fmt} full valid empty', libscanio.validate(valid, rules, mode='full', format=fmt), [])
+    failed = libscanio.validate(invalid, rules, mode='full', format=fmt)
+    check(f'{fmt} full every failure', [r['values'] for r in failed], [['bad','no'],['wrong','yes']])
+    check(f'{fmt} error has no row number', 'row' in failed[0]['errors'][0], False)
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / ('input.' + fmt)
+        p.write_bytes(invalid)
+        check(f'{fmt} path parity', libscanio.validate(p, rules, mode='full'), failed)
+
+check('default input format CSV', libscanio.validate(b'a\n1\n', rules), True)
+check('header only valid', libscanio.validate(b'a\n', rules), True)
+check('full has no failure cap', len(libscanio.validate(b'a\n' + b'bad\n' * 250, rules, mode='full')), 250)
+check('fast stops before malformed tail', libscanio.validate(b'a\nbad\n"unterminated', rules), False)
+check_raises('full sees malformed tail', lambda: libscanio.validate(b'a\nbad\n"unterminated', rules, mode='full'))
+check_raises('fast sees malformed first record', lambda: libscanio.validate(b'a\n"unterminated', rules))
+check_raises('empty bytes raise', lambda: libscanio.validate(b'', {}))
+check_raises('unknown schema column', lambda: libscanio.validate(b'a\n1\n', {'missing': {}}))
+check_raises('bad mode', lambda: libscanio.validate(b'a\n', {}, mode='slow'), ValueError)
+check_raises('bad format', lambda: libscanio.validate(b'a\n', {}, format='xml'), ValueError)
+check_raises('bad UTF8 even without rules', lambda: libscanio.validate(b'a\n\xff\n', {}))
+check('NUL and unicode preserved', libscanio.validate('a\n"é\x00"\n'.encode(), rules, mode='full')[0]['values'], ['é\x00'])
+check('ragged fields retained', libscanio.validate(b'a\n1,extra\n', {}, mode='full')[0]['values'], ['1','extra'])
+check('duplicate headers retained', libscanio.validate(b'a,a\nbad,2\n', rules, mode='full')[0]['values'], ['bad','2'])
+check('large record crosses buffers', libscanio.validate(b'a\n' + b'x' * 200000 + b'\n', rules, mode='full')[0]['values'], ['x' * 200000])
 
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

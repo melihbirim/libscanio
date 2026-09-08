@@ -27,7 +27,7 @@ SCHEMA = {"score": {"type": "float", "min": 30}}
 
 def main() -> int:
     # ── 1. The summary: one pass, bounded memory, no rows returned ──
-    report = libscanio.validate(PATH, SCHEMA)
+    report = libscanio.validate_report(PATH, SCHEMA)
     print(f"{report.rows_valid} of {report.rows_total} rows loadable")
     for e in report.errors:
         print(f"  row {e.row}  {e.column_name}={e.value!r}  {e.rule}")

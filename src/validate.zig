@@ -311,6 +311,45 @@ pub const Validator = struct {
         return .{ .allocator = allocator, .query = query, .schema = schema, .owned_schema = schema };
     }
 
+    pub fn fromBytesJson(allocator: Allocator, bytes: []const u8, format: @import("query.zig").Format, schema_json: []const u8) !Validator {
+        var query = try Query.fromBytes(allocator, bytes, format);
+        errdefer query.deinit();
+        const schema = try allocator.create(Schema);
+        errdefer allocator.destroy(schema);
+        schema.* = try parseSchema(allocator, query.header(), schema_json);
+        return .{ .allocator = allocator, .query = query, .schema = schema, .owned_schema = schema };
+    }
+
+    /// Only failed records are serialized. Fast mode returns immediately
+    /// after the first invalid record, without constructing output rows.
+    pub fn writeOutcome(self: *Validator, w: *std.io.Writer, full: bool) !void {
+        for (self.header()) |field| if (!std.unicode.utf8ValidateSlice(field)) return error.InvalidUtf8;
+        if (full) try w.writeByte('[');
+        var first = true;
+        while (try self.nextWithSink(if (full) std.math.maxInt(usize) else 0, null)) |item| {
+            for (item.row.fields) |field| if (!std.unicode.utf8ValidateSlice(field)) return error.InvalidUtf8;
+            if (!full) {
+                if (self.rows_invalid > 0) return w.writeAll("false");
+                continue;
+            }
+            if (item.isValid()) continue;
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.writeAll("{\"values\":[");
+            for (item.row.fields, 0..) |field, i| {
+                if (i != 0) try w.writeByte(',');
+                try std.json.Stringify.value(field, .{}, w);
+            }
+            try w.writeAll("],\"errors\":[");
+            for (item.errors, 0..) |err, i| {
+                if (i != 0) try w.writeByte(',');
+                try std.json.Stringify.value(.{ .column = err.column, .column_name = err.column_name, .rule = @tagName(err.kind), .value = err.value }, .{}, w);
+            }
+            try w.writeAll("]}");
+        }
+        try w.writeAll(if (full) "]" else "true");
+    }
+
     /// A report owns the entire pass; mixing it with streaming is refused.
     pub fn report(self: *Validator, options: ReportOptions) !Report {
         if (self.row_number != 0) return error.ValidatorAlreadyStarted;
@@ -1167,4 +1206,24 @@ test "single-open validator owns schema through allocation failures" {
     try testing.expectError(error.ValidatorAlreadyStarted, validator.report(.{}));
     const second = (try validator.next()).?;
     try testing.expectEqualStrings("2", second.row.get(0).?);
+}
+
+fn outcomeAllocationCase(allocator: Allocator, bytes: []const u8, format: @import("query.zig").Format) !void {
+    var v = Validator.fromBytesJson(allocator, bytes, format, "{\"a\":{\"type\":\"integer\"}}") catch |err| {
+        if (err == error.BadSchema or err == error.InvalidJson) return error.OutOfMemory;
+        return err;
+    };
+    defer v.deinit();
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    v.writeOutcome(&aw.writer, true) catch |err| {
+        if (err == error.WriteFailed or err == error.InvalidJson) return error.OutOfMemory;
+        return err;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "bad") != null);
+}
+
+test "byte validation releases allocations at every failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, outcomeAllocationCase, .{ "a\n1\nbad\n", @import("query.zig").Format.csv });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, outcomeAllocationCase, .{ "{\"a\":1}\n{\"a\":\"bad\"}\n", @import("query.zig").Format.ndjson });
 }

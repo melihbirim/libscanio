@@ -169,7 +169,7 @@ def validate(path: str, schema: dict, max_errors: int = 100) -> dict:
     capped, so a wholly-broken file still yields an accurate summary
     (and a bounded response) rather than one error per row.
     """
-    return libscanio.validate(path, schema, max_errors=max_errors).as_dict()
+    return libscanio.validate_report(path, schema, max_errors=max_errors).as_dict()
 
 
 if __name__ == "__main__":

@@ -104,7 +104,9 @@ pub const NdjsonScanner = struct {
     limits: InputLimits = InputLimits.unlimited,
     limit_failure: ?InputLimitError = null,
     allocator: Allocator,
-    file: std.fs.File,
+    file: ?std.fs.File,
+    input_bytes: []const u8 = &.{},
+    input_pos: usize = 0,
     mode: Mode,
     buf: []u8,
     buf_len: usize,
@@ -191,6 +193,17 @@ pub const NdjsonScanner = struct {
         const size = (try file.stat()).size;
         if (size == 0) return NdjsonError.EmptyFile;
 
+        return initSource(allocator, file, &.{}, options);
+    }
+
+    /// Borrows bytes until deinit; never writes to the caller's buffer.
+    pub fn fromBytes(allocator: Allocator, bytes: []const u8, options: ScannerOptions) !NdjsonScanner {
+        if (options.chunk_size == 0) return error.InvalidChunkSize;
+        if (bytes.len == 0) return NdjsonError.EmptyFile;
+        return initSource(allocator, null, bytes, options);
+    }
+
+    fn initSource(allocator: Allocator, file: ?std.fs.File, bytes: []const u8, options: ScannerOptions) !NdjsonScanner {
         const buf = try allocator.alloc(u8, options.chunk_size);
         errdefer allocator.free(buf);
 
@@ -198,6 +211,7 @@ pub const NdjsonScanner = struct {
             .limits = options.limits,
             .allocator = allocator,
             .file = file,
+            .input_bytes = bytes,
             .mode = .line_delimited,
             .buf = buf,
             .buf_len = 0,
@@ -272,7 +286,7 @@ pub const NdjsonScanner = struct {
         if (self.field_buf.len > 0) self.allocator.free(self.field_buf);
         self.line_scratch.deinit(self.allocator);
         self.allocator.free(self.buf);
-        self.file.close();
+        if (self.file) |file| file.close();
     }
 
     pub fn columnIndex(self: NdjsonScanner, name: []const u8) ?usize {
@@ -433,7 +447,12 @@ pub const NdjsonScanner = struct {
     }
 
     fn fillBuffer(self: *NdjsonScanner) !void {
-        const n = try self.file.read(self.buf);
+        const n = if (self.file) |file| try file.read(self.buf) else blk: {
+            const len = @min(self.buf.len, self.input_bytes.len - self.input_pos);
+            @memcpy(self.buf[0..len], self.input_bytes[self.input_pos..][0..len]);
+            self.input_pos += len;
+            break :blk len;
+        };
         self.buf_len = n;
         self.buf_pos = 0;
         if (n == 0) self.eof = true;

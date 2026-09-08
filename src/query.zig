@@ -208,6 +208,18 @@ pub const Query = struct {
         };
     }
 
+    pub fn fromBytes(allocator: Allocator, bytes: []const u8, format: Format) !Query {
+        return .{
+            .source = switch (format) {
+                .csv => .{ .csv = try Scanner.fromBytes(allocator, bytes, .{}) },
+                .ndjson => .{ .ndjson = try NdjsonScanner.fromBytes(allocator, bytes, .{}) },
+            },
+            .columns = null,
+            .where = &.{},
+            .limit = null,
+        };
+    }
+
     pub fn deinit(self: *Query) void {
         if (self.proj_buf.len > 0) self.source.allocator().free(@constCast(self.proj_buf));
         self.source.deinit();

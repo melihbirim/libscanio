@@ -258,6 +258,15 @@ const char *scanio_build_mode(void);
  * you need to keep it. */
 const char *scanio_last_error(void);
 
+/* Validate path (format=0) or borrowed bytes (1=CSV, 2=JSON).
+ * full=0: JSON boolean, stops at first invalid record.
+ * full=1: JSON array of all failed records with values/errors, no cap.
+ * NULL indicates an input/schema/parser/allocation error (last_error).
+ * Input is borrowed only for the call. Free result with scanio_outcome_free. */
+const char *scanio_validate_outcome(const unsigned char *input, size_t input_len,
+    const char *schema_json, int format, int full);
+void scanio_outcome_free(const char *result);
+
 #ifdef __cplusplus
 }
 #endif

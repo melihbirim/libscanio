@@ -31,7 +31,7 @@ import datetime
 
 from ._loader import CImportStats, CAgg, COptions, CPredicate, load
 
-__all__ = ["validate_to_files", "scan_batches", "validate_batches", "scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
+__all__ = ["validate_to_files", "scan_batches", "validate_batches", "scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_report", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
@@ -1003,7 +1003,52 @@ def _validation_errors(raw: list) -> list[ValidationError]:
     ]
 
 
-def validate(path: str, schema: dict, max_errors: int = 100) -> ValidationReport:
+def validate(source, schema: dict, *, mode="fast", format=None):
+    """Validate a file path or uploaded bytes entirely in Zig.
+
+    Default ``fast`` returns bool, stopping at the first invalid record.
+    ``full`` returns all failed records as {values: [...], errors: [...]}.
+    Values are positional to preserve duplicate headers and ragged rows;
+    errors contain column, column_name, rule and value (no row numbers).
+    Full mode uses memory proportional to rejected data, with no error cap.
+
+    Bytes default to CSV; specify format="ndjson" or "json" for JSON input.
+    Paths infer format from their extension. File-like streams are not accepted.
+    Invalid input/schema or parser failures raise ScanError. Fast mode does
+    not examine the remainder after a validation failure.
+    The previous summary API is available as validate_report().
+    """
+    import json
+    import os
+
+    if mode not in ("fast", "full"):
+        raise ValueError("mode must be 'fast' or 'full'")
+    if isinstance(source, bytes):
+        formats = {None: 1, "csv": 1, "ndjson": 2, "json": 2}
+        if format not in formats:
+            raise ValueError("format must be csv, ndjson or json")
+        data, source_format = source, formats[format]
+    else:
+        if format is not None:
+            raise ValueError("format is only supported for bytes input")
+        data = os.fsencode(os.fspath(source))
+        if b"\x00" in data:
+            raise ValueError("path contains NUL")
+        source_format = 0
+    lib = load()
+    native = getattr(lib, "scanio_validate_outcome", None)
+    if native is None:
+        raise ScanError("Rebuild libscanio: zig build c-lib -Doptimize=ReleaseFast")
+    result = native(data, len(data), json.dumps(schema).encode(), source_format, mode == "full")
+    if not result:
+        _raise_last_error(lib, "validate failed")
+    try:
+        return json.loads(ctypes.string_at(result))
+    finally:
+        lib.scanio_outcome_free(result)
+
+
+def validate_report(path: str, schema: dict, max_errors: int = 100) -> ValidationReport:
     """Check every row against `schema` in one streaming pass, and
     report what failed.
 
@@ -1011,7 +1056,7 @@ def validate(path: str, schema: dict, max_errors: int = 100) -> ValidationReport
     `scan(where=...)` answers: not "which rows do I want" but "which rows
     can I not take, and why".
 
-        report = libscanio.validate("orders.csv", {
+        report = libscanio.validate_report("orders.csv", {
             "id":     {"type": "integer", "required": True},
             "amount": {"type": "float", "min": 0},
             "status": {"one_of": ["new", "paid", "shipped"]},
@@ -1066,7 +1111,7 @@ def validate_iter(
     """Stream every row with its failures attached, as
     `(row, errors)` — `errors` is empty for a row that passed.
 
-    This is the shape an actual import wants, and the reason `validate()`
+    This is the shape an actual import wants, and the reason this iterator
     does not return two lists: the good rows go to the target table and
     the bad ones to a rejects file in the SAME pass, so neither side is
     ever materialized and memory stays flat no matter how big the file

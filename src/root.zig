@@ -169,7 +169,9 @@ pub const Scanner = struct {
     /// A limit failure is terminal: retrying cannot skip the rejected row.
     limit_failure: ?InputLimitError = null,
     allocator: Allocator,
-    file: std.fs.File,
+    file: ?std.fs.File,
+    input_bytes: []const u8 = &.{},
+    input_pos: usize = 0,
     buf: []u8,
     buf_len: usize,
     buf_pos: usize,
@@ -206,6 +208,17 @@ pub const Scanner = struct {
         const size = (try file.stat()).size;
         if (size == 0) return ScanError.EmptyFile;
 
+        return initSource(allocator, file, &.{}, options);
+    }
+
+    /// Borrows bytes until deinit; never writes to the caller's buffer.
+    pub fn fromBytes(allocator: Allocator, bytes: []const u8, options: ScannerOptions) !Scanner {
+        if (options.chunk_size == 0) return error.InvalidChunkSize;
+        if (bytes.len == 0) return ScanError.EmptyFile;
+        return initSource(allocator, null, bytes, options);
+    }
+
+    fn initSource(allocator: Allocator, file: ?std.fs.File, bytes: []const u8, options: ScannerOptions) !Scanner {
         const buf = try allocator.alloc(u8, options.chunk_size);
         errdefer allocator.free(buf);
 
@@ -213,6 +226,7 @@ pub const Scanner = struct {
             .limits = options.limits,
             .allocator = allocator,
             .file = file,
+            .input_bytes = bytes,
             .buf = buf,
             .buf_len = 0,
             .buf_pos = 0,
@@ -249,7 +263,7 @@ pub const Scanner = struct {
         if (self.field_buf.len > 0) self.allocator.free(self.field_buf);
         self.line_scratch.deinit(self.allocator);
         self.allocator.free(self.buf);
-        self.file.close();
+        if (self.file) |file| file.close();
     }
 
     pub fn columnIndex(self: Scanner, name: []const u8) ?usize {
@@ -316,7 +330,12 @@ pub const Scanner = struct {
     }
 
     fn fillBuffer(self: *Scanner) !void {
-        const n = try self.file.read(self.buf);
+        const n = if (self.file) |file| try file.read(self.buf) else blk: {
+            const len = @min(self.buf.len, self.input_bytes.len - self.input_pos);
+            @memcpy(self.buf[0..len], self.input_bytes[self.input_pos..][0..len]);
+            self.input_pos += len;
+            break :blk len;
+        };
         self.buf_len = n;
         self.buf_pos = 0;
         if (n == 0) self.eof = true;

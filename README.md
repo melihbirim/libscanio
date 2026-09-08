@@ -155,6 +155,27 @@ side straight to Arrow or a bulk loader without it ever entering Python.
 
 ## Validating an import
 
+`validate()` defaults to fail fast and returns a boolean. Pass uploaded bytes
+without writing a temporary file, or supply a file path:
+
+```python
+ok = libscanio.validate(uploaded_bytes, schema)  # CSV by default
+failed = libscanio.validate(uploaded_bytes, schema, mode="full")
+# [{"values": ["42", "bad"], "errors": [{"column": 1,
+#   "column_name": "amount", "rule": "bad_type", "value": "bad"}]}]
+```
+
+Full mode returns every failed record and every error, without row numbers.
+Valid rows never become Python objects. Its memory use grows with rejected
+data. Bytes accept `format="csv"`, `"ndjson"`, or `"json"`; paths infer format
+from their extension. File-like objects/chunk streams are not yet accepted.
+Input bytes stay owned by Python and are read through a bounded native buffer.
+Fast mode stops after the first invalid record and does not inspect the rest;
+parser/schema/I/O errors encountered before stopping raise `ScanError`.
+
+**API change:** the previous report-returning Python `validate()` is now
+`validate_report()`. Existing Node, CLI and C report APIs are unchanged.
+
 CSV files usually arrive to be *loaded*, not queried, and the question a
 loader asks is the opposite of the one a `where` clause answers: not
 "which rows do I want" but "which rows can I not take, and why". That
@@ -170,7 +191,7 @@ schema = {
     "status": {"one_of": ["new", "paid", "shipped"]},
 }
 
-report = libscanio.validate("orders.csv", schema)
+report = libscanio.validate_report("orders.csv", schema)
 print(f"{report.rows_valid:,} of {report.rows_total:,} rows loadable")
 for e in report.errors:
     print(f"  row {e.row}, {e.column_name}: {e.rule} ({e.value!r})")
@@ -270,7 +291,7 @@ four columns (same machine and method as
 | | median | throughput | peak RSS |
 |---|---|---|---|
 | `scanio --validate` (report) | 0.49s | 257 MB/s | **10.1MB** |
-| `libscanio.validate()` (Python) | 0.48s | 263 MB/s | 10.9MB |
+| `libscanio.validate_report()` (Python) | 0.48s | 263 MB/s | 10.9MB |
 | `libscanio.validate()` (Node) | 0.50s | 253 MB/s | 46.1MB (V8 floor) |
 | hand-written Python `csv` loop, same four rules | 4.37s | 29 MB/s | 10.1MB |
 

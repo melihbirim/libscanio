@@ -1803,3 +1803,55 @@ pub export fn scanio_validate_to_files(path: ?[*:0]const u8, schema_json: ?[*:0]
     };
     return 0;
 }
+
+/// Path when format=0; borrowed bytes when format=1 (CSV) or 2 (JSON).
+/// The returned JSON belongs to the caller until scanio_outcome_free.
+export fn scanio_validate_outcome(input: ?[*]const u8, input_len: usize, schema_json: ?[*:0]const u8, format: c_int, full: c_int) ?[*:0]const u8 {
+    clearError();
+    const data = input orelse {
+        setError("input is null", .{});
+        return null;
+    };
+    const schema = schema_json orelse {
+        setError("schema is null", .{});
+        return null;
+    };
+    if (format < 0 or format > 2 or (full != 0 and full != 1)) {
+        setError("invalid validation options", .{});
+        return null;
+    }
+    var validator = (if (format == 0)
+        scan.Validator.openJson(c_allocator, data[0..input_len], std.mem.span(schema))
+    else
+        scan.Validator.fromBytesJson(c_allocator, data[0..input_len], if (format == 1) .csv else .ndjson, std.mem.span(schema))) catch |e| {
+        setError("validate failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    defer validator.deinit();
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    validator.writeOutcome(&aw.writer, full == 1) catch |e| {
+        setError("validate failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    const result = c_allocator.dupeZ(u8, aw.written()) catch {
+        setError("out of memory", .{});
+        return null;
+    };
+    return result.ptr;
+}
+
+export fn scanio_outcome_free(result: ?[*:0]const u8) void {
+    if (result) |ptr| c_allocator.free(std.mem.span(ptr));
+}
+
+test "validation outcome ABI options and ownership" {
+    try std.testing.expect(scanio_validate_outcome(null, 0, "{}", 1, 0) == null);
+    try std.testing.expect(scanio_validate_outcome("a\n", 2, null, 1, 0) == null);
+    try std.testing.expect(scanio_validate_outcome("a\n", 2, "{}", 3, 0) == null);
+    try std.testing.expect(scanio_validate_outcome("a\n", 2, "{}", 1, 2) == null);
+    const result = scanio_validate_outcome("a\n1\n", 4, "{}", 1, 0) orelse return error.UnexpectedNull;
+    defer scanio_outcome_free(result);
+    try std.testing.expectEqualStrings("true", std.mem.span(result));
+    scanio_outcome_free(null);
+}

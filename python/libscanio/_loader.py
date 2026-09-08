@@ -211,6 +211,13 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_collect_columnar_close.argtypes = [ctypes.c_void_p]
     lib.scanio_collect_columnar_close.restype = None
 
+    outcome = getattr(lib, "scanio_validate_outcome", None)
+    if outcome is not None:
+        outcome.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        outcome.restype = ctypes.c_void_p
+        lib.scanio_outcome_free.argtypes = [ctypes.c_void_p]
+        lib.scanio_outcome_free.restype = None
+
     lib.scanio_validate.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
     lib.scanio_validate.restype = ctypes.c_void_p
 
