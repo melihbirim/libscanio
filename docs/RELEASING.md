@@ -36,7 +36,7 @@ After merging this workflow and switching to a clean, up-to-date `main`:
 ```sh
 ./release.sh 0.1.1 --dry-run  # preview only
 ./release.sh 0.1.1            # release an explicit version
-./release.sh next             # bump minor: 0.1.0 -> 0.2.0
+./release.sh next             # bump patch: 0.1.0 -> 0.1.1
 ```
 
 Requires Git, GitHub CLI authenticated with `gh auth login`, and Python 3.11+.
