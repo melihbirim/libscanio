@@ -129,8 +129,17 @@ fn getBoolArg(env: napi.napi_env, info: napi.napi_callback_info, index: usize, d
     return v;
 }
 
+/// Every worker takes its result struct as the last argument, and every
+/// one of those has an `err` field — so a failure to even spawn the
+/// thread is reported the same way as a failure inside it. Returning
+/// silently left the caller with an empty JSON string and no error,
+/// which reached JavaScript as `SyntaxError: Unexpected end of JSON
+/// input` instead of the real cause.
 fn runOnWorkerStack(comptime WorkFn: anytype, args: anytype) void {
-    const t = std.Thread.spawn(.{ .stack_size = worker_stack_size }, WorkFn, args) catch return;
+    const t = std.Thread.spawn(.{ .stack_size = worker_stack_size }, WorkFn, args) catch |e| {
+        args[args.len - 1].err = e;
+        return;
+    };
     t.join();
 }
 
@@ -152,13 +161,25 @@ fn schemaWork(path: [:0]const u8, out: *SchemaResult) void {
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeByte('[') catch return;
+    w.writeByte('[') catch |e| {
+        out.err = e;
+        return;
+    };
     for (header, 0..) |name, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         jsonEscapedString(w, name);
     }
-    w.writeByte(']') catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.writeByte(']') catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiSchema(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -176,7 +197,7 @@ fn napiSchema(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) na
 
 const CountResult = struct { count: i64 = 0, err: ?anyerror = null };
 
-fn countWork(path: [:0]const u8, where: ?[:0]const u8, out: *CountResult) void {
+fn countWork(path: [:0]const u8, where: ?[:0]const u8, negate: bool, out: *CountResult) void {
     var predicates: []Predicate = &.{};
     var header: [][]const u8 = &.{};
     defer if (header.len > 0) freeHeader(c_allocator, header);
@@ -195,6 +216,7 @@ fn countWork(path: [:0]const u8, where: ?[:0]const u8, out: *CountResult) void {
 
     var q = Query.open(c_allocator, path, .{
         .where = predicates,
+        .negate = negate,
         // count() never returns field data — always safe to bound to
         // just the WHERE predicates' columns. Real, measured win: ~7x
         // faster on this fixture's WHERE-filtered count (330ms -> ~45ms)
@@ -217,8 +239,10 @@ fn napiCount(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) nap
     const where = getOptionalStringArg(env, info, 1, c_allocator) catch null;
     defer if (where) |w| c_allocator.free(w);
 
+    const negate = getBoolArg(env, info, 2, false);
+
     var result = CountResult{};
-    runOnWorkerStack(countWork, .{ path, where, &result });
+    runOnWorkerStack(countWork, .{ path, where, negate, &result });
     if (result.err) |e| return failErr(env, e);
     return napiInt64(env, result.count);
 }
@@ -266,12 +290,51 @@ fn aggregateWork(path: [:0]const u8, column_name: [:0]const u8, where: ?[:0]cons
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.print("{{\"count\":{d},\"sum\":{d},", .{ agg.count, agg.sum }) catch return;
-    if (agg.min) |m| w.print("\"min\":{d},", .{m}) catch return else w.writeAll("\"min\":null,") catch return;
-    if (agg.max) |m| w.print("\"max\":{d},", .{m}) catch return else w.writeAll("\"max\":null,") catch return;
-    if (agg.avg()) |a| w.print("\"avg\":{d},", .{a}) catch return else w.writeAll("\"avg\":null,") catch return;
-    w.print("\"has_values\":{s}}}", .{if (agg.count > 0) "true" else "false"}) catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.print("{{\"count\":{d},\"sum\":{d},", .{ agg.count, agg.sum }) catch |e| {
+        out.err = e;
+        return;
+    };
+    if (agg.min) |m| {
+        w.print("\"min\":{d},", .{m}) catch |e| {
+            out.err = e;
+            return;
+        };
+    } else {
+        w.writeAll("\"min\":null,") catch |e| {
+            out.err = e;
+            return;
+        };
+    }
+    if (agg.max) |m| {
+        w.print("\"max\":{d},", .{m}) catch |e| {
+            out.err = e;
+            return;
+        };
+    } else {
+        w.writeAll("\"max\":null,") catch |e| {
+            out.err = e;
+            return;
+        };
+    }
+    if (agg.avg()) |a| {
+        w.print("\"avg\":{d},", .{a}) catch |e| {
+            out.err = e;
+            return;
+        };
+    } else {
+        w.writeAll("\"avg\":null,") catch |e| {
+            out.err = e;
+            return;
+        };
+    }
+    w.print("\"has_values\":{s}}}", .{if (agg.count > 0) "true" else "false"}) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiAggregate(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -310,7 +373,7 @@ fn writeRowsJson(w: *std.io.Writer, header: []const []const u8, columns: ?[]cons
     try w.writeAll("]}");
 }
 
-fn scanArrayWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, out: *RowsResult) void {
+fn scanArrayWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, negate: bool, out: *RowsResult) void {
     const header = probeHeader(c_allocator, path) catch |e| {
         out.err = e;
         return;
@@ -334,6 +397,7 @@ fn scanArrayWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]co
 
     var q = Query.open(c_allocator, path, .{
         .where = predicates,
+        .negate = negate,
         .columns = columns,
         .limit = if (limit < 0) null else @intCast(limit),
     }) catch |e| {
@@ -345,31 +409,64 @@ fn scanArrayWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]co
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeAll("{\"names\":[") catch return;
+    w.writeAll("{\"names\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     const proj = columns orelse blk: {
-        const idx = c_allocator.alloc(usize, header.len) catch return;
+        const idx = c_allocator.alloc(usize, header.len) catch |e| {
+            out.err = e;
+            return;
+        };
         for (idx, 0..) |*v, i| v.* = i;
         break :blk idx;
     };
     defer if (columns == null) c_allocator.free(proj);
     for (proj, 0..) |ci, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         jsonEscapedString(w, header[ci]);
     }
-    w.writeAll("],\"rows\":[") catch return;
+    w.writeAll("],\"rows\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     var first = true;
-    while (q.next() catch return) |row| {
-        if (!first) w.writeByte(',') catch return;
+    while (q.next() catch |e| {
+        out.err = e;
+        return;
+    }) |row| {
+        if (!first) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         first = false;
-        w.writeByte('[') catch return;
+        w.writeByte('[') catch |e| {
+            out.err = e;
+            return;
+        };
         for (row.fields, 0..) |f, i| {
-            if (i > 0) w.writeByte(',') catch return;
+            if (i > 0) w.writeByte(',') catch |e| {
+                out.err = e;
+                return;
+            };
             jsonEscapedString(w, f);
         }
-        w.writeByte(']') catch return;
+        w.writeByte(']') catch |e| {
+            out.err = e;
+            return;
+        };
     }
-    w.writeAll("]}") catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.writeAll("]}") catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiScanArray(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -380,9 +477,10 @@ fn napiScanArray(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c)
     const columns_json = getOptionalStringArg(env, info, 2, c_allocator) catch null;
     defer if (columns_json) |c| c_allocator.free(c);
     const limit = getIntArg(env, info, 3, i64, -1);
+    const negate = getBoolArg(env, info, 4, false);
 
     var result = RowsResult{};
-    runOnWorkerStack(scanArrayWork, .{ path, where, columns_json, limit, &result });
+    runOnWorkerStack(scanArrayWork, .{ path, where, columns_json, limit, negate, &result });
     if (result.err) |e| return failErr(env, e);
     defer c_allocator.free(result.json);
     return napiString(env, result.json);
@@ -425,29 +523,65 @@ fn topkWork(path: [:0]const u8, column_name: [:0]const u8, k: usize, where: ?[:0
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeAll("{\"names\":[") catch return;
+    w.writeAll("{\"names\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     for (header, 0..) |name, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         jsonEscapedString(w, name);
     }
-    w.writeAll("],\"rows\":[") catch return;
+    w.writeAll("],\"rows\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     const items = tk.getSorted();
     for (items, 0..) |entry, i| {
-        if (i > 0) w.writeByte(',') catch return;
-        w.writeByte('[') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
+        w.writeByte('[') catch |e| {
+            out.err = e;
+            return;
+        };
         for (entry.row.fields, 0..) |f, j| {
-            if (j > 0) w.writeByte(',') catch return;
+            if (j > 0) w.writeByte(',') catch |e| {
+                out.err = e;
+                return;
+            };
             jsonEscapedString(w, f);
         }
-        w.writeByte(']') catch return;
+        w.writeByte(']') catch |e| {
+            out.err = e;
+            return;
+        };
     }
-    w.writeAll("],\"keys\":[") catch return;
+    w.writeAll("],\"keys\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     for (items, 0..) |entry, i| {
-        if (i > 0) w.writeByte(',') catch return;
-        w.print("{d}", .{entry.key}) catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
+        w.print("{d}", .{entry.key}) catch |e| {
+            out.err = e;
+            return;
+        };
     }
-    w.writeAll("]}") catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.writeAll("]}") catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiTopk(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -455,7 +589,14 @@ fn napiTopk(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi
     defer c_allocator.free(path);
     const column = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "topkJson(path, column, k): column required");
     defer c_allocator.free(column);
-    const k: usize = @intCast(getIntArg(env, info, 2, i64, 10));
+    // Sign-checked before the cast, the same way `limit` is everywhere
+    // else in this file: @intCast of a negative i64 straight from JS is a
+    // panic in a safety-checked build and a wrapped, enormous usize in
+    // ReleaseFast — `topkJson(path, col, -1)` reached scan.topK() as a
+    // ~2^64 k and took the whole Node process down either way.
+    const k_arg = getIntArg(env, info, 2, i64, 10);
+    if (k_arg < 0) return napiFail(env, "topkJson(path, column, k): k must not be negative");
+    const k: usize = @intCast(k_arg);
     const where = getOptionalStringArg(env, info, 3, c_allocator) catch null;
     defer if (where) |w| c_allocator.free(w);
     const descending = getBoolArg(env, info, 4, true);
@@ -504,23 +645,50 @@ fn orderByWork(path: [:0]const u8, column_name: [:0]const u8, where: ?[:0]const 
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeAll("{\"names\":[") catch return;
+    w.writeAll("{\"names\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     for (header, 0..) |name, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
         jsonEscapedString(w, name);
     }
-    w.writeAll("],\"rows\":[") catch return;
+    w.writeAll("],\"rows\":[") catch |e| {
+        out.err = e;
+        return;
+    };
     for (ordered.rows, 0..) |row, i| {
-        if (i > 0) w.writeByte(',') catch return;
-        w.writeByte('[') catch return;
+        if (i > 0) w.writeByte(',') catch |e| {
+            out.err = e;
+            return;
+        };
+        w.writeByte('[') catch |e| {
+            out.err = e;
+            return;
+        };
         for (row.fields, 0..) |f, j| {
-            if (j > 0) w.writeByte(',') catch return;
+            if (j > 0) w.writeByte(',') catch |e| {
+                out.err = e;
+                return;
+            };
             jsonEscapedString(w, f);
         }
-        w.writeByte(']') catch return;
+        w.writeByte(']') catch |e| {
+            out.err = e;
+            return;
+        };
     }
-    w.writeAll("]}") catch return;
-    out.json = aw.toOwnedSlice() catch return;
+    w.writeAll("]}") catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 fn napiOrderBy(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
@@ -562,47 +730,127 @@ const ScanHandle = struct {
     // after open() returns the way the single-shot functions above do.
     predicates: []Predicate,
     columns: ?[]usize,
+    /// Set for the duration of a nextRowJson() call. Both flags are
+    /// guarded by handle_registry_mutex, never touched outside it.
+    in_use: bool = false,
+    /// closeScan() came in while in_use — the in-flight nextRowJson()
+    /// destroys the handle on its way out instead.
+    close_requested: bool = false,
+
+    /// Frees everything this handle owns, including itself. Never call
+    /// it on a handle still reachable through the registry.
+    fn destroy(self: *ScanHandle) void {
+        self.query.deinit();
+        freeHeader(c_allocator, self.header);
+        if (self.predicates.len > 0) freePredicates(c_allocator, self.predicates);
+        if (self.columns) |c| c_allocator.free(c);
+        c_allocator.destroy(self);
+    }
 };
 
-/// Registry of open scan handles, keyed by a small monotonic ID — NOT
-/// the raw pointer address. A raw pointer exposed to JS as a plain
-/// number is an arbitrary-memory-dereference risk the moment a caller
-/// passes a stale, garbage, or off-by-one handle value: nextRowJson()/
-/// closeScan() would `@ptrFromInt` it and read/write through it with
-/// zero validation. Looking the ID up here first means an invalid
-/// handle fails with a normal JS error instead of a native crash or
-/// memory corruption. Mutex guards it because N-API addons can be
-/// loaded into `worker_threads`, not just the main JS thread — this
-/// registry has no reason to assume single-threaded access even though
-/// today's callers happen to be single-threaded.
-var handle_registry: std.AutoHashMapUnmanaged(u64, *ScanHandle) = .{};
-var handle_registry_mutex: std.Thread.Mutex = .{};
-var next_handle_id: u64 = 1;
+/// Registry of open handles, keyed by a small monotonic ID — NOT the
+/// raw pointer address. A raw pointer exposed to JS as a plain number is
+/// an arbitrary-memory-dereference risk the moment a caller passes a
+/// stale, garbage, or off-by-one handle value: the next()/close() entry
+/// points would `@ptrFromInt` it and read/write through it with zero
+/// validation. Looking the ID up here first means an invalid handle
+/// fails with a normal JS error instead of a native crash or memory
+/// corruption. The mutex is there because N-API addons can be loaded
+/// into `worker_threads`, not just the main JS thread — this registry
+/// has no reason to assume single-threaded access even though today's
+/// callers happen to be single-threaded.
+///
+/// Generic over the handle type because there are now two of them
+/// (scanning and validating) with identical lifetime rules; `T` must
+/// carry `in_use`/`close_requested` flags and a `destroy(*T)` method
+/// that frees everything it owns, itself included.
+fn HandleRegistry(comptime T: type) type {
+    return struct {
+        var map: std.AutoHashMapUnmanaged(u64, *T) = .{};
+        var mutex: std.Thread.Mutex = .{};
+        var next_id: u64 = 1;
 
-fn registerHandle(handle: *ScanHandle) !u64 {
-    handle_registry_mutex.lock();
-    defer handle_registry_mutex.unlock();
-    const id = next_handle_id;
-    next_handle_id += 1;
-    try handle_registry.put(c_allocator, id, handle);
-    return id;
+        fn register(handle: *T) !u64 {
+            mutex.lock();
+            defer mutex.unlock();
+            const id = next_id;
+            next_id += 1;
+            try map.put(c_allocator, id, handle);
+            return id;
+        }
+
+        /// Looks a handle up and marks it busy, so a concurrent close()
+        /// cannot free it out from under the caller.
+        ///
+        /// The mutex used to guard the lookup ONLY, which left a real
+        /// use-after-free between the two calls that are supposed to be
+        /// safe under `worker_threads` (the whole reason this registry
+        /// exists): thread A gets the pointer from the map, thread B
+        /// closes the same handle and frees it, then thread A
+        /// dereferences freed memory. Returns null for an unknown,
+        /// already-closed, or already-busy handle — all three are caller
+        /// errors that must surface as a JS exception rather than as
+        /// memory corruption.
+        fn acquire(id: u64) ?*T {
+            mutex.lock();
+            defer mutex.unlock();
+            const handle = map.get(id) orelse return null;
+            if (handle.in_use) return null;
+            handle.in_use = true;
+            return handle;
+        }
+
+        /// Ends the borrow started by acquire(), destroying the handle
+        /// if a close() arrived in the meantime.
+        fn release(handle: *T) void {
+            mutex.lock();
+            handle.in_use = false;
+            const now_dead = handle.close_requested;
+            mutex.unlock();
+            if (now_dead) handle.destroy();
+        }
+
+        /// Removes a handle from the registry — the ID is invalid from
+        /// here on either way, which is what makes double-close a silent
+        /// no-op. Returns the handle to free, or null if an in-flight
+        /// next() still holds it (that call frees it when it releases)
+        /// or the ID was never valid.
+        fn unregister(id: u64) ?*T {
+            mutex.lock();
+            defer mutex.unlock();
+            const entry = map.fetchRemove(id) orelse return null;
+            if (entry.value.in_use) {
+                entry.value.close_requested = true;
+                return null;
+            }
+            return entry.value;
+        }
+    };
 }
 
-fn lookupHandle(id: u64) ?*ScanHandle {
-    handle_registry_mutex.lock();
-    defer handle_registry_mutex.unlock();
-    return handle_registry.get(id);
+const ScanRegistry = HandleRegistry(ScanHandle);
+
+fn registerHandle(handle: *ScanHandle) !u64 {
+    return ScanRegistry.register(handle);
+}
+
+fn destroyHandle(handle: *ScanHandle) void {
+    handle.destroy();
+}
+
+fn acquireHandle(id: u64) ?*ScanHandle {
+    return ScanRegistry.acquire(id);
+}
+
+fn releaseHandle(handle: *ScanHandle) void {
+    ScanRegistry.release(handle);
 }
 
 fn unregisterHandle(id: u64) ?*ScanHandle {
-    handle_registry_mutex.lock();
-    defer handle_registry_mutex.unlock();
-    const handle = handle_registry.get(id) orelse return null;
-    _ = handle_registry.remove(id);
-    return handle;
+    return ScanRegistry.unregister(id);
 }
 
-fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, out: *OpenScanResult) void {
+fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]const u8, limit: i64, negate: bool, out: *OpenScanResult) void {
     const header = probeHeader(c_allocator, path) catch |e| {
         out.err = e;
         return;
@@ -625,6 +873,7 @@ fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]con
 
     const q = Query.open(c_allocator, path, .{
         .where = predicates,
+        .negate = negate,
         .columns = columns,
         .limit = if (limit < 0) null else @intCast(limit),
     }) catch |e| {
@@ -638,6 +887,18 @@ fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]con
     // them for the scan's lifetime — NOT freed here, freed in
     // closeScanWork alongside the rest of the handle.
 
+    // Everything from here on has to undo `q` too, not just the header
+    // and predicates: every failure path below used to return with the
+    // Query — and the open file handle inside it — still live.
+    var q_mut = q;
+    var opened_ok = false;
+    defer if (!opened_ok) {
+        q_mut.deinit();
+        freeHeader(c_allocator, header);
+        if (predicates.len > 0) freePredicates(c_allocator, predicates);
+        if (columns) |c| c_allocator.free(c);
+    };
+
     const proj = columns orelse blk: {
         const idx = c_allocator.alloc(usize, header.len) catch {
             out.err = error.OutOfMemory;
@@ -646,33 +907,50 @@ fn openScanWork(path: [:0]const u8, where: ?[:0]const u8, columns_json: ?[:0]con
         for (idx, 0..) |*v, i| v.* = i;
         break :blk idx;
     };
+    defer if (columns == null) c_allocator.free(proj);
 
     var aw = std.io.Writer.Allocating.init(c_allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeByte('[') catch return;
+    w.writeByte('[') catch {
+        out.err = error.OutOfMemory;
+        return;
+    };
     for (proj, 0..) |ci, i| {
-        if (i > 0) w.writeByte(',') catch return;
+        if (i > 0) w.writeByte(',') catch {
+            out.err = error.OutOfMemory;
+            return;
+        };
         jsonEscapedString(w, header[ci]);
     }
-    w.writeByte(']') catch return;
-    if (columns == null) c_allocator.free(proj);
-    out.names_json = aw.toOwnedSlice() catch return;
+    w.writeByte(']') catch {
+        out.err = error.OutOfMemory;
+        return;
+    };
+    const names_json = aw.toOwnedSlice() catch {
+        out.err = error.OutOfMemory;
+        return;
+    };
+    errdefer c_allocator.free(names_json);
 
     const handle = c_allocator.create(ScanHandle) catch {
+        c_allocator.free(names_json);
         out.err = error.OutOfMemory;
         return;
     };
-    handle.* = .{ .query = q, .header = header, .predicates = predicates, .columns = columns };
+    handle.* = .{ .query = q_mut, .header = header, .predicates = predicates, .columns = columns };
     const id = registerHandle(handle) catch {
-        handle.query.deinit();
-        freeHeader(c_allocator, handle.header);
-        if (handle.predicates.len > 0) freePredicates(c_allocator, handle.predicates);
-        if (handle.columns) |c| c_allocator.free(c);
-        c_allocator.destroy(handle);
+        destroyHandle(handle);
+        c_allocator.free(names_json);
+        // The handle owns (and just freed) all of it — don't let the
+        // defer above free the same memory a second time.
+        opened_ok = true;
         out.err = error.OutOfMemory;
         return;
     };
+    // Ownership has moved into the registered handle; closeScan frees it.
+    opened_ok = true;
+    out.names_json = names_json;
     out.handle = @intCast(id);
 }
 
@@ -684,9 +962,10 @@ fn napiOpenScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) 
     const columns_json = getOptionalStringArg(env, info, 2, c_allocator) catch null;
     defer if (columns_json) |c| c_allocator.free(c);
     const limit = getIntArg(env, info, 3, i64, -1);
+    const negate = getBoolArg(env, info, 4, false);
 
     var result = OpenScanResult{};
-    runOnWorkerStack(openScanWork, .{ path, where, columns_json, limit, &result });
+    runOnWorkerStack(openScanWork, .{ path, where, columns_json, limit, negate, &result });
     if (result.err) |e| return failErr(env, e);
 
     var obj: napi.napi_value = undefined;
@@ -700,8 +979,9 @@ fn napiOpenScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) 
 fn napiNextRow(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
     const handle_id = getIntArg(env, info, 0, i64, 0);
     if (handle_id <= 0) return napiFail(env, "nextRowJson(handle): invalid handle");
-    const handle = lookupHandle(@intCast(handle_id)) orelse
-        return napiFail(env, "nextRowJson(handle): unknown or already-closed handle");
+    const handle = acquireHandle(@intCast(handle_id)) orelse
+        return napiFail(env, "nextRowJson(handle): unknown, already-closed, or concurrently-in-use handle");
+    defer releaseHandle(handle);
 
     const row = handle.query.next() catch |e| return failErr(env, e);
     const r = row orelse {
@@ -734,15 +1014,256 @@ fn napiCloseScan(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c)
     // nothing and returns early, same as the old raw-pointer version's
     // implicit behavior (a double-free there was instead a real bug).
     const handle = unregisterHandle(@intCast(handle_id)) orelse return undef;
-    handle.query.deinit();
-    freeHeader(c_allocator, handle.header);
-    if (handle.predicates.len > 0) freePredicates(c_allocator, handle.predicates);
-    if (handle.columns) |c| c_allocator.free(c);
-    c_allocator.destroy(handle);
+    destroyHandle(handle);
     return undef;
 }
 
+// ── validation ───────────────────────────────────────────────────────
+//
+// Rules are parsed and evaluated in Zig from a JSON schema, exactly as
+// the C ABI does it — so the Node client and the Python client cannot
+// disagree about whether a given cell is an integer. Composing this in
+// JavaScript, the way describe() is composed, would have guaranteed the
+// opposite.
+
+fn validateWork(path: [:0]const u8, schema_json: [:0]const u8, max_errors: i64, out: *RowsResult) void {
+    var report = scan.validateJson(c_allocator, path, schema_json, .{
+        .max_errors = if (max_errors <= 0) 100 else @intCast(max_errors),
+    }) catch |e| {
+        out.err = e;
+        return;
+    };
+    defer report.deinit();
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    scan.writeReportJson(&aw.writer, report) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
+}
+
+fn napiValidate(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const path = getStringArg(env, info, 0, c_allocator) catch return napiFail(env, "validateJson(path, schema): path required");
+    defer c_allocator.free(path);
+    const schema_json = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "validateJson(path, schema): schema required");
+    defer c_allocator.free(schema_json);
+    const max_errors = getIntArg(env, info, 2, i64, 100);
+
+    var result = RowsResult{};
+    runOnWorkerStack(validateWork, .{ path, schema_json, max_errors, &result });
+    if (result.err) |e| return failErr(env, e);
+    defer c_allocator.free(result.json);
+    return napiString(env, result.json);
+}
+
+const ValidatorHandle = struct {
+    validator: scan.Validator,
+    in_use: bool = false,
+    close_requested: bool = false,
+
+    fn destroy(self: *ValidatorHandle) void {
+        self.validator.deinit();
+        c_allocator.destroy(self);
+    }
+};
+
+const ValidatorRegistry = HandleRegistry(ValidatorHandle);
+
+fn openValidatorWork(path: [:0]const u8, schema_json: [:0]const u8, out: *OpenScanResult) void {
+    const handle = c_allocator.create(ValidatorHandle) catch {
+        out.err = error.OutOfMemory;
+        return;
+    };
+    handle.* = .{ .validator = scan.Validator.openJson(c_allocator, path, schema_json) catch |e| {
+        c_allocator.destroy(handle);
+        out.err = e;
+        return;
+    } };
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    w.writeByte('[') catch {
+        handle.destroy();
+        out.err = error.OutOfMemory;
+        return;
+    };
+    for (handle.validator.header(), 0..) |name, i| {
+        if (i > 0) w.writeByte(',') catch {
+            handle.destroy();
+            out.err = error.OutOfMemory;
+            return;
+        };
+        jsonEscapedString(w, name);
+    }
+    w.writeByte(']') catch {
+        handle.destroy();
+        out.err = error.OutOfMemory;
+        return;
+    };
+    const names_json = aw.toOwnedSlice() catch {
+        handle.destroy();
+        out.err = error.OutOfMemory;
+        return;
+    };
+
+    const id = ValidatorRegistry.register(handle) catch {
+        handle.destroy();
+        c_allocator.free(names_json);
+        out.err = error.OutOfMemory;
+        return;
+    };
+    out.names_json = names_json;
+    out.handle = @intCast(id);
+}
+
+fn napiOpenValidator(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const path = getStringArg(env, info, 0, c_allocator) catch return napiFail(env, "openValidator(path, schema): path required");
+    defer c_allocator.free(path);
+    const schema_json = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "openValidator(path, schema): schema required");
+    defer c_allocator.free(schema_json);
+
+    var result = OpenScanResult{};
+    runOnWorkerStack(openValidatorWork, .{ path, schema_json, &result });
+    if (result.err) |e| return failErr(env, e);
+
+    var obj: napi.napi_value = undefined;
+    _ = napi.napi_create_object(env, &obj);
+    _ = napi.napi_set_named_property(env, obj, "handle", napiInt64(env, result.handle));
+    _ = napi.napi_set_named_property(env, obj, "namesJson", napiString(env, result.names_json));
+    c_allocator.free(result.names_json);
+    return obj;
+}
+
+/// One row as `{"number":N,"values":[...],"errors":[...]}`, or null at
+/// end of file. `errors` is omitted entirely for a valid row, so the
+/// common case carries no extra bytes across the boundary.
+fn napiValidatorNext(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const handle_id = getIntArg(env, info, 0, i64, 0);
+    if (handle_id <= 0) return napiFail(env, "validatorNextJson(handle): invalid handle");
+    const handle = ValidatorRegistry.acquire(@intCast(handle_id)) orelse
+        return napiFail(env, "validatorNextJson(handle): unknown, already-closed, or concurrently-in-use handle");
+    defer ValidatorRegistry.release(handle);
+
+    const maybe = handle.validator.next() catch |e| return failErr(env, e);
+    const vr = maybe orelse {
+        var null_val: napi.napi_value = undefined;
+        _ = napi.napi_get_null(env, &null_val);
+        return null_val;
+    };
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    w.print("{{\"number\":{d},\"values\":[", .{vr.number}) catch return napiFail(env, "out of memory");
+    for (vr.row.fields, 0..) |f, i| {
+        if (i > 0) w.writeByte(',') catch return napiFail(env, "out of memory");
+        jsonEscapedString(w, f);
+    }
+    w.writeByte(']') catch return napiFail(env, "out of memory");
+    if (vr.errors.len > 0) {
+        w.writeAll(",\"errors\":") catch return napiFail(env, "out of memory");
+        scan.writeRowErrorsJson(w, vr.errors) catch return napiFail(env, "out of memory");
+    }
+    w.writeByte('}') catch return napiFail(env, "out of memory");
+    const json = aw.toOwnedSlice() catch return napiFail(env, "out of memory");
+    defer c_allocator.free(json);
+    return napiString(env, json);
+}
+
+fn napiValidatorTotals(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const handle_id = getIntArg(env, info, 0, i64, 0);
+    if (handle_id <= 0) return napiFail(env, "validatorTotalsJson(handle): invalid handle");
+    const handle = ValidatorRegistry.acquire(@intCast(handle_id)) orelse
+        return napiFail(env, "validatorTotalsJson(handle): unknown or already-closed handle");
+    defer ValidatorRegistry.release(handle);
+
+    var buf: [128]u8 = undefined;
+    const json = std.fmt.bufPrint(
+        &buf,
+        "{{\"rowsTotal\":{d},\"rowsValid\":{d},\"rowsInvalid\":{d}}}",
+        .{ handle.validator.row_number, handle.validator.rows_valid, handle.validator.rows_invalid },
+    ) catch return napiFail(env, "out of memory");
+    return napiString(env, json);
+}
+
+fn napiCloseValidator(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const handle_id = getIntArg(env, info, 0, i64, 0);
+    var undef: napi.napi_value = undefined;
+    _ = napi.napi_get_undefined(env, &undef);
+    if (handle_id <= 0) return undef;
+    const handle = ValidatorRegistry.unregister(@intCast(handle_id)) orelse return undef;
+    handle.destroy();
+    return undef;
+}
+
+fn batchResult(env: napi.napi_env, source: anytype, comptime validated: bool, rows: i64, bytes: i64) napi.napi_value {
+    if (rows < 1 or rows > 65536 or bytes < 1) return napiFail(env, "invalid batch size");
+    const json = scan.batch.readJson(c_allocator, source, validated, .{
+        .max_rows = @intCast(rows),
+        .target_bytes = @intCast(bytes),
+    }) catch |e| return failErr(env, e);
+    if (json) |data| {
+        defer c_allocator.free(data);
+        return napiString(env, data);
+    }
+    var result: napi.napi_value = undefined;
+    _ = napi.napi_get_null(env, &result);
+    return result;
+}
+
+fn napiNextBatch(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const id = getIntArg(env, info, 0, i64, 0);
+    if (id <= 0) return napiFail(env, "invalid handle");
+    const handle = acquireHandle(@intCast(id)) orelse return napiFail(env, "unknown or busy handle");
+    defer releaseHandle(handle);
+    return batchResult(env, &handle.query, false, getIntArg(env, info, 1, i64, 1024), getIntArg(env, info, 2, i64, 1048576));
+}
+
+fn napiValidatorBatch(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const id = getIntArg(env, info, 0, i64, 0);
+    if (id <= 0) return napiFail(env, "invalid handle");
+    const handle = ValidatorRegistry.acquire(@intCast(id)) orelse return napiFail(env, "unknown or busy handle");
+    defer ValidatorRegistry.release(handle);
+    return batchResult(env, &handle.validator, true, getIntArg(env, info, 1, i64, 1024), getIntArg(env, info, 2, i64, 1048576));
+}
+
 // ── Module registration ──────────────────────────────────────────────
+
+const ImportResult = struct { stats: scan.validation_import.Stats = .{}, err: ?anyerror = null };
+
+fn importWork(path: [:0]const u8, schema: [:0]const u8, accepted: [:0]const u8, rejected: [:0]const u8, result: *ImportResult) void {
+    result.stats = scan.validation_import.run(c_allocator, path, schema, accepted, rejected) catch |e| {
+        result.err = e;
+        return;
+    };
+}
+
+fn napiValidateToFiles(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const path = getStringArg(env, info, 0, c_allocator) catch return napiFail(env, "input path required");
+    defer c_allocator.free(path);
+    const schema = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "schema required");
+    defer c_allocator.free(schema);
+    const accepted = getStringArg(env, info, 2, c_allocator) catch return napiFail(env, "accepted path required");
+    defer c_allocator.free(accepted);
+    const rejected = getStringArg(env, info, 3, c_allocator) catch return napiFail(env, "rejected path required");
+    defer c_allocator.free(rejected);
+    var result = ImportResult{};
+    runOnWorkerStack(importWork, .{ path, schema, accepted, rejected, &result });
+    if (result.err) |e| return failErr(env, e);
+    var buffer: [256]u8 = undefined;
+    const json = std.fmt.bufPrint(&buffer, "{{\"rowsTotal\":{d},\"rowsValid\":{d},\"rowsInvalid\":{d},\"errorsTotal\":{d}}}", .{ result.stats.rows_total, result.stats.rows_valid, result.stats.rows_invalid, result.stats.errors_total }) catch return napiFail(env, "stats overflow");
+    return napiString(env, json);
+}
+
+fn napiBuildMode(env: napi.napi_env, _: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    return napiString(env, @tagName(@import("builtin").mode));
+}
 
 fn prop(name: [*:0]const u8, method: napi.napi_callback) napi.napi_property_descriptor {
     return .{
@@ -760,6 +1281,13 @@ fn prop(name: [*:0]const u8, method: napi.napi_callback) napi.napi_property_desc
 export fn napi_register_module_v1(env: napi.napi_env, exports: napi.napi_value) callconv(.c) napi.napi_value {
     const props = [_]napi.napi_property_descriptor{
         prop("schemaJson", napiSchema),
+        prop("buildMode", napiBuildMode),
+        prop("validateToFiles", napiValidateToFiles),
+        prop("validateJson", napiValidate),
+        prop("openValidator", napiOpenValidator),
+        prop("validatorNextJson", napiValidatorNext),
+        prop("validatorTotalsJson", napiValidatorTotals),
+        prop("closeValidator", napiCloseValidator),
         prop("countJson", napiCount),
         prop("aggregateJson", napiAggregate),
         prop("scanArrayJson", napiScanArray),
@@ -767,6 +1295,8 @@ export fn napi_register_module_v1(env: napi.napi_env, exports: napi.napi_value) 
         prop("orderByJson", napiOrderBy),
         prop("openScan", napiOpenScan),
         prop("nextRowJson", napiNextRow),
+        prop("nextBatchJson", napiNextBatch),
+        prop("validatorBatchJson", napiValidatorBatch),
         prop("closeScan", napiCloseScan),
     };
     _ = napi.napi_define_properties(env, exports, props.len, &props);

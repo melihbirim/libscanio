@@ -7,10 +7,14 @@ Search order:
   3. Directories listed in the LIBSCANIO_LIB_PATH environment variable
 """
 
+# os.path, not pathlib: pathlib pulls in urllib.parse and costs ~3.7ms
+# of import time, which is a large slice of the total latency of a small
+# query (the Zig scan of a 1MB file takes ~2ms).
+from __future__ import annotations
+
 import ctypes
 import os
 import sys
-from pathlib import Path
 
 _lib_cache: ctypes.CDLL | None = None
 
@@ -23,23 +27,28 @@ def _lib_name() -> str:
     return "libscanio.so"
 
 
-def _candidate_dirs() -> list[Path]:
-    dirs: list[Path] = [Path(__file__).parent]
+def _candidate_dirs() -> list[str]:
+    here = os.path.realpath(__file__)
+    dirs: list[str] = [os.path.dirname(__file__)]
 
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        if (parent / "build.zig").exists():
+    parent = os.path.dirname(here)
+    while True:
+        nxt = os.path.dirname(parent)
+        if nxt == parent:
+            break
+        parent = nxt
+        if os.path.exists(os.path.join(parent, "build.zig")):
             # zig-out/lib on POSIX; on Windows the loadable .dll lands in
             # zig-out/bin (zig-out/lib only gets the .lib import stub) —
             # check both rather than special-case by platform, since it's
             # harmless to check a dir that doesn't have the file.
-            dirs.append(parent / "zig-out" / "lib")
-            dirs.append(parent / "zig-out" / "bin")
+            dirs.append(os.path.join(parent, "zig-out", "lib"))
+            dirs.append(os.path.join(parent, "zig-out", "bin"))
             break
 
     env_path = os.environ.get("LIBSCANIO_LIB_PATH")
     if env_path:
-        dirs.append(Path(env_path))
+        dirs.append(env_path)
 
     return dirs
 
@@ -51,14 +60,14 @@ def load() -> ctypes.CDLL:
 
     name = _lib_name()
     for d in _candidate_dirs():
-        candidate = d / name
-        if candidate.exists():
-            lib = ctypes.CDLL(str(candidate))
+        candidate = os.path.join(d, name)
+        if os.path.exists(candidate):
+            lib = ctypes.CDLL(candidate)
             _setup_signatures(lib)
             _lib_cache = lib
             return lib
 
-    searched = "\n  ".join(str(d / name) for d in _candidate_dirs())
+    searched = "\n  ".join(os.path.join(d, name) for d in _candidate_dirs())
     raise FileNotFoundError(
         f"Could not find {name}. Searched:\n  {searched}\n"
         "Run `zig build c-lib -Doptimize=ReleaseFast` to build it, "
@@ -84,7 +93,15 @@ class COptions(ctypes.Structure):
         ("n_where", ctypes.c_size_t),
         ("limit", ctypes.c_int64),
         ("max_column", ctypes.c_int64),
+        # Last, matching the C struct: a zero-filled COptions keeps the
+        # pre-negate behaviour without the caller knowing this exists.
+        ("negate", ctypes.c_int),
     ]
+
+
+class CImportStats(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("rows_total", "rows_valid", "rows_invalid", "errors_total")]
 
 
 class CAgg(ctypes.Structure):
@@ -174,6 +191,7 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
         ctypes.c_char,
         ctypes.POINTER(CPredicate),
         ctypes.c_size_t,
+        ctypes.c_int,  # negate
         ctypes.c_size_t,
     ]
     lib.scanio_parallel_collect_columnar.restype = ctypes.c_void_p
@@ -193,8 +211,70 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.scanio_collect_columnar_close.argtypes = [ctypes.c_void_p]
     lib.scanio_collect_columnar_close.restype = None
 
+    outcome = getattr(lib, "scanio_validate_outcome", None)
+    if outcome is not None:
+        outcome.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        outcome.restype = ctypes.c_void_p
+        lib.scanio_outcome_free.argtypes = [ctypes.c_void_p]
+        lib.scanio_outcome_free.restype = None
+
+    lib.scanio_validate.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.scanio_validate.restype = ctypes.c_void_p
+
+    lib.scanio_validate_json.argtypes = [ctypes.c_void_p]
+    lib.scanio_validate_json.restype = ctypes.c_char_p
+
+    lib.scanio_validate_free.argtypes = [ctypes.c_void_p]
+    lib.scanio_validate_free.restype = None
+
+    lib.scanio_validator_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    lib.scanio_validator_open.restype = ctypes.c_void_p
+
+    lib.scanio_validator_next.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.scanio_validator_next.restype = ctypes.c_int
+
+    for _fn in ("scanio_validator_rows_total", "scanio_validator_rows_valid", "scanio_validator_rows_invalid"):
+        getattr(lib, _fn).argtypes = [ctypes.c_void_p]
+        getattr(lib, _fn).restype = ctypes.c_uint64
+
+    lib.scanio_validator_n_columns.argtypes = [ctypes.c_void_p]
+    lib.scanio_validator_n_columns.restype = ctypes.c_size_t
+
+    lib.scanio_validator_column_name.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.scanio_validator_column_name.restype = ctypes.c_char_p
+
+    lib.scanio_validator_close.argtypes = [ctypes.c_void_p]
+    lib.scanio_validator_close.restype = None
+
     lib.scanio_close.argtypes = [ctypes.c_void_p]
     lib.scanio_close.restype = None
 
+    lib.scanio_build_mode.argtypes = []
+    lib.scanio_build_mode.restype = ctypes.c_char_p
+
     lib.scanio_last_error.argtypes = []
     lib.scanio_last_error.restype = ctypes.c_char_p
+
+    for name in ("scanio_next_batch", "scanio_validator_next_batch"):
+        fn = getattr(lib, name)
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+                       ctypes.POINTER(ctypes.c_void_p)]
+        fn.restype = ctypes.c_int
+    lib.scanio_batch_json.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+    lib.scanio_batch_json.restype = ctypes.c_void_p
+    lib.scanio_batch_free.argtypes = [ctypes.c_void_p]
+    lib.scanio_batch_free.restype = None
+
+    # Additive API: old libraries can still run their supported functions
+    # (and serve as before/after benchmark baselines).
+    native_import = getattr(lib, "scanio_validate_to_files", None)
+    if native_import is not None:
+        native_import.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(CImportStats)]
+        native_import.restype = ctypes.c_int

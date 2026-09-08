@@ -36,8 +36,13 @@ pub const OrderedRows = struct {
 /// inventing a second ordering rule: "10" sorts after "9" (numeric),
 /// not before it (which a pure string compare would do).
 fn compareField(a: []const u8, b: []const u8) std.math.Order {
-    if (std.fmt.parseFloat(f64, a) catch null) |fa| {
-        if (std.fmt.parseFloat(f64, b) catch null) |fb| {
+    // scan.parseNumeric rejects "nan"/"inf" so they order as the strings
+    // they are. With plain parseFloat, a NaN field compared .eq to every
+    // other row (both < and > are false for NaN) while the rest ordered
+    // normally — a non-transitive relation handed to std.mem.sort, which
+    // is free to produce an arbitrary order from it.
+    if (scan.parseNumeric(a)) |fa| {
+        if (scan.parseNumeric(b)) |fb| {
             if (fa < fb) return .lt;
             if (fa > fb) return .gt;
             return .eq;
@@ -197,4 +202,33 @@ test "orderBy: empty result set" {
     var result = try orderBy(allocator, &q, 1, false);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.rows.len);
+}
+
+test "orderBy: a 'nan' field orders deterministically instead of comparing equal to everything" {
+    // parseFloat("nan") gave a real NaN, and both < and > are false for
+    // it — so compareField returned .eq against every row, a
+    // non-transitive relation that std.mem.sort may resolve any way it
+    // likes. Treated as a string now, so the numeric rows keep their
+    // own order regardless of where the odd one lands.
+    const allocator = std.testing.allocator;
+    const path = "test_order_nan.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,nan\n2,50\n3,10\n4,900\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{});
+    defer q.deinit();
+
+    var res = try orderBy(allocator, &q, 1, false);
+    defer res.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), res.rows.len);
+    var seen: [3]usize = undefined;
+    var n: usize = 0;
+    for (res.rows) |row| {
+        const v = row.get(1).?;
+        if (std.mem.eql(u8, v, "10")) seen[n] = 10 else if (std.mem.eql(u8, v, "50")) seen[n] = 50 else if (std.mem.eql(u8, v, "900")) seen[n] = 900 else continue;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualSlices(usize, &.{ 10, 50, 900 }, &seen);
 }

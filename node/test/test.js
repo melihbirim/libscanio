@@ -289,6 +289,262 @@ async function main() {
     fs.unlinkSync(ALNUM_P);
   }
 
+  // A row with MORE fields than the header: zipRow() looped to
+  // names.length and silently DROPPED the extras, while scanArray()
+  // (raw arrays) kept them — the same file answered differently
+  // depending on which function you called. A row with FEWER fields
+  // than the header crashed the columnar path in Zig, which the Python
+  // client surfaced as an IndexError.
+  const raggedPath = path.join(os.tmpdir(), `libscanio_ragged_${process.pid}.csv`);
+  fs.writeFileSync(raggedPath, 'a,b,c\n1,2,3\n4,5\n6\n7,8,9,EXTRA\n');
+  try {
+    const ragged = [];
+    for await (const r of libscanio.scan(raggedPath)) ragged.push(r);
+    check('scan: ragged file yields every row', ragged.length, 4);
+    check('scan: a field past the header is kept under a positional key', ragged[3].col3, 'EXTRA');
+    check('scan: header columns of that row are still correct',
+      [ragged[3].a, ragged[3].b, ragged[3].c], ['7', '8', '9']);
+    check('scan: a short row simply omits the missing keys', Object.keys(ragged[2]), ['a']);
+    check('scan: normal rows are untouched', ragged[0], { a: '1', b: '2', c: '3' });
+    check('scanArray: ragged rows keep their natural width',
+      libscanio.scanArray(raggedPath), [['1', '2', '3'], ['4', '5'], ['6'], ['7', '8', '9', 'EXTRA']]);
+    check('scanArray(asObjects): agrees with scan()', libscanio.scanArray(raggedPath, { asObjects: true })[3], ragged[3]);
+    check('count: unaffected by ragged rows', libscanio.count(raggedPath), 4);
+    check('orderBy: ragged file does not throw', libscanio.orderBy(raggedPath, 'a').length, 4);
+  } finally {
+    fs.unlinkSync(raggedPath);
+  }
+
+  // The Python client exposes exactly {count, sum, min, max, avg}; this
+  // one used to also leak `has_values`, a C-ABI-only flag (C structs have
+  // no null), making the two clients disagree on the shape of the same
+  // answer.
+  const aggPath = path.join(os.tmpdir(), `libscanio_agg_${process.pid}.csv`);
+  fs.writeFileSync(aggPath, 'id,label,amount\n1,alpha,10\n2,beta,20\n');
+  try {
+    check('aggregate: result shape matches the Python client exactly',
+      Object.keys(libscanio.aggregate(aggPath, 'amount')).sort(),
+      ['avg', 'count', 'max', 'min', 'sum']);
+    const emptyAgg = libscanio.aggregate(aggPath, 'label');
+    check('aggregate: a column with no numeric values reports count 0', emptyAgg.count, 0);
+    check('aggregate: and nulls min/max/avg rather than reporting zero',
+      [emptyAgg.min, emptyAgg.max, emptyAgg.avg], [null, null, null]);
+  } finally {
+    fs.unlinkSync(aggPath);
+  }
+
+  // RFC 4180 quoting, and — just as important — what happens on the one
+  // shape the reader cannot represent. Every entry point used to report
+  // a mid-scan failure differently: scan() threw a bare Error, and
+  // scanArray/topk/orderBy/aggregate swallowed it in the addon and left
+  // JavaScript to fail on `JSON.parse('')` with "Unexpected end of JSON
+  // input" — an error message that named nothing about the real cause.
+  const qPath = path.join(os.tmpdir(), `libscanio_quoted_${process.pid}.csv`);
+  fs.writeFileSync(qPath, 'id,"name",city\n1,"Smith, John",London\n2,"He said ""hi""",Paris\n3,he said "hi",Berlin\n');
+  try {
+    check('quoted CSV: header quoting is stripped', libscanio.schema(qPath), ['id', 'name', 'city']);
+    check('quoted CSV: a delimiter inside quotes does not split the field',
+      await collect(libscanio.scan(qPath)), [
+        { id: '1', name: 'Smith, John', city: 'London' },
+        { id: '2', name: 'He said "hi"', city: 'Paris' },
+        { id: '3', name: 'he said "hi"', city: 'Berlin' },
+      ]);
+    check('quoted CSV: scanArray agrees with scan',
+      libscanio.scanArray(qPath), [
+        ['1', 'Smith, John', 'London'],
+        ['2', 'He said "hi"', 'Paris'],
+        ['3', 'he said "hi"', 'Berlin'],
+      ]);
+    check('quoted CSV: a quoted value is filterable by its real content',
+      (await collect(libscanio.scan(qPath, { where: 'name = Smith, John' }))).length, 1);
+  } finally {
+    fs.unlinkSync(qPath);
+  }
+
+  // The one shape this reader cannot represent: a record spanning lines.
+  const badPath = path.join(os.tmpdir(), `libscanio_badquote_${process.pid}.csv`);
+  fs.writeFileSync(badPath, 'a,b\n1,"oops\n');
+  try {
+    await checkRaises('unterminated quote: scan reports it as a ScanError',
+      () => collect(libscanio.scan(badPath)));
+    await checkRaises('unterminated quote: scanArray reports it, not a JSON parse error',
+      () => libscanio.scanArray(badPath));
+    await checkRaises('unterminated quote: aggregate reports it', () => libscanio.aggregate(badPath, 'b'));
+    await checkRaises('unterminated quote: topk reports it', () => libscanio.topk(badPath, 'b', 2));
+    await checkRaises('unterminated quote: orderBy reports it', () => libscanio.orderBy(badPath, 'b'));
+    await checkRaises('unterminated quote: describe reports it', () => libscanio.describe(badPath));
+  } finally {
+    fs.unlinkSync(badPath);
+  }
+
+  // Import validation. The rules live in Zig precisely so this client
+  // and the Python one cannot drift apart on them; the differential
+  // test checks the two against each other directly.
+  const valPath = path.join(os.tmpdir(), `libscanio_validate_${process.pid}.csv`);
+  fs.writeFileSync(valPath, 'id,name,amount,status\n1,Alice,100,new\nx,Bob,-5,bogus\n3,,20,paid\n');
+  const valSchema = {
+    id: { type: 'integer', required: true },
+    name: { required: true },
+    amount: { type: 'float', min: 0 },
+    status: { one_of: ['new', 'paid', 'shipped'] },
+  };
+  try {
+    const r = libscanio.validate(valPath, valSchema);
+    check('validate: row totals', [r.rowsTotal, r.rowsValid, r.rowsInvalid], [3, 1, 2]);
+    check('validate: ok is false when any row failed', r.ok, false);
+    check('validate: every failure is counted', r.errorsTotal, 4);
+    check('validate: counts are keyed by rule name', r.counts,
+      { bad_type: 1, below_min: 1, not_in_set: 1, missing_required: 1 });
+    check('validate: an error names the row, column and offending value', r.errors[0],
+      { row: 2, column: 0, column_name: 'id', rule: 'bad_type', value: 'x' });
+    check('validate: a clean run reports ok', libscanio.validate(valPath, { name: {} }).ok, true);
+
+    const capped = libscanio.validate(valPath, valSchema, { maxErrors: 2 });
+    check('validate: maxErrors caps the stored list', capped.errors.length, 2);
+    check('validate: ...but not the totals', capped.errorsTotal, 4);
+    check('validate: ...and says so', capped.truncated, true);
+
+    const seen = [];
+    for await (const v of libscanio.validateIter(valPath, valSchema)) seen.push(v);
+    check('validateIter: yields every row, not just the bad ones', seen.length, 3);
+    check('validateIter: rows are numbered from 1, header excluded', seen.map((v) => v.number), [1, 2, 3]);
+    check('validateIter: a passing row carries no errors', seen[0].errors, []);
+    check('validateIter: a failing row carries the row itself', seen[1].row,
+      { id: 'x', name: 'Bob', amount: '-5', status: 'bogus' });
+    check('validateIter: ...and every rule it broke',
+      seen[1].errors.map((e) => e.rule).sort(), ['bad_type', 'below_min', 'not_in_set']);
+
+    await checkRaises('validate: an unknown column is an error, not an unenforced rule',
+      () => libscanio.validate(valPath, { nope: { required: true } }));
+    await checkRaises('validate: a misspelled rule name is an error too',
+      () => libscanio.validate(valPath, { id: { requred: true } }));
+    await checkRaises('validateIter: same, before any row is yielded',
+      async () => { for await (const _ of libscanio.validateIter(valPath, { nope: {} })) break; });
+
+    const inferred = await libscanio.inferSchema(valPath);
+    check('inferSchema: names every column', Object.keys(inferred).sort(),
+      ['amount', 'id', 'name', 'status']);
+    check('inferSchema: types what it can, leaves the rest open', inferred.amount, { type: 'integer' });
+    check('inferSchema: its own output validates the file it came from',
+      libscanio.validate(valPath, inferred).ok, true);
+  } finally {
+    fs.unlinkSync(valPath);
+  }
+
+  // negate: the complement of a WHERE clause. The property that matters
+  // is that the two halves PARTITION the file — every row in exactly
+  // one, no row in both, none lost.
+  const negPath = path.join(os.tmpdir(), `libscanio_negate_${process.pid}.csv`);
+  fs.writeFileSync(negPath, 'id,city,amount\n1,London,10\n2,Paris,20\n3,London,30\n4,Berlin,40\n5,Paris,50\n');
+  try {
+    const kept = libscanio.scanArray(negPath, { where: 'city = London' });
+    const dropped = libscanio.scanArray(negPath, { where: 'city = London', negate: true });
+    check('negate: scanArray returns the complement', dropped.length, 3);
+    check('negate: the two halves partition the file',
+      kept.length + dropped.length, libscanio.count(negPath));
+    check('negate: no row appears in both halves',
+      kept.map((r) => r[0]).filter((id) => dropped.some((d) => d[0] === id)), []);
+    check('negate: count agrees with scanArray',
+      libscanio.count(negPath, 'city = London', { negate: true }), dropped.length);
+    check('negate: scan() streams the same rows scanArray() collects',
+      (await collect(libscanio.scan(negPath, { where: 'city = London', negate: true })))
+        .map((r) => Object.values(r)),
+      dropped);
+
+    // NOT(a AND b) inverts the CONJUNCTION, not each clause.
+    check('negate: inverts the whole AND-list, not each clause',
+      libscanio.scanArray(negPath, { where: 'city = London AND amount > 20' }).length, 1);
+    check('negate: ...so everything else is rejected',
+      libscanio.scanArray(negPath, { where: 'city = London AND amount > 20', negate: true }).length, 4);
+
+    check('negate: with no where, nothing matches', libscanio.count(negPath, null, { negate: true }), 0);
+    check('negate: ...and scan yields nothing',
+      await collect(libscanio.scan(negPath, { negate: true })), []);
+    check('negate: composes with columns and limit',
+      libscanio.scanArray(negPath, { columns: ['city'], where: 'city = London', limit: 2, negate: true }),
+      [['Paris'], ['Berlin']]);
+  } finally {
+    fs.unlinkSync(negPath);
+  }
+
+  const negRagged = path.join(os.tmpdir(), `libscanio_negate_ragged_${process.pid}.csv`);
+  fs.writeFileSync(negRagged, 'a,b\n1,10\n2\n3,30\n');
+  try {
+    check('negate: a truncated row counts as rejected',
+      libscanio.count(negRagged, 'b >= 0', { negate: true }), 1);
+    check('negate: ...and is not lost from the partition',
+      libscanio.count(negRagged, 'b >= 0') + libscanio.count(negRagged, 'b >= 0', { negate: true }),
+      libscanio.count(negRagged));
+  } finally {
+    fs.unlinkSync(negRagged);
+  }
+
+
+  const batchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scanio-batches-'));
+  try {
+    for (const format of ['csv', 'ndjson', 'json']) {
+      const bp = path.join(batchDir, 'rows.' + format);
+      const records = [{a:'1',b:'Zürich'}, {a:'bad',b:'quote"'}, {a:'3',b:'tail'}, {a:'4',b:'last'}];
+      fs.writeFileSync(bp, format === 'csv' ? 'a,b\n1,Zürich\nbad,"quote"""\n3,tail\n4,last\n' :
+        format === 'json' ? JSON.stringify(records) : records.map(r => JSON.stringify(r)).join('\n'));
+      const rules = {a:{type:'integer',min:2}};
+      const expected = await collect(libscanio.scan(bp));
+      const errors = await collect(libscanio.validateIter(bp, rules));
+      for (const batchSize of [1,2,3,8192]) {
+        const batches = await collect(libscanio.scanBatches(bp, {batchSize}));
+        check(`${format} batches ${batchSize}: order/retention`, batches.flat(), expected);
+        check(`${format} batches ${batchSize}: size bound`, batches.every(b => b.length > 0 && b.length <= batchSize), true);
+        check(`${format} validation batches ${batchSize}: errors`,
+          (await collect(libscanio.validateBatches(bp, rules, {batchSize}))).flat(), errors);
+      }
+      const opts = {columns:['b'],where:'a = 1',negate:true,limit:2};
+      check(`${format} batches: query options`, (await collect(libscanio.scanBatches(bp, opts))).flat(), await collect(libscanio.scan(bp, opts)));
+      check(`${format} batches: byte target`, (await collect(libscanio.scanBatches(bp, {targetBytes:1}))).map(b => b.length), [1,1,1,1]);
+      check(`${format} batches: arrays`, (await collect(libscanio.scanBatches(bp, {asObjects:false}))).flat(), records.map(r => Object.values(r)));
+      for (let i=0;i<10;i++) { for await (const b of libscanio.validateBatches(bp, rules, {batchSize:1})) { break; } }
+      for (const options of [{batchSize:0},{batchSize:65537},{batchSize:1.5},{targetBytes:0}]) {
+        await assert.rejects(() => collect(libscanio.scanBatches(bp, options)), RangeError);
+      }
+    }
+    const bp = path.join(batchDir, 'ragged.csv');
+    fs.writeFileSync(bp, 'a,b\n1,2,extra\n3\n');
+    check('batches: ragged rows', (await collect(libscanio.scanBatches(bp))).flat(), await collect(libscanio.scan(bp)));
+    check('batches: ragged validation', (await collect(libscanio.validateBatches(bp, {}))).flat(), await collect(libscanio.validateIter(bp, {})));
+    fs.writeFileSync(bp, 'a,b\n1,ok\n2,"unterminated\n');
+    await checkRaises('batches: malformed row', () => collect(libscanio.scanBatches(bp)));
+    await checkRaises('validation batches: malformed row', () => collect(libscanio.validateBatches(bp, {})));
+    fs.writeFileSync(bp, 'a,b\n1,nul\x00tail\n');
+    check('batches: NUL', (await collect(libscanio.scanBatches(bp)))[0][0].b, 'nul\x00tail');
+  } finally { fs.rmSync(batchDir, {recursive:true,force:true}); }
+
+
+  const importDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scanio-import-'));
+  try {
+    const good = path.join(importDir,'good.csv'), bad = path.join(importDir,'bad.jsonl');
+    for (const format of ['csv','ndjson','json']) {
+      const input = path.join(importDir,'input.'+format);
+      const records = [{a:'1',b:'Zürich'},{a:'bad',b:'quote"'},{a:'3',b:'comma,value'}];
+      fs.writeFileSync(input, format==='csv' ? 'a,b\n1,Zürich\nbad,"quote"""\n3,"comma,value"\n' :
+        format==='json' ? JSON.stringify(records) : records.map(r=>JSON.stringify(r)).join('\n'));
+      const rules = {a:{type:'integer',min:2}};
+      const rows = await collect(libscanio.validateIter(input,rules));
+      check(`${format} native import stats`, libscanio.validateToFiles(input,rules,good,bad),
+        {rowsTotal:3,rowsValid:1,rowsInvalid:2,errorsTotal:2});
+      check(`${format} native import accepted`, fs.readFileSync(good,'utf8'), 'a,b\r\n3,"comma,value"\r\n');
+      check(`${format} native import rejects`, fs.readFileSync(bad,'utf8'), rows.filter(r=>r.errors.length)
+        .map(r=>JSON.stringify({values:Object.values(r.row),errors:r.errors})+'\n').join(''));
+      await checkRaises('native import refuses existing outputs', ()=>libscanio.validateToFiles(input,rules,good,bad));
+      fs.unlinkSync(good);fs.unlinkSync(bad);
+      const original=fs.readFileSync(input,'utf8');
+      await checkRaises('native import refuses input alias', ()=>libscanio.validateToFiles(input,{},input,bad));
+      check('native import preserves input',fs.readFileSync(input,'utf8'),original);
+    }
+    const input=path.join(importDir,'broken.csv');
+    fs.writeFileSync(input,'a,b\n1,ok\n2,"broken\n');
+    await checkRaises('native import removes partial files on parse error',()=>libscanio.validateToFiles(input,{},good,bad));
+    check('native import cleanup', [fs.existsSync(good),fs.existsSync(bad)], [false,false]);
+  } finally { fs.rmSync(importDir,{recursive:true,force:true}); }
+
   console.log(`\n${passed}/${total} Node binding tests passed`);
   process.exit(passed === total ? 0 : 1);
 }

@@ -170,12 +170,20 @@ pub inline fn parseIntFast(str: []const u8) !i64 {
 
     if (i >= str.len) return error.InvalidInput;
 
-    // Parse digits - compiler can vectorize this loop
+    // Parse digits. The overflow checks are @mulWithOverflow/
+    // @addWithOverflow rather than plain arithmetic: `result * 10 + digit`
+    // on a 20-digit number panics in a safety-checked build and silently
+    // wraps to a garbage value in ReleaseFast, so `{"n":99999999999999999999}`
+    // used to come back as a plausible-looking wrong number.
     var result: i64 = 0;
     while (i < str.len) : (i += 1) {
         const c = str[i];
         if (c < '0' or c > '9') break;
-        result = result * 10 + (c - '0');
+        const scaled = @mulWithOverflow(result, 10);
+        if (scaled[1] != 0) return error.Overflow;
+        const added = @addWithOverflow(scaled[0], @as(i64, c - '0'));
+        if (added[1] != 0) return error.Overflow;
+        result = added[0];
     }
 
     return if (negative) -result else result;
@@ -212,4 +220,12 @@ test "fast integer parsing" {
     try std.testing.expectEqual(@as(i64, 42), try parseIntFast("42"));
     try std.testing.expectEqual(@as(i64, -123), try parseIntFast("-123"));
     try std.testing.expectEqual(@as(i64, 0), try parseIntFast("0"));
+}
+
+test "parseIntFast reports overflow instead of wrapping" {
+    // `result * 10 + digit` wrapped silently in ReleaseFast (and panicked
+    // in safety-checked builds) on anything past i64.
+    try std.testing.expectError(error.Overflow, parseIntFast("99999999999999999999"));
+    try std.testing.expectEqual(@as(i64, 9223372036854775807), try parseIntFast("9223372036854775807"));
+    try std.testing.expectError(error.Overflow, parseIntFast("9223372036854775808"));
 }

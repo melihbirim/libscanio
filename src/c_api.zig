@@ -45,6 +45,20 @@ fn clearError() void {
     last_error = null;
 }
 
+/// The optimize mode this library was built with — "Debug",
+/// "ReleaseSafe", "ReleaseFast" or "ReleaseSmall".
+///
+/// Exists because of a repeated, expensive measurement bug, not for
+/// introspection: `zig build diff-test`/`node`/`cli` reinstall their
+/// artifacts at the DEFAULT optimize mode, silently overwriting a
+/// ReleaseFast build in zig-out. Three separate benchmark runs in one
+/// session were quietly measuring a Debug library and reported numbers
+/// 40-100x off before anyone noticed the .so had changed size. A
+/// benchmark can now refuse to run instead of publishing that.
+pub export fn scanio_build_mode() [*:0]const u8 {
+    return @tagName(@import("builtin").mode);
+}
+
 pub export fn scanio_last_error() ?[*:0]const u8 {
     const msg = last_error orelse return null;
     // Re-render into a NUL-terminated copy on demand rather than keeping
@@ -83,6 +97,11 @@ const COptions = extern struct {
     /// ROADMAP.md), since trailing unneeded fields are never scanned at
     /// all rather than split-then-discarded.
     max_column: i64 = -1,
+    /// Non-zero returns the COMPLEMENT of `where` — every row the filter
+    /// REJECTS. Added last in the struct so a caller that zero-fills
+    /// COptions (every existing one does) keeps today's behaviour
+    /// without knowing this field exists.
+    negate: c_int = 0,
 };
 
 /// Owns everything needed to answer scanio_next()/scanio_count() calls:
@@ -108,17 +127,56 @@ const Ctx = struct {
     /// NUL-terminated header column names, built once at open() — small
     /// and fixed-size, unlike row fields, so no reuse/grow logic needed.
     header_cstrs: [][:0]u8 = &.{},
-
-    fn ensureFieldCapacity(self: *Ctx, n: usize) void {
-        if (n <= self.field_cstrs.len) return;
-        const old_len = self.field_cstrs.len;
-        const grown_cstrs = c_allocator.realloc(self.field_cstrs, n) catch return;
-        self.field_cstrs = grown_cstrs;
-        for (self.field_cstrs[old_len..]) |*slot| slot.* = &.{};
-        const grown_ptrs = c_allocator.realloc(self.field_ptrs, n) catch return;
-        self.field_ptrs = grown_ptrs;
-    }
 };
+
+/// Grows the reused per-field buffers (`field_cstrs`/`field_ptrs`) to
+/// hold at least `n` fields. Returns false if a growth allocation
+/// failed.
+///
+/// Callers MUST bail out on false. The three copies of this that used to
+/// live on Ctx/TopkCtx/OrderByCtx returned void and simply left the old,
+/// smaller arrays in place on OOM — and every caller then went straight
+/// on to index field_cstrs[i]/field_ptrs[i] up to the row's field count,
+/// i.e. an out-of-bounds heap write on exactly the path that was
+/// supposed to be handling the failure.
+///
+/// Each array is grown independently and re-checked on entry, so a
+/// partial success (cstrs grown, ptrs not) can't be mistaken for "big
+/// enough" by the next call.
+fn growFieldBuffers(field_cstrs: *[][]u8, field_ptrs: *[][*:0]const u8, n: usize) bool {
+    if (n > field_cstrs.len) {
+        const old_len = field_cstrs.len;
+        const grown = c_allocator.realloc(field_cstrs.*, n) catch return false;
+        field_cstrs.* = grown;
+        for (field_cstrs.*[old_len..]) |*slot| slot.* = &.{};
+    }
+    if (n > field_ptrs.len) {
+        const grown = c_allocator.realloc(field_ptrs.*, n) catch return false;
+        field_ptrs.* = grown;
+    }
+    return true;
+}
+
+/// Undoes everything scanio_open() allocated before it built its Ctx.
+/// Every one of open()'s failure paths needs exactly this pair, and
+/// several of them used to free `predicates` alone and leak all the
+/// IN-value copies.
+fn freeOpenPredicates(predicates: []Predicate, in_values: [][]const []const u8) void {
+    if (predicates.len > 0) c_allocator.free(predicates);
+    freeInValues(in_values);
+}
+
+/// Frees the owned IN-predicate value copies built by scanio_open() —
+/// the per-value dupes, each predicate's value array, and the outer
+/// array. Shared by scanio_close() and open()'s own failure paths, which
+/// used to free `predicates` but silently leak all of this.
+fn freeInValues(in_values: [][]const []const u8) void {
+    for (in_values) |vals| {
+        for (vals) |v| c_allocator.free(@constCast(v));
+        if (vals.len > 0) c_allocator.free(@constCast(vals));
+    }
+    if (in_values.len > 0) c_allocator.free(in_values);
+}
 
 pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx {
     clearError();
@@ -150,15 +208,23 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
                     const cvals = cp.values.?[0..cp.n_values];
                     const owned = c_allocator.alloc([]const u8, cvals.len) catch {
                         setError("out of memory allocating IN values", .{});
+                        freeOpenPredicates(predicates, in_values);
                         return null;
                     };
+                    // Zeroed and handed to in_values BEFORE it's filled:
+                    // that makes a half-built `owned` (a dupe below
+                    // failing partway) freeable by the same one-line
+                    // cleanup as everything else, instead of the silent
+                    // leak of every already-duplicated value it was.
+                    @memset(owned, &.{});
+                    in_values[i] = owned;
                     for (cvals, 0..) |cv, j| {
                         owned[j] = c_allocator.dupe(u8, std.mem.span(cv)) catch {
                             setError("out of memory allocating IN values", .{});
+                            freeOpenPredicates(predicates, in_values);
                             return null;
                         };
                     }
-                    in_values[i] = owned;
                     predicates[i] = Predicate.initIn(cp.column, owned);
                     continue;
                 }
@@ -179,21 +245,24 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
     }
 
     const stop_after_column: ?usize = if (options) |o| (if (o.max_column >= 0) @intCast(o.max_column) else null) else null;
+    const negate: bool = if (options) |o| o.negate != 0 else false;
 
     const ctx = c_allocator.create(Ctx) catch {
         setError("out of memory allocating scanner context", .{});
+        freeOpenPredicates(predicates, in_values);
         return null;
     };
     ctx.* = .{
         .query = Query.open(c_allocator, std.mem.span(p), .{
             .columns = columns,
             .where = predicates,
+            .negate = negate,
             .limit = limit,
             .stop_after_column = stop_after_column,
         }) catch |e| {
             setError("open failed: {s}", .{@errorName(e)});
             c_allocator.destroy(ctx);
-            if (predicates.len > 0) c_allocator.free(predicates);
+            freeOpenPredicates(predicates, in_values);
             return null;
         },
         .predicates = predicates,
@@ -205,13 +274,22 @@ pub export fn scanio_open(path: ?[*:0]const u8, options: ?*const COptions) ?*Ctx
         setError("out of memory allocating header", .{});
         ctx.query.deinit();
         c_allocator.destroy(ctx);
-        if (predicates.len > 0) c_allocator.free(predicates);
+        freeOpenPredicates(predicates, in_values);
         return null;
     };
     for (header, 0..) |name, i| {
         ctx.header_cstrs[i] = c_allocator.allocSentinel(u8, name.len, 0) catch {
             setError("out of memory allocating header", .{});
-            return null; // ctx now partially initialized; leaked on this rare OOM path, not worth the extra bookkeeping.
+            // Unwinding by hand rather than via scanio_close(): the
+            // header_cstrs entries past `i` are still uninitialized, so
+            // close()'s "free every entry" loop would free garbage
+            // pointers. (This path used to just leak the whole Ctx.)
+            for (ctx.header_cstrs[0..i]) |buf| c_allocator.free(buf);
+            c_allocator.free(ctx.header_cstrs);
+            ctx.query.deinit();
+            freeOpenPredicates(predicates, in_values);
+            c_allocator.destroy(ctx);
+            return null;
         };
         @memcpy(ctx.header_cstrs[i], name);
     }
@@ -248,7 +326,10 @@ export fn scanio_next(ctx: ?*Ctx, out_fields: ?*[*]const [*:0]const u8, out_n: ?
         return -1;
     } orelse return 0;
 
-    c.ensureFieldCapacity(row.fields.len);
+    if (!growFieldBuffers(&c.field_cstrs, &c.field_ptrs, row.fields.len)) {
+        setError("out of memory growing field buffers", .{});
+        return -1;
+    }
     for (row.fields, 0..) |field, i| {
         if (c.field_cstrs[i].len < field.len + 1) {
             const grown = c_allocator.realloc(c.field_cstrs[i], field.len + 1) catch {
@@ -330,16 +411,6 @@ const TopkCtx = struct {
     index: usize = 0,
     field_cstrs: [][]u8 = &.{},
     field_ptrs: [][*:0]const u8 = &.{},
-
-    fn ensureFieldCapacity(self: *TopkCtx, n: usize) void {
-        if (n <= self.field_cstrs.len) return;
-        const old_len = self.field_cstrs.len;
-        const grown_cstrs = c_allocator.realloc(self.field_cstrs, n) catch return;
-        self.field_cstrs = grown_cstrs;
-        for (self.field_cstrs[old_len..]) |*slot| slot.* = &.{};
-        const grown_ptrs = c_allocator.realloc(self.field_ptrs, n) catch return;
-        self.field_ptrs = grown_ptrs;
-    }
 };
 
 /// Runs top-K over the REST of ctx's rows (same drains-the-query
@@ -380,7 +451,10 @@ export fn scanio_topk_next(tctx: ?*TopkCtx, out_fields: ?*[*]const [*:0]const u8
     const entry = t.sorted[t.index];
     t.index += 1;
 
-    t.ensureFieldCapacity(entry.row.fields.len);
+    if (!growFieldBuffers(&t.field_cstrs, &t.field_ptrs, entry.row.fields.len)) {
+        setError("out of memory growing field buffers", .{});
+        return -1;
+    }
     for (entry.row.fields, 0..) |field, i| {
         if (t.field_cstrs[i].len < field.len + 1) {
             const grown = c_allocator.realloc(t.field_cstrs[i], field.len + 1) catch {
@@ -420,16 +494,6 @@ const OrderByCtx = struct {
     index: usize = 0,
     field_cstrs: [][]u8 = &.{},
     field_ptrs: [][*:0]const u8 = &.{},
-
-    fn ensureFieldCapacity(self: *OrderByCtx, n: usize) void {
-        if (n <= self.field_cstrs.len) return;
-        const old_len = self.field_cstrs.len;
-        const grown_cstrs = c_allocator.realloc(self.field_cstrs, n) catch return;
-        self.field_cstrs = grown_cstrs;
-        for (self.field_cstrs[old_len..]) |*slot| slot.* = &.{};
-        const grown_ptrs = c_allocator.realloc(self.field_ptrs, n) catch return;
-        self.field_ptrs = grown_ptrs;
-    }
 };
 
 /// Runs ORDER BY over the REST of ctx's rows (same drains-the-query
@@ -472,7 +536,10 @@ export fn scanio_order_by_next(octx: ?*OrderByCtx, out_fields: ?*[*]const [*:0]c
     const row = o.result.rows[o.index];
     o.index += 1;
 
-    o.ensureFieldCapacity(row.fields.len);
+    if (!growFieldBuffers(&o.field_cstrs, &o.field_ptrs, row.fields.len)) {
+        setError("out of memory growing field buffers", .{});
+        return -1;
+    }
     for (row.fields, 0..) |field, i| {
         if (o.field_cstrs[i].len < field.len + 1) {
             const grown = c_allocator.realloc(o.field_cstrs[i], field.len + 1) catch {
@@ -759,6 +826,7 @@ export fn scanio_parallel_collect_columnar(
     delimiter: u8,
     where: ?[*]const CPredicate,
     n_where: usize,
+    negate: c_int,
     num_threads: usize,
 ) ?*CollectColumnarCtx {
     clearError();
@@ -831,7 +899,7 @@ export fn scanio_parallel_collect_columnar(
     // just takes ownership of its output directly — zero re-copy, since
     // CollectColumnarCtx.columns IS scan.ColumnBuf, not a
     // separate type that needs converting.
-    var result = scan.parallelScanColumnar(c_allocator, std.mem.span(p), delimiter, predicates, num_threads) catch |e| {
+    var result = scan.parallelScanColumnar(c_allocator, std.mem.span(p), delimiter, predicates, negate != 0, num_threads) catch |e| {
         setError("parallel scan failed: {s}", .{@errorName(e)});
         return null;
     };
@@ -845,6 +913,246 @@ export fn scanio_parallel_collect_columnar(
     return cc;
 }
 
+// ── validation ───────────────────────────────────────────────────────
+//
+// Two entry points, matching the two ways an import is actually run.
+// `scanio_validate` is the pre-flight report: one pass, a summary, no
+// rows. `scanio_validator_open/next/close` is the import itself: every
+// row handed back with its failures attached, so the caller writes the
+// good ones to its target and the bad ones to a rejects file in the same
+// pass — never materializing either.
+//
+// Rules are parsed and evaluated in Zig, from a JSON schema. That is the
+// point of putting this behind the C ABI rather than composing it in
+// each binding, the way profile()/describe() are composed: three clients
+// re-implementing "is this an integer" is three subtly different
+// answers, and an import that passes in Python and fails in Node is
+// worse than no validation at all.
+
+const ValidationReport = struct {
+    report: scan.Report,
+    json: [:0]u8,
+};
+
+/// Runs a full validation pass and returns a handle owning the report
+/// JSON. `max_errors` bounds what the report STORES, never what it
+/// counts — pass 0 for the default.
+export fn scanio_validate(
+    path: ?[*:0]const u8,
+    schema_json: ?[*:0]const u8,
+    max_errors: usize,
+) ?*ValidationReport {
+    clearError();
+    const p = path orelse {
+        setError("path is null", .{});
+        return null;
+    };
+    const sj = schema_json orelse {
+        setError("schema_json is null", .{});
+        return null;
+    };
+
+    var report = scan.validateJson(c_allocator, std.mem.span(p), std.mem.span(sj), .{
+        .max_errors = if (max_errors == 0) 100 else max_errors,
+    }) catch |e| {
+        setError("validate failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    errdefer report.deinit();
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    scan.writeReportJson(&aw.writer, report) catch {
+        setError("out of memory rendering report", .{});
+        report.deinit();
+        return null;
+    };
+    const json = c_allocator.dupeZ(u8, aw.written()) catch {
+        setError("out of memory rendering report", .{});
+        report.deinit();
+        return null;
+    };
+
+    const handle = c_allocator.create(ValidationReport) catch {
+        setError("out of memory", .{});
+        c_allocator.free(json);
+        report.deinit();
+        return null;
+    };
+    handle.* = .{ .report = report, .json = json };
+    return handle;
+}
+
+export fn scanio_validate_json(vr: ?*ValidationReport) ?[*:0]const u8 {
+    const h = vr orelse return null;
+    return h.json.ptr;
+}
+
+export fn scanio_validate_free(vr: ?*ValidationReport) void {
+    const h = vr orelse return;
+    c_allocator.free(h.json);
+    h.report.deinit();
+    c_allocator.destroy(h);
+}
+
+const ValidatorCtx = struct {
+    validator: scan.Validator,
+    field_cstrs: [][]u8 = &.{},
+    field_ptrs: [][*:0]const u8 = &.{},
+    /// Reused across rows: rendered only for a row that actually failed,
+    /// so a clean file never builds a single one of these.
+    errors_json: std.ArrayListUnmanaged(u8) = .{},
+    /// NUL-terminated header names. Its own copy rather than a borrow of
+    /// the Validator's header, so a caller can read column names after
+    /// the scan has run to completion.
+    header_cstrs: [][:0]u8 = &.{},
+};
+
+export fn scanio_validator_open(path: ?[*:0]const u8, schema_json: ?[*:0]const u8) ?*ValidatorCtx {
+    clearError();
+    const p = path orelse {
+        setError("path is null", .{});
+        return null;
+    };
+    const sj = schema_json orelse {
+        setError("schema_json is null", .{});
+        return null;
+    };
+
+    const ctx = c_allocator.create(ValidatorCtx) catch {
+        setError("out of memory", .{});
+        return null;
+    };
+    ctx.* = .{ .validator = scan.Validator.openJson(c_allocator, std.mem.span(p), std.mem.span(sj)) catch |e| {
+        c_allocator.destroy(ctx);
+        setError("cannot open validator: {s}", .{@errorName(e)});
+        return null;
+    } };
+
+    const header = ctx.validator.header();
+    ctx.header_cstrs = c_allocator.alloc([:0]u8, header.len) catch {
+        setError("out of memory", .{});
+        scanio_validator_close(ctx);
+        return null;
+    };
+    for (header, 0..) |name, i| {
+        ctx.header_cstrs[i] = c_allocator.allocSentinel(u8, name.len, 0) catch {
+            setError("out of memory copying header", .{});
+            // Entries past `i` are uninitialized, so trim before the
+            // close routine walks the slice.
+            ctx.header_cstrs = ctx.header_cstrs[0..i];
+            scanio_validator_close(ctx);
+            return null;
+        };
+        @memcpy(ctx.header_cstrs[i], name);
+    }
+    return ctx;
+}
+
+export fn scanio_validator_column_name(vctx: ?*ValidatorCtx, index: usize) ?[*:0]const u8 {
+    const c = vctx orelse return null;
+    if (index >= c.header_cstrs.len) return null;
+    return c.header_cstrs[index].ptr;
+}
+
+/// 1 = a row was produced, 0 = end of file, -1 = error.
+///
+/// `out_errors_json` is set to NULL for a valid row — the common case,
+/// and the one that must stay allocation-free.
+export fn scanio_validator_next(
+    vctx: ?*ValidatorCtx,
+    out_fields: ?*[*]const [*:0]const u8,
+    out_n: ?*usize,
+    out_errors_json: ?*?[*:0]const u8,
+    out_row_number: ?*u64,
+) c_int {
+    clearError();
+    const c = vctx orelse {
+        setError("validator is null", .{});
+        return -1;
+    };
+    const vr = c.validator.next() catch |e| {
+        setError("validate failed: {s}", .{@errorName(e)});
+        return -1;
+    } orelse return 0;
+
+    if (!growFieldBuffers(&c.field_cstrs, &c.field_ptrs, vr.row.fields.len)) {
+        setError("out of memory growing field buffers", .{});
+        return -1;
+    }
+    for (vr.row.fields, 0..) |field, i| {
+        if (c.field_cstrs[i].len < field.len + 1) {
+            const grown = c_allocator.realloc(c.field_cstrs[i], field.len + 1) catch {
+                setError("out of memory copying row", .{});
+                return -1;
+            };
+            c.field_cstrs[i] = grown;
+        }
+        @memcpy(c.field_cstrs[i][0..field.len], field);
+        c.field_cstrs[i][field.len] = 0;
+        c.field_ptrs[i] = @ptrCast(c.field_cstrs[i].ptr);
+    }
+
+    if (out_fields) |of| of.* = c.field_ptrs.ptr;
+    if (out_n) |on| on.* = vr.row.fields.len;
+    if (out_row_number) |orn| orn.* = vr.number;
+
+    if (out_errors_json) |oej| {
+        if (vr.errors.len == 0) {
+            oej.* = null;
+        } else {
+            c.errors_json.clearRetainingCapacity();
+            var aw = std.io.Writer.Allocating.fromArrayList(c_allocator, &c.errors_json);
+            scan.writeRowErrorsJson(&aw.writer, vr.errors) catch {
+                c.errors_json = aw.toArrayList();
+                setError("out of memory rendering row errors", .{});
+                return -1;
+            };
+            c.errors_json = aw.toArrayList();
+            c.errors_json.append(c_allocator, 0) catch {
+                setError("out of memory rendering row errors", .{});
+                return -1;
+            };
+            oej.* = @ptrCast(c.errors_json.items.ptr);
+        }
+    }
+    return 1;
+}
+
+export fn scanio_validator_rows_total(vctx: ?*ValidatorCtx) u64 {
+    const c = vctx orelse return 0;
+    return c.validator.row_number;
+}
+
+export fn scanio_validator_rows_valid(vctx: ?*ValidatorCtx) u64 {
+    const c = vctx orelse return 0;
+    return c.validator.rows_valid;
+}
+
+export fn scanio_validator_rows_invalid(vctx: ?*ValidatorCtx) u64 {
+    const c = vctx orelse return 0;
+    return c.validator.rows_invalid;
+}
+
+export fn scanio_validator_n_columns(vctx: ?*ValidatorCtx) usize {
+    const c = vctx orelse return 0;
+    return c.validator.header().len;
+}
+
+export fn scanio_validator_close(vctx: ?*ValidatorCtx) void {
+    const c = vctx orelse return;
+    c.validator.deinit();
+    c.errors_json.deinit(c_allocator);
+    for (c.header_cstrs) |buf| c_allocator.free(buf);
+    if (c.header_cstrs.len > 0) c_allocator.free(c.header_cstrs);
+    for (c.field_cstrs) |buf| {
+        if (buf.len > 0) c_allocator.free(buf);
+    }
+    if (c.field_cstrs.len > 0) c_allocator.free(c.field_cstrs);
+    if (c.field_ptrs.len > 0) c_allocator.free(c.field_ptrs);
+    c_allocator.destroy(c);
+}
+
 pub export fn scanio_close(ctx: ?*Ctx) void {
     const c = ctx orelse return;
     c.query.deinit();
@@ -854,11 +1162,7 @@ pub export fn scanio_close(ctx: ?*Ctx) void {
     if (c.field_cstrs.len > 0) c_allocator.free(c.field_cstrs);
     if (c.field_ptrs.len > 0) c_allocator.free(c.field_ptrs);
     if (c.predicates.len > 0) c_allocator.free(c.predicates);
-    for (c.in_values) |vals| {
-        for (vals) |v| c_allocator.free(@constCast(v));
-        if (vals.len > 0) c_allocator.free(@constCast(vals));
-    }
-    if (c.in_values.len > 0) c_allocator.free(c.in_values);
+    freeInValues(c.in_values);
     for (c.header_cstrs) |buf| c_allocator.free(buf);
     if (c.header_cstrs.len > 0) c_allocator.free(c.header_cstrs);
     c_allocator.destroy(c);
@@ -1206,7 +1510,7 @@ test "C ABI: scanio_parallel_collect_columnar matches scanio_collect_columnar on
     defer scanio_collect_columnar_close(single);
     scanio_close(ctx);
 
-    const par = scanio_parallel_collect_columnar(path, ',', &preds, 1, 4);
+    const par = scanio_parallel_collect_columnar(path, ',', &preds, 1, 0, 4);
     try std.testing.expect(par != null);
     defer scanio_collect_columnar_close(par);
 
@@ -1252,4 +1556,302 @@ test "C ABI: max_column bounds the row without breaking the result" {
     try std.testing.expectEqual(@as(c_int, 1), scanio_next(ctx, &fields, &n));
     try std.testing.expectEqualStrings("2", std.mem.span(fields[0]));
     try std.testing.expectEqual(@as(c_int, 0), scanio_next(ctx, &fields, &n));
+}
+
+test "C ABI: validate returns a JSON report and frees cleanly" {
+    const path = "test_c_api_validate.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,10\nx,20\n2,-5\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const v = scanio_validate(path, "{\"id\":{\"type\":\"integer\"},\"amount\":{\"min\":0}}", 0);
+    try std.testing.expect(v != null);
+    defer scanio_validate_free(v);
+
+    const json = std.mem.span(scanio_validate_json(v).?);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rows_total\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rows_valid\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"bad_type\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"below_min\":1") != null);
+}
+
+test "C ABI: a bad schema fails the call rather than validating nothing" {
+    const path = "test_c_api_validate_bad.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id\n1\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    try std.testing.expect(scanio_validate(path, "{\"nope\":{\"required\":true}}", 0) == null);
+    try std.testing.expect(scanio_last_error() != null);
+    try std.testing.expect(scanio_validate(path, "{\"id\":{\"requred\":true}}", 0) == null);
+    try std.testing.expect(scanio_validator_open(path, "not json") == null);
+}
+
+test "C ABI: the streaming validator hands back each row with its errors" {
+    const path = "test_c_api_validator.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,10\nx,20\n3,30\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const v = scanio_validator_open(path, "{\"id\":{\"type\":\"integer\"}}");
+    try std.testing.expect(v != null);
+    defer scanio_validator_close(v);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    var errors: ?[*:0]const u8 = null;
+    var row_no: u64 = 0;
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_validator_next(v, &fields, &n, &errors, &row_no));
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u64, 1), row_no);
+    // A valid row costs nothing: no error JSON is built at all.
+    try std.testing.expect(errors == null);
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_validator_next(v, &fields, &n, &errors, &row_no));
+    try std.testing.expectEqual(@as(u64, 2), row_no);
+    try std.testing.expect(errors != null);
+    const ej = std.mem.span(errors.?);
+    try std.testing.expect(std.mem.indexOf(u8, ej, "\"rule\":\"bad_type\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ej, "\"value\":\"x\"") != null);
+    // The row itself is still there — an importer needs it for a
+    // rejects file, not just the reason.
+    try std.testing.expectEqualStrings("x", std.mem.span(fields[0]));
+
+    try std.testing.expectEqual(@as(c_int, 1), scanio_validator_next(v, &fields, &n, &errors, &row_no));
+    try std.testing.expect(errors == null); // reset, not left over from the bad row
+
+    try std.testing.expectEqual(@as(c_int, 0), scanio_validator_next(v, &fields, &n, &errors, &row_no));
+    try std.testing.expectEqual(@as(u64, 3), scanio_validator_rows_total(v));
+    try std.testing.expectEqual(@as(u64, 2), scanio_validator_rows_valid(v));
+    try std.testing.expectEqual(@as(u64, 1), scanio_validator_rows_invalid(v));
+    try std.testing.expectEqual(@as(usize, 2), scanio_validator_n_columns(v));
+}
+
+test "C ABI: validation entry points tolerate null arguments" {
+    try std.testing.expect(scanio_validate(null, "{}", 0) == null);
+    try std.testing.expect(scanio_validate("x.csv", null, 0) == null);
+    try std.testing.expect(scanio_validator_open(null, "{}") == null);
+    try std.testing.expect(scanio_validate_json(null) == null);
+    scanio_validate_free(null);
+    scanio_validator_close(null);
+    try std.testing.expectEqual(@as(c_int, -1), scanio_validator_next(null, null, null, null, null));
+    try std.testing.expectEqual(@as(u64, 0), scanio_validator_rows_total(null));
+}
+
+test "C ABI: negate returns the complement, and zero-filled options keep the old behaviour" {
+    const path = "test_c_api_negate.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,city\n1,London\n2,Paris\n3,London\n4,Berlin\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var pred = CPredicate{ .column = 1, .op = 0, .value = "London", .values = null, .n_values = 0 };
+
+    // The field is last in COptions and defaults to 0, so a caller built
+    // before it existed gets exactly what it always got.
+    var keep_opts = COptions{ .columns = null, .n_columns = 0, .where = @ptrCast(&pred), .n_where = 1, .limit = -1 };
+    const keep = scanio_open(path, &keep_opts);
+    try std.testing.expect(keep != null);
+    try std.testing.expectEqual(@as(i64, 2), scanio_count(keep));
+    scanio_close(keep);
+
+    var drop_opts = COptions{ .columns = null, .n_columns = 0, .where = @ptrCast(&pred), .n_where = 1, .limit = -1, .negate = 1 };
+    const drop = scanio_open(path, &drop_opts);
+    try std.testing.expect(drop != null);
+
+    var fields: [*]const [*:0]const u8 = undefined;
+    var n: usize = 0;
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next(drop, &fields, &n));
+    try std.testing.expectEqualStrings("Paris", std.mem.span(fields[1]));
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next(drop, &fields, &n));
+    try std.testing.expectEqualStrings("Berlin", std.mem.span(fields[1]));
+    try std.testing.expectEqual(@as(c_int, 0), scanio_next(drop, &fields, &n));
+    scanio_close(drop);
+}
+
+test "C ABI: the parallel columnar path takes the same flag" {
+    const path = "test_c_api_negate_par.csv";
+    var data = std.ArrayListUnmanaged(u8){};
+    defer data.deinit(c_allocator);
+    try data.appendSlice(c_allocator, "id,city\n");
+    const cities = [_][]const u8{ "London", "Paris" };
+    for (0..600) |i| try data.writer(c_allocator).print("{d},{s}\n", .{ i, cities[i % 2] });
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var pred = CPredicate{ .column = 1, .op = 0, .value = "London", .values = null, .n_values = 0 };
+    const kept = scanio_parallel_collect_columnar(path, ',', @ptrCast(&pred), 1, 0, 4);
+    try std.testing.expect(kept != null);
+    defer scanio_collect_columnar_close(kept);
+    const dropped = scanio_parallel_collect_columnar(path, ',', @ptrCast(&pred), 1, 1, 4);
+    try std.testing.expect(dropped != null);
+    defer scanio_collect_columnar_close(dropped);
+
+    try std.testing.expectEqual(@as(usize, 300), scanio_collect_columnar_n_rows(kept));
+    try std.testing.expectEqual(@as(usize, 300), scanio_collect_columnar_n_rows(dropped));
+}
+
+// Owned batch storage is independent of the scanner lifetime.
+const Batch = struct { json: []u8 };
+
+fn readBatch(source: anytype, comptime validated: bool, max_rows: usize, target_bytes: usize, out: ?*?*Batch) c_int {
+    clearError();
+    const output = out orelse {
+        setError("batch output is null", .{});
+        return -1;
+    };
+    output.* = null;
+    const json = scan.batch.readJson(c_allocator, source, validated, .{ .max_rows = max_rows, .target_bytes = target_bytes }) catch |e| {
+        setError("batch failed: {s}", .{@errorName(e)});
+        return -1;
+    } orelse return 0;
+    const batch = c_allocator.create(Batch) catch {
+        c_allocator.free(json);
+        setError("out of memory allocating batch", .{});
+        return -1;
+    };
+    batch.* = .{ .json = json };
+    output.* = batch;
+    return 1;
+}
+
+pub export fn scanio_next_batch(ctx: ?*Ctx, max_rows: usize, target_bytes: usize, out: ?*?*Batch) c_int {
+    const c = ctx orelse {
+        if (out) |o| o.* = null;
+        setError("scanner is null", .{});
+        return -1;
+    };
+    return readBatch(&c.query, false, max_rows, target_bytes, out);
+}
+
+pub export fn scanio_validator_next_batch(ctx: ?*ValidatorCtx, max_rows: usize, target_bytes: usize, out: ?*?*Batch) c_int {
+    const c = ctx orelse {
+        if (out) |o| o.* = null;
+        setError("validator is null", .{});
+        return -1;
+    };
+    return readBatch(&c.validator, true, max_rows, target_bytes, out);
+}
+
+pub export fn scanio_batch_json(batch: ?*const Batch, out_len: ?*usize) ?[*]const u8 {
+    if (out_len) |n| n.* = if (batch) |b| b.json.len else 0;
+    return if (batch) |b| b.json.ptr else null;
+}
+
+pub export fn scanio_batch_free(batch: ?*Batch) void {
+    if (batch) |b| {
+        c_allocator.free(b.json);
+        c_allocator.destroy(b);
+    }
+}
+
+test "C ABI: batches own their data after scanner close" {
+    const path = "test_batch_owned.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a,b\n1,one\n2,two\n3,three\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+    const ctx = scanio_open(path, null).?;
+    var closed = false;
+    defer if (!closed) scanio_close(ctx);
+    var batch: ?*Batch = null;
+    try std.testing.expectEqual(@as(c_int, -1), scanio_next_batch(ctx, 0, 1024, &batch));
+    try std.testing.expect(batch == null);
+    try std.testing.expectEqual(@as(c_int, -1), scanio_next_batch(ctx, 2, 1024, null));
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next_batch(ctx, 2, 1024, &batch));
+    const first = batch.?;
+    defer scanio_batch_free(first);
+    try std.testing.expectEqual(@as(c_int, 1), scanio_next_batch(ctx, 2, 1024, &batch));
+    const last = batch.?;
+    defer scanio_batch_free(last);
+    try std.testing.expectEqual(@as(c_int, 0), scanio_next_batch(ctx, 2, 1024, &batch));
+    try std.testing.expect(batch == null);
+    scanio_close(ctx);
+    closed = true;
+    var len: usize = 0;
+    const json = scanio_batch_json(first, &len).?;
+    try std.testing.expectEqualStrings("[[\"1\",\"one\"],[\"2\",\"two\"]]", json[0..len]);
+    const tail = scanio_batch_json(last, &len).?;
+    try std.testing.expectEqualStrings("[[\"3\",\"three\"]]", tail[0..len]);
+    scanio_batch_free(null);
+}
+
+test "C ABI: validation batches preserve totals and errors" {
+    const path = "test_batch_validation.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "a\n1\nbad\n3\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+    const ctx = scanio_validator_open(path, "{\"a\":{\"type\":\"integer\"}}").?;
+    defer scanio_validator_close(ctx);
+    var batch: ?*Batch = null;
+    try std.testing.expectEqual(@as(c_int, 1), scanio_validator_next_batch(ctx, 8192, 1024, &batch));
+    defer scanio_batch_free(batch);
+    try std.testing.expectEqual(@as(u64, 3), scanio_validator_rows_total(ctx));
+    try std.testing.expectEqual(@as(u64, 1), scanio_validator_rows_invalid(ctx));
+    var len: usize = 0;
+    const json = scanio_batch_json(batch, &len).?;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json[0..len], .{});
+    defer parsed.deinit();
+    const errors = parsed.value.array.items[1].object.get("errors").?.array.items;
+    try std.testing.expectEqualStrings("bad_type", errors[0].object.get("rule").?.string);
+    try std.testing.expectEqual(@as(i64, 2), errors[0].object.get("row").?.integer);
+}
+
+pub export fn scanio_validate_to_files(path: ?[*:0]const u8, schema_json: ?[*:0]const u8, accepted: ?[*:0]const u8, rejected: ?[*:0]const u8, out: ?*scan.validation_import.Stats) c_int {
+    clearError();
+    if (out) |result| result.* = .{};
+    if (path == null or schema_json == null or accepted == null or rejected == null or out == null) {
+        setError("validate_to_files requires input, schema, two outputs and stats", .{});
+        return -1;
+    }
+    out.?.* = scan.validation_import.run(c_allocator, std.mem.span(path.?), std.mem.span(schema_json.?), std.mem.span(accepted.?), std.mem.span(rejected.?)) catch |e| {
+        setError("validate_to_files failed: {s}", .{@errorName(e)});
+        return -1;
+    };
+    return 0;
+}
+
+/// Path when format=0; borrowed bytes when format=1 (CSV) or 2 (JSON).
+/// The returned JSON belongs to the caller until scanio_outcome_free.
+export fn scanio_validate_outcome(input: ?[*]const u8, input_len: usize, schema_json: ?[*:0]const u8, format: c_int, full: c_int) ?[*:0]const u8 {
+    clearError();
+    const data = input orelse {
+        setError("input is null", .{});
+        return null;
+    };
+    const schema = schema_json orelse {
+        setError("schema is null", .{});
+        return null;
+    };
+    if (format < 0 or format > 2 or (full != 0 and full != 1)) {
+        setError("invalid validation options", .{});
+        return null;
+    }
+    var validator = (if (format == 0)
+        scan.Validator.openJson(c_allocator, data[0..input_len], std.mem.span(schema))
+    else
+        scan.Validator.fromBytesJson(c_allocator, data[0..input_len], if (format == 1) .csv else .ndjson, std.mem.span(schema))) catch |e| {
+        setError("validate failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    defer validator.deinit();
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+    validator.writeOutcome(&aw.writer, full == 1) catch |e| {
+        setError("validate failed: {s}", .{@errorName(e)});
+        return null;
+    };
+    const result = c_allocator.dupeZ(u8, aw.written()) catch {
+        setError("out of memory", .{});
+        return null;
+    };
+    return result.ptr;
+}
+
+export fn scanio_outcome_free(result: ?[*:0]const u8) void {
+    if (result) |ptr| c_allocator.free(std.mem.span(ptr));
+}
+
+test "validation outcome ABI options and ownership" {
+    try std.testing.expect(scanio_validate_outcome(null, 0, "{}", 1, 0) == null);
+    try std.testing.expect(scanio_validate_outcome("a\n", 2, null, 1, 0) == null);
+    try std.testing.expect(scanio_validate_outcome("a\n", 2, "{}", 3, 0) == null);
+    try std.testing.expect(scanio_validate_outcome("a\n", 2, "{}", 1, 2) == null);
+    const result = scanio_validate_outcome("a\n1\n", 4, "{}", 1, 0) orelse return error.UnexpectedNull;
+    defer scanio_outcome_free(result);
+    try std.testing.expectEqualStrings("true", std.mem.span(result));
+    scanio_outcome_free(null);
 }

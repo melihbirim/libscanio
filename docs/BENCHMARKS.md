@@ -161,6 +161,95 @@ See [DESIGN.md](DESIGN.md) for the full chunked-read rationale and the
 CSV/NDJSON/JSON-array before-and-after numbers (196x, 29x, and 26x less
 peak RSS respectively, at 0-50% time cost depending on format).
 
+## Ecosystem comparison — equivalent workloads
+
+`bench/compare.py` separates three contracts. Compare engines **within a
+category**, rather than treating a count, a Python iterator, and an Arrow
+table as interchangeable outputs.
+
+| Category | Required result | Engines |
+|---|---|---|
+| Filtered count | One scalar count; no matching table collected | libscanio CLI/Python/Node, PyArrow `count_rows`, Polars `select(pl.len())` |
+| Materialized Arrow | All matching rows, all eight columns, string values, retained in an Arrow table | libscanio `scan_table(infer_types=False)`, PyArrow `to_table`, Polars `collect().to_arrow()`, optional Arrow JS + parser |
+| Streaming import | Consume each matching row and all eight fields; sum their string lengths without retaining the result | libscanio Python/Node, PyArrow batches, Polars batches, Python csv/json, Node readline |
+
+The Arrow group measures logical string columns (Arrow string or large
+string), including conversion into Arrow where required. Both CSV and
+NDJSON fixtures contain the same string values. This is an import/text
+workload, **not a numeric analytics benchmark**. Type inference is disabled
+or replaced with an explicit schema in the competing table readers.
+The Node baseline parses only this fixture's unquoted CSV; it is not a
+production CSV parser. Arrow JS includes CSV/JSON parsing and pivoting
+objects into columns, so its label names that complete pipeline.
+
+The streaming group uses one identical Python checksum loop for libscanio,
+Polars, PyArrow, and native Python. Polars uses `collect_batches()` followed
+by `iter_rows(named=True)`; PyArrow uses `scanner().to_batches()` followed
+by `batch.to_pylist()`. Batch-to-row conversion is timed, and batches are
+consumed incrementally without collecting the complete result.
+`--batch-size` defaults to 8,192 rows for both adapters. PyArrow batch and
+fragment read-ahead are zero; Polars uses `lazy=True`, `maintain_order=True`,
+and `engine="streaming"`, with internal buffering managed by Polars.
+These settings appear in Markdown and JSON output. A batch size is not a
+total memory ceiling: parsers, worker buffers, and Python row conversion
+also contribute to RSS. Polars currently marks `collect_batches()` as
+unstable; CI pins the tested version.
+
+Each table reports two distinct timing boundaries:
+
+- **Cold process:** launch, imports, query, output, and process exit.
+- **Warm query:** a second query in a separate process after one untimed
+  query; imports and warmup are excluded. Query construction and Arrow
+  conversion are included. The CLI has no persistent query API, so its
+  warm result is N/A.
+- **Peak RSS (MiB):** the cold process's lifetime maximum, including
+  runtime/import memory. Warm RSS is deliberately not mixed into it.
+
+OS caches are not cleared: cold means a fresh process, not cold storage.
+Every engine uses its default threading. Results are medians across
+`--reps` fresh processes for each timing mode. Engines run sequentially;
+small differences can reflect cache/order/CPU variation. No timing gate
+is enforced in CI.
+
+Every repetition must match an independent fixture-derived row count;
+streaming consumers must also match a checksum covering every field.
+Small-fixture tests check exact Arrow values across engines. An installed
+engine failing, missing output, or any mismatch makes the run fail.
+Unavailable optional dependencies are recorded as skipped. The 40 MiB CI
+ceiling applies only to libscanio's CLI/Python count and streaming paths,
+not materialized tables or the Node runtime.
+
+Reproduce:
+
+```bash
+python -m pip install polars==1.44.1 pyarrow==25.0.1
+zig build bench-compare -Doptimize=ReleaseFast -- --rows 200000 --reps 3
+# Select a category or stable engine IDs:
+python bench/compare.py --workloads arrow --engines libscanio-python,pyarrow,polars
+# Optional JavaScript Arrow comparison:
+npm install apache-arrow csv-parse
+python bench/compare.py --node-modules ./node_modules
+# Cold-only runs and machine-readable results:
+python bench/compare.py --timing cold --json bench-results.json
+# Compare Python streaming consumers at an explicit batch size:
+python bench/compare.py --workloads stream --engines libscanio-python,pyarrow,polars,native-python --batch-size 8192
+```
+
+JSON schema version 2 records workload, engine ID, status, cold/warm
+seconds, cold RSS, fixture size/count, expected result, and runtime
+versions. Summary Markdown uses the same categories. CI installs the
+Python competitors and runs the matrix on Windows, macOS, and Linux.
+
+A fresh local [categorized result snapshot](BENCHMARK_MATRIX.md) replaces
+the old mixed-workload tables. Those historical numbers used different
+consumption patterns and a numeric NDJSON fixture; they should not be
+compared directly to this matrix or used to claim an overall winner.
+
+API references: [Polars collect](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.collect.html),
+[PyArrow Dataset](https://arrow.apache.org/docs/python/generated/pyarrow.dataset.Dataset.html),
+[Polars collect_batches](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.collect_batches.html),
+[PyArrow Scanner](https://arrow.apache.org/docs/python/generated/pyarrow.dataset.Scanner.html).
+
 ## Reproducing
 
 ```bash
@@ -169,3 +258,44 @@ zig build filter-bench -Doptimize=ReleaseFast -- <file> <col> <val>  # WHERE eq 
 ```
 
 Both print `matches=N time=Xs`; wrap in `/usr/bin/time -l` for RSS.
+
+## Code placement moves the CSV numbers by up to 30%
+
+The CSV scan benchmarks are alignment-sensitive to a degree that makes
+small deltas meaningless. Appending N no-op exported functions to
+`src/root.zig` — code the CSV path never calls, deterministic ReleaseFast
+builds each time, medians of 7 interleaved runs on the 166MB fixture —
+moves `scan-file` like this:
+
+| no-op fns added | 0 | 2 | 4 | 6 | 8 | 10 |
+|---|---|---|---|---|---|---|
+| scan-file | 0.214s | 0.184s | 0.167s | 0.174s | 0.217s | 0.182s |
+
+Nothing about the CSV scanner changed across those six builds. The hot
+loop's address moves, and with it which side of a cache line its backward
+branch lands on.
+
+This is not theoretical: an NDJSON-only change (fusing the fast path's two
+per-string scans, which CSV never executes) appeared to make CSV 22%
+slower, purely because HEAD happened to land on an unlucky offset while
+its parent landed on a lucky one.
+
+**So when reading a CSV delta here, a difference under ~30% between two
+single builds is not a result.** Before believing one:
+
+1. Build each revision straight from git (`git checkout <rev> -- src`),
+   never from a working tree that experiments have touched — stale
+   binaries from a dirty tree caused exactly this confusion once already.
+2. Interleave the runs of the two binaries rather than running all of A
+   then all of B; the machine drifts.
+3. For anything below ~30%, re-measure with 2-3 layout perturbations (the
+   no-op-function trick above) and compare the ranges, not two points.
+
+NDJSON and the parallel paths are far less sensitive — their deltas track
+real changes and reproduce across perturbations.
+
+Forcing the issue with `align(64)` on `Scanner.next`/`nextLine`/
+`splitInto` does collapse the spread to under 2% — but it pins the loop at
+0.216s, the slow end of its own range, versus 0.165s at `align(32)`. A
+permanent ~25% cost to make a benchmark tidy is the wrong trade, so the
+code is deliberately left unaligned and the caveat lives here instead.

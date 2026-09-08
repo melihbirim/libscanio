@@ -25,7 +25,11 @@ pub fn aggregate(q: *Query, column: usize) !AggResult {
     var r = AggResult{};
     while (try q.next()) |row| {
         const field = row.get(column) orelse continue;
-        const v = std.fmt.parseFloat(f64, field) catch continue;
+        // parseNumeric, not parseFloat: the latter accepts the literal
+        // text "nan"/"inf", and one such cell used to poison sum, min
+        // and max for the whole column (NaN compares false against
+        // everything, so min/max could never move off it again).
+        const v = scan.parseNumeric(field) orelse continue;
         r.count += 1;
         r.sum += v;
         if (r.min == null or v < r.min.?) r.min = v;
@@ -91,4 +95,23 @@ test "aggregate: empty result set (no rows match)" {
     const r = try aggregate(&q, 1);
     try std.testing.expectEqual(@as(usize, 0), r.count);
     try std.testing.expectEqual(@as(?f64, null), r.avg());
+}
+
+test "aggregate: a literal 'nan'/'inf' cell is skipped, not parsed as a float" {
+    // std.fmt.parseFloat accepts these as real NaN/Inf; once min/max held
+    // a NaN, every later comparison was false and they never moved again,
+    // and the sum stayed NaN for the rest of the column.
+    const allocator = std.testing.allocator;
+    const path = "test_aggregate_nan.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount\n1,nan\n2,50\n3,900\n4,inf\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var q = try Query.open(allocator, path, .{});
+    defer q.deinit();
+
+    const r = try aggregate(&q, 1);
+    try std.testing.expectEqual(@as(usize, 2), r.count);
+    try std.testing.expectEqual(@as(f64, 950), r.sum);
+    try std.testing.expectEqual(@as(f64, 50), r.min.?);
+    try std.testing.expectEqual(@as(f64, 900), r.max.?);
 }

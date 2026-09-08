@@ -59,6 +59,17 @@ pub fn build(b: *std.Build) void {
     const run_c_api_tests = b.addRunArtifact(c_api_tests);
     test_step.dependOn(&run_c_api_tests.step);
 
+    // Shared CSV field splitter — its own module so `zig build test`
+    // covers the quoting rules directly, not only through a Scanner.
+    const csv_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/csv.zig"),
+    });
+    const csv_tests = b.addTest(.{ .root_module = csv_mod });
+    const run_csv_tests = b.addRunArtifact(csv_tests);
+    test_step.dependOn(&run_csv_tests.step);
+
     // WHERE-string parsing for the N-API Node binding — its own module
     // (not node_binding.zig itself, which needs node_api.h available to
     // even compile) so `zig build test` covers it without needing Node
@@ -72,6 +83,19 @@ pub fn build(b: *std.Build) void {
     const where_parser_tests = b.addTest(.{ .root_module = where_parser_mod });
     const run_where_parser_tests = b.addRunArtifact(where_parser_tests);
     test_step.dependOn(&run_where_parser_tests.step);
+
+    const python_core_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/python_core.zig"),
+        .pic = true,
+    });
+    python_core_mod.addImport("scanio", scanio_mod);
+    const python_core = b.addLibrary(.{ .name = "scanio_python", .linkage = .static, .root_module = python_core_mod });
+    python_core.linkLibC();
+    python_core.bundle_compiler_rt = true;
+    const python_core_step = b.step("python-core", "Build the static core for the CPython extension");
+    python_core_step.dependOn(&b.addInstallArtifact(python_core, .{}).step);
 
     const c_lib = b.addLibrary(.{
         .name = "scanio",
@@ -147,6 +171,25 @@ pub fn build(b: *std.Build) void {
         // process rather than at link time — Windows cannot do that, see
         // the node_lib comment above.
         node_addon.linker_allow_shlib_undefined = true;
+        // Force the LLVM backend for this addon, at every optimize level.
+        // Zig 0.15.2's self-hosted x86_64 backend (the DEFAULT for Debug
+        // builds) miscompiles this file: `zig build node-test` — which
+        // rebuilds the addon at Debug, per the -Doptimize gotcha
+        // documented above — segfaults on the FIRST openScan() call that
+        // passes a `columns` projection. Reduced all the way down: the
+        // caller passes a garbage value in a callee-saved register, so
+        // the callee faults dereferencing it (address 0x20) in its own
+        // prologue — it reproduces in any std container call
+        // (ArrayList.append, HashMap.put) reached at that point, and
+        // `std.debug.print` is broken on those worker threads for the
+        // same reason. Not a bug in this file: the identical source at
+        // -Doptimize=ReleaseFast (LLVM) and at Debug with use_llvm
+        // passes all 31 addon + 53 wrapper tests. CI never hit it
+        // because it builds ReleaseFast and runs the test scripts
+        // directly, never through `zig build node-test`. Revisit when
+        // this project moves off 0.15.2 — check whether the self-hosted
+        // backend has been fixed before dropping this line.
+        node_addon.use_llvm = true;
         if (node_lib) |nlib| {
             node_addon.addObjectFile(.{ .cwd_relative = nlib });
         }
@@ -164,6 +207,30 @@ pub fn build(b: *std.Build) void {
         const node_step = b.step("node", "Build Node.js N-API addon (requires node in PATH)");
         _ = node_step;
     }
+
+    // `scanio` — the user-facing CLI. Installed by the default `zig
+    // build`, unlike the examples/ benchmarks, because this one is a
+    // shipped artifact rather than a diagnostic: it exists so a one-shot
+    // query costs ~2ms of process instead of ~15ms through Python or
+    // ~130ms through pyarrow. See src/cli.zig's doc comment.
+    const cli_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/cli.zig"),
+    });
+    cli_mod.addImport("scanio", scanio_mod);
+    const cli_exe = b.addExecutable(.{ .name = "scanio", .root_module = cli_mod });
+    cli_exe.linkLibC();
+    b.installArtifact(cli_exe);
+    const cli_step = b.step("cli", "Build the scanio CLI (zig-out/bin/scanio)");
+    cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+
+    // The CLI's argument parsing and column resolution are plain logic —
+    // covered by `zig build test` alongside everything else, no process
+    // spawning needed.
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    test_step.dependOn(&run_cli_tests.step);
 
     // scan-file/mem-check/count-bench/filter-bench share ONE compiled
     // binary (examples/bench_tool.zig) with a mode dispatch — these four
@@ -318,14 +385,49 @@ pub fn build(b: *std.Build) void {
     const smoke_test_step = b.step("smoke-test", "dlopen() the built C ABI shared library and exercise it for real (needs python3)");
     smoke_test_step.dependOn(&smoke_test.step);
 
+    const python_extension = b.addSystemCommand(&.{ python_cmd, "setup.py", "build_ext", "--inplace" });
+    python_extension.setCwd(b.path("python"));
+    const python_extension_step = b.step("python-extension", "Build the ReleaseFast CPython extension");
+    python_extension_step.dependOn(&python_extension.step);
     const python_test = b.addSystemCommand(&.{ python_cmd, "python/tests/test_scan.py" });
     python_test.step.dependOn(c_lib_step);
+    python_test.step.dependOn(&python_extension.step);
     const python_test_step = b.step("python-test", "Run the Python binding test suite (needs python3)");
     python_test_step.dependOn(&python_test.step);
+    const native_only_test = b.addSystemCommand(&.{ python_cmd, "python/tests/test_native_only.py" });
+    native_only_test.step.dependOn(&python_test.step);
+    python_test_step.dependOn(&native_only_test.step);
 
     // Node binding — N-API addon. `zig build node` must have already
     // produced zig-out/lib/scanio.node; these tests load it directly,
     // no `npm install` needed at all (zero runtime dependencies).
+    // Cross-client differential test: the same query through the Python
+    // client, the Node client and the CLI, all compared against a
+    // plain-Python oracle. The per-binding suites above each verify one
+    // path in isolation and so cannot catch two clients disagreeing
+    // about the same file — which is exactly what happened with ragged
+    // rows (Python raised, Node silently dropped fields, both suites
+    // green). Needs all three artifacts built, hence the dependencies.
+    const diff_test = b.addSystemCommand(&.{ python_cmd, "tests/differential_test.py" });
+    diff_test.step.dependOn(c_lib_step);
+    diff_test.step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+    if (node_install_step) |s| diff_test.step.dependOn(s);
+    const diff_test_step = b.step("diff-test", "Cross-client differential test (Python vs Node vs CLI vs an oracle)");
+    diff_test_step.dependOn(&diff_test.step);
+
+    // Ecosystem comparison — libscanio's three front doors against
+    // pyarrow, polars, apache-arrow and hand-written baselines. Optional
+    // engines skip themselves when their dependency is absent, so this
+    // runs anywhere; see bench/compare.py's doc comment for what the
+    // numbers do and don't mean.
+    const bench_compare = b.addSystemCommand(&.{ python_cmd, "bench/compare.py" });
+    bench_compare.step.dependOn(c_lib_step);
+    bench_compare.step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+    if (node_install_step) |s| bench_compare.step.dependOn(s);
+    if (b.args) |extra| bench_compare.addArgs(extra);
+    const bench_compare_step = b.step("bench-compare", "Compare against pyarrow/polars/apache-arrow and native baselines");
+    bench_compare_step.dependOn(&bench_compare.step);
+
     const node_addon_test = b.addSystemCommand(&.{ "node", "node/test/addon_test.js" });
     if (node_install_step) |s| node_addon_test.step.dependOn(s);
     const node_wrapper_test = b.addSystemCommand(&.{ "node", "node/test/test.js" });

@@ -39,8 +39,8 @@ jobs:
       # arrays) is exactly the platform-specific surface CI exists to
       # catch — install pyarrow so its tests actually run here instead
       # of only ever being exercised on whichever machine has it locally.
-      - name: pip install pyarrow
-        run: python3 -m pip install pyarrow
+      - name: pip install pyarrow setuptools wheel
+        run: python3 -m pip install pyarrow setuptools wheel
 
       - uses: actions/setup-node@v4
         with:
@@ -57,6 +57,9 @@ jobs:
 
       - name: zig build python-test
         run: zig build python-test
+
+      - name: Build and test installed Python wheel
+        run: python python/tests/test_wheel.py
 
       # Node binding tested in the separate node-napi job below, not here
       # — it needs Windows-specific setup (node.lib fetch) that job
@@ -124,3 +127,67 @@ jobs:
         run: |
           node node/test/addon_test.js
           node node/test/test.js
+
+      # The per-binding suites above each check one path in isolation, so
+      # they cannot catch two clients disagreeing about the same file.
+      # This job already has Node and the addon; it only needs the C ABI
+      # and the CLI to run all three clients side by side.
+      # Runs on every CI run, but gates only on what is NOT noisy on a
+      # shared runner: that every engine returns the SAME row count, and
+      # that libscanio's streaming peak RSS stays under its ceiling.
+      # Wall-clock times are printed to the job summary for eyeballing
+      # and deliberately not asserted on — a hosted runner moves them by
+      # far more than a real regression would, and a perf gate that cries
+      # wolf is a perf gate everyone learns to ignore.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python comparison engines
+        run: python -m pip install polars==1.44.1 pyarrow==25.0.1 setuptools wheel
+
+      - name: Build the CPython comparison extension
+        run: zig build python-extension -Doptimize=ReleaseFast
+
+      - name: Benchmark (report timings, gate on rows + memory ceiling)
+        shell: bash
+        run: |
+          zig build c-lib -Doptimize=ReleaseFast
+          zig build cli -Doptimize=ReleaseFast
+          # Reuse the ReleaseFast addon built and tested above with the
+          # platform-specific Node header and import-library paths.
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" bench/test_compare.py
+          "$PY" bench/compare.py --rows 200000 --reps 3 \
+            --max-rss-mb 40 \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --json bench-results.json
+
+      - name: Batch API benchmark smoke (gate on correctness)
+        shell: bash
+        run: |
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" bench/batches.py --rows 2000 --reps 1 --json batch-results.json
+          "$PY" bench/import_validation.py --rows 2000 --reps 1 --json import-results.json
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ matrix.os }}
+          path: |
+            bench-results.json
+            batch-results.json
+            import-results.json
+          if-no-files-found: ignore
+
+      - name: Cross-client differential test
+        shell: bash
+        run: |
+          zig build c-lib -Doptimize=ReleaseFast
+          zig build cli -Doptimize=ReleaseFast
+          # Windows runners don't reliably have a "python3" alias, only
+          # "python" — the same gotcha build.zig's own python_cmd exists
+          # for. Hardcoding python3 here is what broke this job.
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" tests/differential_test.py

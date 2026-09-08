@@ -1,15 +1,17 @@
 """
-Build script: invokes `zig build c-lib -Doptimize=ReleaseFast` to compile
-libscanio.dylib/.so/scanio.dll, then copies it into the package directory
-so it's included in the wheel.
+Build the diagnostic C ABI library and a CPython extension statically
+linked to the Zig core. Both use ReleaseFast; wheels are platform-specific.
 """
 
+import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import setup, Extension
+from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
 
 REPO_ROOT = Path(__file__).parent.parent  # python/ -> repo root
@@ -48,4 +50,38 @@ class BuildZigLib(build_py):
         super().run()
 
 
-setup(cmdclass={"build_py": BuildZigLib})
+class BuildNative(build_ext):
+    def run(self):
+        command = ["zig", "build", "python-core", "-Doptimize=ReleaseFast"]
+        if sys.platform == "win32":
+            arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
+            command.append(f"-Dtarget={arch}-windows-msvc")
+        subprocess.check_call(command, cwd=str(REPO_ROOT))
+        archive = REPO_ROOT / "zig-out" / "lib" / ("scanio_python.lib" if sys.platform == "win32" else "libscanio_python.a")
+        if sys.platform == "darwin":
+            # Apple ld requires 8-byte Mach-O member alignment; Zig's ar
+            # can emit a differently aligned member after symbol changes.
+            aligned = Path(self.build_temp).resolve() / "libscanio_python.a"
+            aligned.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory() as objects_dir:
+                subprocess.check_call(["ar", "-x", str(archive)], cwd=objects_dir)
+                objects = sorted(str(p) for p in Path(objects_dir).glob("*.o"))
+                for obj in objects:
+                    Path(obj).chmod(0o600)  # Zig archive members may carry mode 000.
+                if not objects:
+                    raise RuntimeError("Zig static library contains no object files")
+                subprocess.check_call(["/usr/bin/libtool", "-static", "-o", str(aligned), *objects])
+            archive = aligned
+        for ext in self.extensions:
+            ext.extra_objects = [str(archive)]
+            ext.depends = [str(archive), str(PKG_DIR / "_api.c")]
+        super().run()
+
+
+setup(
+    # Zig's Windows filesystem implementation calls NT APIs directly. Static
+    # archives do not propagate their system-library dependencies to MSVC.
+    ext_modules=[Extension("libscanio._native", ["libscanio/_native.c"],
+                           libraries=["ntdll"] if sys.platform == "win32" else [])],
+    cmdclass={"build_py": BuildZigLib, "build_ext": BuildNative},
+)

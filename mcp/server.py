@@ -1,7 +1,7 @@
 """
 libscanio MCP server — exposes scan/schema/profile/count/aggregate/topk/
-order_by/describe as agent-callable tools over CSV files, without ever
-loading a file into memory (see ../docs/DESIGN.md).
+order_by/describe/infer_schema/validate as agent-callable tools over CSV
+files, without ever loading a file into memory (see ../docs/DESIGN.md).
 
 This file is deliberately thin: every tool is a direct pass-through to
 the libscanio Python binding (../python/libscanio). No filtering,
@@ -32,6 +32,7 @@ def scan(
     columns: Optional[list[str]] = None,
     where: Optional[str] = None,
     limit: Optional[int] = None,
+    negate: bool = False,
 ) -> list[dict[str, str]]:
     """Scan a CSV file and return matching rows. This tool always
     materializes the result list to return it over MCP, so pass `limit`
@@ -48,8 +49,14 @@ def scan(
     where: e.g. "revenue > 1000", "city = Austin AND revenue > 1000", or
     "color IN (yellow, green)". Operators: = != > >= < <= IN. Only AND
     joins clauses — no OR (IN covers "any of these values" without it).
+
+    negate=True returns the rows `where` REJECTS instead of the ones it
+    accepts — the complement. Useful for "show me the rows that failed
+    these checks". It inverts the whole AND-list, not each clause, and
+    with no `where` it returns nothing.
     """
-    return libscanio.scan_array(path, columns=columns, where=where, limit=limit, as_dict=True)
+    return libscanio.scan_array(path, columns=columns, where=where, limit=limit,
+                                as_dict=True, negate=negate)
 
 
 @server.tool()
@@ -60,10 +67,14 @@ def schema(path: str) -> list[str]:
 
 
 @server.tool()
-def count(path: str, where: Optional[str] = None) -> int:
+def count(path: str, where: Optional[str] = None, negate: bool = False) -> int:
     """Row count, optionally filtered. With no `where`, never parses a
-    single field — fast regardless of file size."""
-    return libscanio.count(path, where=where)
+    single field — fast regardless of file size.
+
+    negate=True counts the rows `where` REJECTS instead — the cheapest
+    way to ask how many rows fail a set of checks, since no row data is
+    returned at all. With no `where` it counts nothing."""
+    return libscanio.count(path, where=where, negate=negate)
 
 
 @server.tool()
@@ -121,6 +132,44 @@ def profile(path: str) -> dict:
     not something to call repeatedly on a wide file. For inferred TYPES
     per column (not just numeric-vs-not), prefer describe()."""
     return libscanio.profile(path)
+
+
+@server.tool()
+def infer_schema(path: str, sample_size: int = 1000, required: bool = False) -> dict:
+    """Draft a validation schema from what the file already looks like,
+    using describe()'s sampled type inference. A starting point to show
+    a user and edit — not a schema to trust, since it can only describe
+    the file it read: a file that is entirely wrong infers a schema it
+    passes cleanly. Pass the (edited) result to validate()."""
+    return libscanio.infer_schema(path, sample_size=sample_size, required=required)
+
+
+@server.tool()
+def validate(path: str, schema: dict, max_errors: int = 100) -> dict:
+    """Check every row against a schema in one streaming pass and report
+    what failed — the question an IMPORT asks, as opposed to the "which
+    rows do I want" that scan(where=...) answers.
+
+    schema is keyed by column name:
+
+        {"id":     {"type": "integer", "required": true},
+         "amount": {"type": "float", "min": 0},
+         "status": {"one_of": ["new", "paid"]},
+         "email":  {"required": true, "max_len": 255}}
+
+    type is one of any/integer/float/boolean/datetime/string. Lengths
+    count characters, not bytes. A blank cell is ABSENT, not badly
+    typed — only `required` has anything to say about it. Every schema
+    key must name a real column and every rule name must be spelled
+    right; both raise, because a rule that silently does not run is
+    worse than a call that fails.
+
+    Returns row counts, per-rule counts, and the first `max_errors`
+    individual failures. The counts are complete even when that list is
+    capped, so a wholly-broken file still yields an accurate summary
+    (and a bounded response) rather than one error per row.
+    """
+    return libscanio.validate_report(path, schema, max_errors=max_errors).as_dict()
 
 
 if __name__ == "__main__":
