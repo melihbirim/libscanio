@@ -3,6 +3,7 @@ Build the diagnostic C ABI library and a CPython extension statically
 linked to the Zig core. Both use ReleaseFast; wheels are platform-specific.
 """
 
+import os
 import platform
 import shutil
 import subprocess
@@ -34,10 +35,21 @@ def _lib_src_dir() -> Path:
     return REPO_ROOT / "zig-out" / "lib"
 
 
+def _zig_command(step):
+    command = ["zig", "build", step, "-Doptimize=ReleaseFast"]
+    arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
+    if sys.platform == "win32" and step == "python-core":
+        command.append(f"-Dtarget={arch}-windows-msvc")
+    elif sys.platform == "darwin" and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
+        version = os.environ["MACOSX_DEPLOYMENT_TARGET"]
+        command.append(f"-Dtarget={arch}-macos.{version}")
+    return command
+
+
 class BuildZigLib(build_py):
     def run(self):
         subprocess.check_call(
-            ["zig", "build", "c-lib", "-Doptimize=ReleaseFast"],
+            _zig_command("c-lib"),
             cwd=str(REPO_ROOT),
         )
         src = _lib_src_dir() / _lib_name()
@@ -52,10 +64,7 @@ class BuildZigLib(build_py):
 
 class BuildNative(build_ext):
     def run(self):
-        command = ["zig", "build", "python-core", "-Doptimize=ReleaseFast"]
-        if sys.platform == "win32":
-            arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
-            command.append(f"-Dtarget={arch}-windows-msvc")
+        command = _zig_command("python-core")
         subprocess.check_call(command, cwd=str(REPO_ROOT))
         archive = REPO_ROOT / "zig-out" / "lib" / ("scanio_python.lib" if sys.platform == "win32" else "libscanio_python.a")
         if sys.platform == "darwin":

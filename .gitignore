@@ -16,3 +16,6 @@ python/libscanio/*.dll
 # Generated benchmark samples belong in local output or CI artifacts.
 /*-results.json
 /docs/*BENCHMARKS.json
+
+# Local release helper; never publish or commit.
+/release.sh

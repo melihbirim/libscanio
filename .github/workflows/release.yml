@@ -1,11 +1,47 @@
 name: Release
 
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/check_release.py'
+      - 'scripts/test_check_release.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/test_check_release.py
+      - name: Match release tag to package versions
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: python scripts/check_release.py
+
+  packages:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: validate
+    uses: ./.github/workflows/packages.yml
+
   build:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: validate
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -53,17 +89,29 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
+          name: c-${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
   release:
-    needs: build
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    needs: [build, packages]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: c-*
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: artifacts/wheels
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: artifacts/npm
       - name: Flatten artifacts
         run: |
           mkdir -p release
@@ -72,4 +120,40 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          generate_release_notes: true
+          tag_name: ${{ github.event.release.tag_name }}
+          fail_on_unmatched_files: true
+
+  publish-pypi:
+    if: github.event_name == 'release'
+    needs: [validate, packages, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  publish-npm:
+    if: github.event_name == 'release'
+    needs: [validate, packages, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global npm@11
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: dist
+      - name: Publish tested tarball with provenance
+        run: npm publish dist/*.tgz --access public --provenance
