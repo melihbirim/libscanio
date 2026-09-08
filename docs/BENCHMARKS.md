@@ -1,109 +1,102 @@
 # Benchmarks
 
-**Method:** every table below is wall-clock time and peak RSS (physical
-memory the process actually used, via `/usr/bin/time -l`), on the same
-file, same query, same machine, min/avg/max over 10 runs. Every tool
-compared is checked to return the identical result before either number
-is trusted. Numbers are relative, not absolute — a different machine
-shifts the raw seconds; the ratios between tools on the same machine are
-the part worth trusting.
+**North star: scan faster, using less memory, than the alternatives.**
+Measured, not assumed — same file, same query, same machine, cross-checked
+row counts before any number was trusted.
 
-Machine: Apple M2 Pro, 16GB RAM, macOS, single-threaded unless noted.
-Fixture: `bench/.taxi-data/sample.csv` (417MB, 1,000,000 rows, 51 real NYC
-taxi columns) and `trips.csv` (8.5GB, 20,000,000 rows, same schema family)
-— both real, pre-existing data, not synthetic.
+**Method:** one file per size tier (`id,category,amount` / NDJSON
+equivalent, `category` one of 5 values), filtered with `WHERE category =
+'B'` (~20% of rows match). Time is wall clock, RSS is peak resident set
+size (physical memory actually used, not the file size — see
+[DESIGN.md](DESIGN.md#what-is-rss)), via `/usr/bin/time -l` (macOS).
+Machine: Apple M2 Pro, 16GB RAM. 1MB–1GB tiers are the median of 3 runs;
+10GB is a single run (the slow engines take minutes each — three reps
+wasn't worth the extra 30-45 minutes for numbers that were already
+directionally clear from the smaller tiers).
 
-## Filtered scan: `WHERE cab_type = 'yellow'` (417MB, 967,553 matches)
+Engines: `libscanio` (Python + Node, the real published packages, not the
+CLI), `pyarrow.dataset`, `pandas` (chunked, `chunksize=500_000` — not a
+full `read_csv()` load), `polars` (`scan_csv`/`scan_ndjson`, lazy,
+`engine="streaming"`), `duckdb` (`read_csv_auto`/`read_ndjson_auto`).
+Naive hand-written Python (`csv.DictReader`/line-by-line `json.loads`),
+naive Node (`readline`), and Node + `apache-arrow` (`csv-parse` into
+`tableFromArrays`, since apache-arrow has no native CSV/NDJSON reader)
+were run through 100MB and dropped above that — see the notes under each
+table for why.
 
-| tool | time | peak RSS |
-|---|---|---|
-| libscanio `scan_array()` | 0.687s | ~24MB |
-| xan `search -s cab_type -e yellow` | 0.89s | 12.98MB |
-| qsv `search --select cab_type ^yellow$` | 1.26s | 21.72MB |
-| `grep -c ",yellow,"` (count-only, not directly comparable) | 3.07s | 1.49MB |
+## CSV
 
-xan and qsv are the fairest comparison — same weight class (narrow CSV
-tools, no SQL layer), real and actively used. At this selectivity (97% of
-rows match) libscanio wins, but selectivity changes the outcome — see below.
+| engine | 1MB | 10MB | 100MB | 1GB | 10GB |
+|---|---|---|---|---|---|
+| **libscanio (Python)** | 0.005s / 15.4MB | 0.018s / 15.6MB | 0.153s / 15.4MB | 1.37s / 15.4MB | 14.3s / 15.4MB |
+| **libscanio (Node)** | 0.003s / 40.7MB | 0.016s / 40.5MB | 0.151s / 40.5MB | 1.35s / 40.3MB | 14.1s / 38.5MB |
+| duckdb | 0.026s / 51.5MB | 0.057s / 61.4MB | 0.114s / 163.2MB | 0.55s / 237.9MB | 5.6s / 395.0MB |
+| pyarrow.dataset | 0.008s / 112.7MB | 0.030s / 126.2MB | 0.240s / 162.5MB | 2.13s / 254.3MB | 21.8s / 556.0MB |
+| polars | 0.006s / 74.6MB | 0.009s / 99.5MB | 0.057s / 308.6MB | 0.34s / 1457.8MB | 24.8s / 3546.6MB |
+| pandas (chunked) | 0.016s / 111.4MB | 0.097s / 169.8MB | 0.805s / 209.0MB | 7.19s / 210.3MB | skipped¹ |
+| naive Python | 0.049s / 15.2MB | 0.503s / 15.1MB | 5.03s / 15.2MB | 45.5s / 15.1MB | 459.4s² / 15.6MB |
+| naive Node | 0.029s / 57.6MB | 0.172s / 66.2MB | 1.48s / 82.8MB | 13.1s / 83.1MB | 127.5s² / 87.1MB |
+| Node + apache-arrow | 0.092s / 82.1MB | 0.666s / 198.7MB | 7.24s / 786.3MB | crashed³ | not run |
 
-## Selectivity: low match rate, 417MB and 8.5GB
+## NDJSON
 
-| selectivity | file | column position | libscanio | xan |
-|---|---|---|---|---|
-| 26 / 1,000,000 | 417MB | early | **0.13-0.18s** | 0.29-0.33s |
-| 1,085 / 1,000,000 | 417MB | mid | **0.27-0.29s** | 0.29-0.30s |
-| 13,711 / 20,000,000 | 8.5GB | mid | **6.52-6.60s** | 7.26s |
+| engine | 1MB | 10MB | 100MB | 1GB | 10GB |
+|---|---|---|---|---|---|
+| **libscanio (Python)** | 0.003s / 15.5MB | 0.014s / 15.4MB | 0.103s / 15.5MB | 1.04s / 15.4MB | 11.6s / 16.2MB |
+| **libscanio (Node)** | 0.002s / 40.3MB | 0.011s / 40.4MB | 0.100s / 40.5MB | 1.00s / 40.4MB | 11.3s / 40.6MB |
+| duckdb | 0.016s / 50.0MB | 0.031s / 68.8MB | 0.059s / 175.8MB | 0.21s / 290.6MB | 2.4s / 295.2MB |
+| pyarrow.dataset | 0.016s / 115.2MB | 0.031s / 133.0MB | 0.147s / 207.4MB | 0.99s / 251.7MB | 7.8s / 481.0MB |
+| polars | 0.005s / 71.3MB | 0.011s / 88.2MB | 0.078s / 237.4MB | 0.54s / 1270.9MB | killed⁴ |
+| pandas (chunked) | 0.028s / 112.4MB | 0.205s / 251.6MB | 1.94s / 524.2MB | 18.5s / 578.5MB | skipped¹ |
+| naive Python | 0.024s / 15.2MB | 0.234s / 15.2MB | 2.36s / 15.2MB | not run | not run |
+| naive Node | 0.018s / 52.0MB | 0.101s / 55.9MB | 0.900s / 78.1MB | not run | not run |
+| Node + apache-arrow | 0.019s / 64.7MB | 0.113s / 136.9MB | 1.09s / 590.7MB | not run | not run |
 
-libscanio wins across all three by stopping each row's field-split the
-moment it has every column the query needs, instead of splitting the
-whole row regardless of what's used (`stop_after_column` in
-`src/root.zig`). This closed a real loss libscanio had at low selectivity
-before the fix — kept honest here rather than only showing the win.
+Row counts matched exactly across every engine that completed, at every
+tier — same query, same answer, confirmed before any number was trusted.
 
-## Full scan, every row and column (417MB)
+¹ **pandas skipped at 10GB**: still running past 68s on its first of 3
+reps (>2x libscanio's total 10GB time) when killed — the 1GB numbers
+already show why (7-18s there, versus libscanio's ~1s).
+² **naive Python/Node at 10GB**: single run, not median-of-3, given the
+per-run cost (7.7 and 2.1 minutes respectively).
+³ **apache-arrow crashed at 1GB** (CSV): Node heap out-of-memory,
+reproduced twice. `csv-parse` fully materializes records before
+`tableFromArrays()` can build columns — apache-arrow has no native
+CSV/NDJSON reader (confirmed: no `pyarrow.csv`-equivalent in the JS
+package), so this path pays a full in-memory parse first regardless of
+what's queried after.
+⁴ **polars NDJSON killed at 10GB**: exceeded 2x libscanio's 10GB time
+(23s budget) with no result yet — consistent with its CSV number at the
+same tier (24.8s) and its RSS pattern (1.3-3.5GB at 1GB-10GB, growing
+roughly linearly with file size, not flat).
 
-| tool | time | peak RSS |
-|---|---|---|
-| `cat file > /dev/null` | 0.34s | 1.43MB |
-| **libscanio `Scanner`** | 0.57s | 2.17MB |
-| zcsv (third-party Zig CSV lib, zero-alloc mode) | 2.49s | 1462.7MB |
+## The point of this table
 
-~5.5-6x faster and ~2.6x lighter than zcsv at zcsv's fastest mode.
+**Peak RSS.** libscanio's stays flat (~15-16MB Python, ~38-41MB Node)
+from 1MB to 10GB — it tracks the read buffer, not the file. Every other
+engine's RSS grows with file size, some linearly (polars: 71MB → 3.5GB,
+roughly proportional to input size) and some sublinearly but still
+clearly growing (duckdb, pyarrow: low hundreds of MB to several hundred
+MB). Naive Python/Node also stay close to flat — `csv.DictReader` and
+`readline` are real generators, not full-file loads — but pay for it in
+time (30-40x slower than libscanio at the tiers both completed).
 
-## Scale: does peak RSS stay flat past 417MB?
+**Time.** libscanio and duckdb are the two consistently fast engines
+across every tier and both formats; pyarrow and polars are competitive at
+small-to-mid sizes but polars' NDJSON path degrades badly at 10GB. pandas
+chunked reading is real streaming (flat-ish RSS growth, much better than
+a full `read_csv()` load would be) but 5-15x slower than libscanio at
+every tier it completed.
 
-| file | size | peak RSS |
-|---|---|---|
-| sample.csv | 417MB | ~2.2MB |
-| trips.csv | 8.5GB (20x bigger) | ~2.2MB |
-
-Same peak RSS at 20x the file size — memory doesn't grow with the file,
-only time does (~2.1M rows/sec, unfiltered).
-
-## 8.5GB scale, filtered: `WHERE payment_type = 'DIS'` (13,711 / 20,000,000 matches)
-
-| tool | time | peak RSS |
-|---|---|---|
-| naive Python `csv.reader` | 103.98s | 15.6MB |
-| **libscanio `scan_array()`** | 6.52-6.60s | 20.7MB |
-| xan | 7.26s | 12.8MB |
-| qsv | 13.08s | 21.5MB |
-
-~15.8x faster than naive Python, ~1.1x faster than xan. Naive Python's
-lower RSS isn't a libscanio weakness — this query is selective enough that
-neither approach holds the whole file in memory; the flat-RSS claim above
-is about the scan loop, proven separately.
-
-## Concurrent load: `scan_table()` vs pyarrow
-
-Under N-way concurrent load, libscanio's parallel scan/count path uses
-**2.3-2.8x less memory than pyarrow** for the same query — the
-Python-API-level comparison, not an internal-only number. Full method:
-[ROADMAP.md](../ROADMAP.md).
-
-## Ecosystem comparison (PyArrow, Polars, Node/Arrow JS)
-
-`bench/compare.py` runs the same queries — filtered count, materialized
-Arrow table, streaming import — across engines under identical contracts
-(same result count, same checksum). See
-[BENCHMARK_MATRIX.md](BENCHMARK_MATRIX.md) for the current numbers and
-`bench/compare.py --help` for reproduction options.
-
-## Reproducing
+Reproduce (single query, single engine):
 
 ```bash
-zig build mem-check -Doptimize=ReleaseFast -- <file>                  # raw scan, no filter
-zig build filter-bench -Doptimize=ReleaseFast -- <file> <col> <val>   # WHERE eq scan, counts matches
+python3 -c "import libscanio; print(libscanio.count('file.csv', where='category = B'))"
+node -e "console.log(require('libscanio').count('file.csv', 'category = B'))"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT count(*) FROM read_csv_auto('file.csv') WHERE category='B'\").fetchone())"
 ```
 
-Both print `matches=N time=Xs`; wrap in `/usr/bin/time -l` for RSS.
-
-## A caveat worth knowing before trusting a small delta
-
-CSV scan timings are sensitive to code alignment: appending unrelated
-no-op functions elsewhere in the binary can move `scan-file`'s time by up
-to 30% with zero logic changes, purely from where the hot loop's backward
-branch lands relative to a cache line. A difference under ~30% between two
-single builds is not a result — re-measure with a couple of layout
-perturbations before believing it. NDJSON and the parallel paths don't
-have this problem; their deltas reproduce reliably.
+wrapped in `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux) for RSS.
+Generator scripts for every fixture and every engine used above live in
+[bench/simple/](../bench/simple/) — see `bench/simple/README.md`.

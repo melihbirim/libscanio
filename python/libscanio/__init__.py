@@ -29,7 +29,7 @@ from __future__ import annotations
 import datetime
 
 
-__all__ = ["validate_to_files", "scan_batches", "validate_batches", "scan", "scan_array", "scan_table", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_report", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
+__all__ = ["validate_to_files", "scan_batches", "validate_batches", "scan", "scan_array", "schema", "count", "aggregate", "topk", "order_by", "profile", "describe", "build_mode", "validate", "validate_report", "validate_iter", "infer_schema", "ValidationReport", "ValidationError", "ScanError"]
 
 _OP_MAP = {">=": 3, "<=": 5, "!=": 1, "=": 0, ">": 2, "<": 4}
 _OP_IN = 6
@@ -195,84 +195,6 @@ def scan_array(path, columns=None, where=None, limit=None, as_dict=False, negate
             result.extend(batch)
     finally:
         _call("close", ctx)
-
-
-_ARROW_TYPE_FOR_INFERRED = {
-    "integer": "int64",
-    "float": "float64",
-    "boolean": "bool",
-}
-
-
-def scan_table(path: str, where: Optional[str] = None, infer_types: bool = False, negate: bool = False):
-    """Return a zero-copy Arrow table using CPython-owned native buffers.
-
-    Parallel collection and optional inferred type casts are preserved.
-    Each read-only buffer retains the native owner until Arrow releases it.
-    """
-    try:
-        import pyarrow as pa
-        import pyarrow.compute as pc
-    except ImportError as e:
-        raise ImportError("scan_table() requires pyarrow: pip install pyarrow") from e
-
-    ctx = _open_query(path, where=where, negate=negate)
-    try:
-        names = _call("names", ctx)
-        owner = _call("columnar", ctx)
-    finally:
-        _call("close", ctx)
-    n_rows, buffers = _call("columnar_buffers", owner)
-    if n_rows == 0:
-        return pa.table({name: pa.array([], type=pa.string()) for name in names})
-    arrays = [pa.Array.from_buffers(pa.string(), n_rows,
-              [None, pa.py_buffer(offsets), pa.py_buffer(data)])
-              for offsets, data in buffers]
-
-    if infer_types:
-        types_by_col = {d["column"]: d["type"] for d in describe(path)}
-        for i, name in enumerate(names):
-            inferred = types_by_col.get(name)
-            if inferred == "datetime":
-                # Two real ISO8601 shapes describe() accepts under one
-                # label: "...Z"/"...+00:00" (needs a tz-aware target) and
-                # bare "YYYY-MM-DD[THH:MM:SS]" (needs a tz-naive target,
-                # or Arrow rejects it asking for one).
-                #
-                # Which to try FIRST is decided on a few rows, not by
-                # attempting each on the whole column: a cast that is
-                # going to fail still reads every row before raising, so
-                # guessing wrong cost 0.344s on a 666K-row column and the
-                # fallback then did the real work in 0.012s — 29x the
-                # price of the cast itself, paid per datetime column. The
-                # probe is a handful of values, and both targets are
-                # still tried in full below, so the outcome is unchanged
-                # even when the probe is unrepresentative.
-                targets = (pa.timestamp("s", tz="UTC"), pa.timestamp("s"))
-                probe = arrays[i].slice(0, min(8, n_rows))
-                accepted = []
-                for target in targets:
-                    try:
-                        pc.cast(probe, target)
-                        accepted.append(target)
-                    except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError):
-                        pass
-                for target in accepted + [t for t in targets if t not in accepted]:
-                    try:
-                        arrays[i] = pc.cast(arrays[i], target)
-                        break
-                    except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError):
-                        continue
-                continue
-            target = _ARROW_TYPE_FOR_INFERRED.get(inferred)
-            if target is None:
-                continue
-            try:
-                arrays[i] = pc.cast(arrays[i], target)
-            except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError):
-                pass  # sample-based inference was wrong for the real data — keep the string column
-
-    return pa.table(arrays, names=names)
 
 
 def build_mode():

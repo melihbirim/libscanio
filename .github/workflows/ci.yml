@@ -35,12 +35,8 @@ jobs:
         with:
           python-version: '3.x'
 
-      # scan_table()'s Zig-side FFI (buffer addresses, zero-copy Arrow
-      # arrays) is exactly the platform-specific surface CI exists to
-      # catch — install pyarrow so its tests actually run here instead
-      # of only ever being exercised on whichever machine has it locally.
-      - name: pip install pyarrow setuptools wheel
-        run: python3 -m pip install pyarrow setuptools wheel
+      - name: pip install setuptools wheel
+        run: python3 -m pip install setuptools wheel
 
       - uses: actions/setup-node@v4
         with:

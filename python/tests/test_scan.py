@@ -274,109 +274,6 @@ finally:
     os.unlink(ALNUM_P)
 
 
-# scan_table(): same describe()-fixture shape, but checking the actual
-# typed Arrow output, not just the type label. Reuses the two real ISO8601
-# shapes describe() lumps under one "datetime" label (trailing Z needs a
-# tz-aware Arrow target, bare needs tz-naive) to make sure both cast paths
-# work, not just one.
-st_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
-st_tmp.write(
-    "id,price,active,created_at,notes\n"
-    "1,19.99,true,2023-05-26T22:00:00Z,\n"
-    "2,29.50,false,2023-06-01T10:15:30Z,\n"
-    "3,9.75,true,2023-07-04T00:00:00Z,\n"
-)
-st_tmp.close()
-ST_P = st_tmp.name
-try:
-    tbl = libscanio.scan_table(ST_P, infer_types=True)
-    check(
-        "scan_table: infer_types=True casts to typed columns",
-        {name: str(tbl.schema.field(name).type) for name in tbl.column_names},
-        {
-            "id": "int64",
-            "price": "double",
-            "active": "bool",
-            "created_at": "timestamp[s, tz=UTC]",
-            "notes": "string",
-        },
-    )
-    check("scan_table: typed values round-trip correctly", tbl.column("price").to_pylist(), [19.99, 29.5, 9.75])
-    check("scan_table: boolean values correct", tbl.column("active").to_pylist(), [True, False, True])
-
-    tbl_untyped = libscanio.scan_table(ST_P, infer_types=False)
-    check(
-        "scan_table: infer_types=False keeps every column a string",
-        {str(f.type) for f in tbl_untyped.schema},
-        {"string"},
-    )
-finally:
-    os.unlink(ST_P)
-
-# describe()'s sample-based inference can be wrong for data outside the
-# sample — scan_table() must fall back to a string column for THAT one
-# column instead of raising, since the real value pyarrow can't cast
-# only shows up after the sample describe() actually looked at.
-st_bad_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
-lines = ["id,mixed\n"] + [f"{i},{i}\n" for i in range(1, 1001)] + ["1001,not-a-number\n"]
-st_bad_tmp.writelines(lines)
-st_bad_tmp.close()
-ST_BAD_P = st_bad_tmp.name
-try:
-    check(
-        "scan_table: describe() sample misses the later non-numeric value",
-        {d["column"]: d["type"] for d in libscanio.describe(ST_BAD_P)}["mixed"],
-        "integer",
-    )
-    tbl_bad = libscanio.scan_table(ST_BAD_P, infer_types=True)
-    check(
-        "scan_table: cast failure falls back to string instead of raising",
-        str(tbl_bad.schema.field("mixed").type),
-        "string",
-    )
-    check("scan_table: fallback column still has correct, complete data", tbl_bad.column("mixed").to_pylist()[-1], "not-a-number")
-finally:
-    os.unlink(ST_BAD_P)
-
-# ---------------------------------------------------------------------
-# scan_table(infer_types=True) picks the datetime target from a short
-# probe rather than trying each on the whole column. Both ISO8601 shapes
-# describe() labels "datetime" must still land on the right Arrow type,
-# and a column the probe agrees with but the full data doesn't must
-# still fall back to string rather than half-cast.
-ST_DT_P = "_test_scan_table_datetime.csv"
-with open(ST_DT_P, "w") as f:
-    f.write("id,naive,aware\n")
-    for i in range(12):
-        f.write(f"{i},2024-01-0{i % 9 + 1}T08:00:00,2024-01-0{i % 9 + 1}T08:00:00Z\n")
-try:
-    tbl_dt = libscanio.scan_table(ST_DT_P, infer_types=True)
-    check("scan_table: bare ISO8601 casts to a tz-naive timestamp",
-          str(tbl_dt.schema.field("naive").type), "timestamp[s]")
-    check("scan_table: ...Z ISO8601 casts to a tz-aware timestamp",
-          str(tbl_dt.schema.field("aware").type), "timestamp[s, tz=UTC]")
-    check("scan_table: datetime values round-trip",
-          str(tbl_dt.column("naive")[0]), "2024-01-01 08:00:00")
-finally:
-    os.unlink(ST_DT_P)
-
-# The probe sees only well-formed timestamps; a bad value later in the
-# column must still leave the whole column a string.
-ST_DTBAD_P = "_test_scan_table_datetime_mixed.csv"
-with open(ST_DTBAD_P, "w") as f:
-    f.write("id,when\n")
-    for i in range(12):
-        f.write(f"{i},2024-01-01T08:00:00Z\n")
-    f.write("99,not-a-date\n")
-try:
-    tbl_dtbad = libscanio.scan_table(ST_DTBAD_P, infer_types=True)
-    check("scan_table: datetime probe agreeing but full column failing keeps string",
-          str(tbl_dtbad.schema.field("when").type), "string")
-    check("scan_table: that column keeps its complete data",
-          tbl_dtbad.column("when").to_pylist()[-1], "not-a-date")
-finally:
-    os.unlink(ST_DTBAD_P)
-
 # ---------------------------------------------------------------------
 # A row with MORE fields than the header used to raise IndexError out of
 # scan(), killing the iteration. Real files hit this. Extra fields get a
@@ -426,14 +323,6 @@ try:
           [("1", "Smith, John", "London"), ("2", 'He said "hi"', "Paris"), ("3", 'he said "hi"', "Berlin")])
     check("quoted CSV: a quoted value is filterable by its real content",
           len(list(libscanio.scan(QUOTED_P, where="name = Smith, John"))), 1)
-    # The parallel/columnar path is a different splitter call site than
-    # scan()'s, so Arrow output gets its own check.
-    try:
-        t = libscanio.scan_table(QUOTED_P)
-        check("quoted CSV: scan_table (zero-copy Arrow) agrees",
-              t.column("name").to_pylist(), ["Smith, John", 'He said "hi"', 'he said "hi"'])
-    except ImportError:
-        pass  # pyarrow not installed
 finally:
     os.unlink(QUOTED_P)
 
@@ -570,12 +459,6 @@ try:
           libscanio.scan_array(NEG_P, columns=["city"], where="city = London",
                                limit=2, negate=True),
           [("Paris",), ("Berlin",)])
-    try:
-        import pyarrow  # noqa: F401
-        check("negate: scan_table (zero-copy Arrow) returns the same complement",
-              libscanio.scan_table(NEG_P, where="city = London", negate=True).num_rows, 3)
-    except ImportError:
-        pass
 finally:
     os.unlink(NEG_P)
 

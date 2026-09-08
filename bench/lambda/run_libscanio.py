@@ -12,7 +12,7 @@ import libscanio  # noqa: E402
 path, where = sys.argv[1], sys.argv[2]
 
 t0 = time.time()
-tbl = libscanio.scan_table(path, where=where)
+rows = libscanio.scan_array(path, where=where)
 dt = time.time() - t0
 peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-print(f"OK rows={tbl.num_rows} time={dt:.3f}s peak_rss={peak_mb:.1f}MB")
+print(f"OK rows={len(rows)} time={dt:.3f}s peak_rss={peak_mb:.1f}MB")

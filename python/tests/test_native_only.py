@@ -1,5 +1,4 @@
 """Exercise every public API with the ctypes loader disabled (also installed)."""
-import gc
 import sys
 import tempfile
 from pathlib import Path
@@ -9,7 +8,6 @@ package_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolv
 sys.path.insert(0, str(package_root))
 sys.modules['libscanio._loader'] = None
 import libscanio as s
-import pyarrow as pa
 from libscanio import _native
 
 assert s.build_mode() == 'ReleaseFast'
@@ -42,23 +40,6 @@ with tempfile.TemporaryDirectory() as td:
     assert [r for b in s.validate_batches(p,rules,batch_size=2) for r in b] == stream
     stats=s.validate_to_files(p,rules,str(Path(td)/'good.csv'),str(Path(td)/'bad.jsonl'))
     assert stats == dict(rows_total=3,rows_valid=1,rows_invalid=2,errors_total=2)
-    table=s.scan_table(p)
-    column=table['label'].slice(1)
-    del table
-    gc.collect()
-    for _ in range(30): s.scan_table(p)
-    assert column.to_pylist() == ['beta','café, quoted']
-    assert s.scan_table(p,infer_types=True)['id'].type == pa.int64()
-    # Read-only buffer ownership survives closing the query and releasing owner.
-    q=_native.query_open(p.encode(), b'{}')
-    owner=_native.columnar(q)
-    _native.close(q)
-    n, buffers=_native.columnar_buffers(owner)
-    offsets,data=buffers[2]
-    assert offsets.readonly and data.readonly
-    del buffers,owner,q
-    gc.collect()
-    assert bytes(data)==b'alphabetacaf\xc3\xa9, quoted' and n==3
     # Raw handles cannot be closed twice or consumed after close.
     q=_native.query_open(p.encode(), b'{}');_native.close(q);_native.close(q)
     try:_native.next_batch(q,1,100,False)
@@ -71,12 +52,10 @@ with tempfile.TemporaryDirectory() as td:
     assert s.scan_array(p)[0][1]=='nul\x00tail'
     assert s.topk(p,'id',2,descending=False)[0]['value']=='nul\x00tail'
     assert s.order_by(p,'id')[0]['value']=='nul\x00tail'
-    assert s.scan_table(p)['value'][0].as_py()=='nul\x00tail'
     path.write_bytes(b'a,b\n,\n,\n')
     assert s.scan_array(p)==[('',''),('','')]
-    assert s.scan_table(p).to_pydict()=={'a':['',''],'b':['','']}
-    assert s.scan_table(p,where='a = absent').num_rows==0
+    assert s.scan_array(p,where='a = absent')==[]
     path.write_bytes(b'a,b\n')
-    assert s.scan_table(p).column_names==['a','b']
+    assert s.schema(p)==['a','b']
     assert s.scan_array(p)==[]
-print('All 18 public APIs passed without the ctypes loader; Arrow buffer ownership passed')
+print('All 17 public APIs passed without the ctypes loader')

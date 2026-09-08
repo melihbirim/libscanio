@@ -191,32 +191,6 @@ static PyObject *api_columnar(PyObject *self,PyObject *cap){
     void *p=py_columnar(h->ptr,err);return p ? api_wrap(p,3,h->names) : api_error(err);
 }
 /* Read-only buffer protocol keeps the native columnar owner alive. */
-typedef struct { PyObject_HEAD PyObject *owner; const char *data; Py_ssize_t len; } ApiBuffer;
-static int api_buffer_get(PyObject *obj,Py_buffer *view,int flags){ApiBuffer *b=(ApiBuffer *)obj;return PyBuffer_FillInfo(view,obj,(void *)b->data,b->len,1,flags);}
-static void api_buffer_dealloc(PyObject *obj){ApiBuffer *b=(ApiBuffer *)obj;Py_DECREF(b->owner);Py_TYPE(obj)->tp_free(obj);}
-static PyBufferProcs api_buffer_protocol={api_buffer_get,NULL};
-static PyTypeObject ApiBufferType={PyVarObject_HEAD_INIT(NULL,0)
-    .tp_name="libscanio._native.ColumnBuffer",.tp_basicsize=sizeof(ApiBuffer),.tp_flags=Py_TPFLAGS_DEFAULT,
-    .tp_dealloc=api_buffer_dealloc,.tp_as_buffer=&api_buffer_protocol};
-static PyObject *api_buffer(PyObject *owner,Slice s){
-    if(s.len>PY_SSIZE_T_MAX)return PyErr_NoMemory();
-    ApiBuffer *b=PyObject_New(ApiBuffer,&ApiBufferType);if(!b)return NULL;
-    b->owner=Py_NewRef(owner);b->data=s.len ? s.ptr : "";b->len=(Py_ssize_t)s.len;
-    PyObject *out=PyMemoryView_FromObject((PyObject *)b);Py_DECREF(b);return out;
-}
-static PyObject *api_buffers(PyObject *self,PyObject *cap){
-    (void)self;ApiHandle *h=api_handle(cap,3);if(!h)return NULL;
-    size_t n=py_columnar_ncols(h->ptr),rows=py_columnar_nrows(h->ptr);
-    if(n>PY_SSIZE_T_MAX)return PyErr_NoMemory();
-    PyObject *out=PyList_New((Py_ssize_t)n);if(!out)return NULL;
-    for(size_t i=0;i<n;i++){
-        PyObject *data=api_buffer(cap,py_columnar_data(h->ptr,i));
-        PyObject *offsets=api_buffer(cap,py_columnar_offsets(h->ptr,i));
-        PyObject *pair=data && offsets ? PyTuple_Pack(2,offsets,data) : NULL;
-        Py_XDECREF(data);Py_XDECREF(offsets);if(!pair){Py_DECREF(out);return NULL;}PyList_SET_ITEM(out,i,pair);
-    }
-    PyObject *r=Py_BuildValue("KN",(unsigned long long)rows,out);return r;
-}
 static PyObject *api_columnar_rows(PyObject *self,PyObject *args){
     (void)self;PyObject *cap;int dict;if(!PyArg_ParseTuple(args,"Op",&cap,&dict))return NULL;
     ApiHandle *h=api_handle(cap,3);if(!h)return NULL;
@@ -272,7 +246,6 @@ static PyObject *api_import(PyObject *self,PyObject *args){
     {"aggregate",api_aggregate,METH_VARARGS,NULL}, \
     {"sort",api_sort,METH_VARARGS,NULL}, \
     {"columnar",api_columnar,METH_O,NULL}, \
-    {"columnar_buffers",api_buffers,METH_O,NULL}, \
     {"columnar_rows",api_columnar_rows,METH_VARARGS,NULL}, \
     {"report",api_report,METH_VARARGS,NULL}, \
     {"validate_to_files",api_import,METH_VARARGS,NULL},

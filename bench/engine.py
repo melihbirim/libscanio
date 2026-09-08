@@ -42,7 +42,7 @@ def query():
         if workload == "count":
             return ls.count(path, where)
         if workload == "arrow":
-            return ls.scan_table(path, where=where, infer_types=False)
+            raise NotImplementedError("libscanio's scan_table() (Arrow output) was removed")
         rows = ls.scan(path, where=where)
     elif engine == "polars":
         schema = dict.fromkeys(fields, pl.String)

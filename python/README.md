@@ -14,9 +14,7 @@ Windows x64, and macOS 14+ on Intel and Apple Silicon. A matching wheel needs
 no Zig installation or C compiler. Alpine/musl, Windows ARM64, and PyPy are
 not included in this release.
 
-The core APIs have no third-party Python runtime dependencies. Only
-`scan_table()` requires an optional installation of PyArrow and currently
-returns a `pyarrow.Table`.
+No third-party Python runtime dependencies.
 
 ## Supported file formats
 

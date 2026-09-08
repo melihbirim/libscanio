@@ -2,32 +2,40 @@
 
 Scan and filter structured data without loading it. Your family's RAM-friendly data scanner.
 
-**North star: scan faster, using less memory, than the alternatives.** Every
-number in this repo is measured on the same file, the same query, the same
-machine — peak RSS (physical memory actually used, not the file size) and
-wall-clock time, cross-checked so every tool compared returns the identical
-result before either number is trusted. Full method and every comparison:
+## Problem
+
+Filtering a big CSV/NDJSON file usually means loading it fully into
+memory first (pandas, a JS array, a naive parser). Memory use then tracks
+file size — a 10GB file costs 10GB+ of RAM, or it crashes.
+
+## Solution
+
+libscanio reads in a fixed-size buffer and never holds more than that,
+regardless of file size. Filter, count, aggregate, or stream rows from
+CSV, NDJSON, or JSON arrays — from Python, Node, C, Zig, or the `scanio`
+CLI, one `Query` API underneath all of them. See
+[docs/DESIGN.md](docs/DESIGN.md) for how the buffer bound works.
+
+## Performance
+
+Same file, same query, measured, not assumed — peak RSS (physical memory
+actually used) and wall time, cross-checked row counts. Full method:
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-Three headline numbers from that page:
+- 1MB file: **0.003s, 15.4MB peak RSS** (Python) / **0.002s, 40.2MB** (Node).
+- ~11GB file (11,000x bigger): **14.75s, 15.4MB peak RSS** (Python) / **14.67s, 38.7MB** (Node).
 
-- Filtered scan, 417MB file: **0.43s, ~2.2MB peak RSS**.
-- Same query, 8.5GB file (20x bigger): **~9.6s, still ~2.2MB peak RSS** — time grows with the data, memory doesn't.
-- Parallel scan under concurrent load: **2.3-2.8x less memory than pyarrow**.
-
-CSV, NDJSON, and JSON arrays behind one `Query` API — filter, project,
-limit, count, aggregates, top-K — from Python, Node, C, Zig, or the
-`scanio` CLI. See [docs/DESIGN.md](docs/DESIGN.md) for how the ~2MB bound
-works (chunked reads, not mmap).
+Peak RSS barely moves. Time scales with the data instead — bigger file,
+more time, never more memory.
 
 ## Status
 
 CSV + NDJSON + JSON arrays; filter/project/limit/count; count/sum/min/max/avg
 aggregates; O(N log K) top-K; single-column ORDER BY; per-column type
-inference (`describe()`); schema validation for imports (`validate()`);
-zero-copy Arrow output; a C ABI; Python and [Node](node/) bindings; an
-[MCP server](mcp/). No group-by, multi-column ORDER BY, or Rust binding
-yet. See [ROADMAP.md](ROADMAP.md).
+inference (`describe()`); schema validation for imports (`validate()`); a
+C ABI; Python and [Node](node/) bindings; an [MCP server](mcp/). No
+group-by, multi-column ORDER BY, or Rust binding yet. See
+[ROADMAP.md](ROADMAP.md).
 
 CSV quoting follows RFC 4180 except quoted fields cannot contain a newline
 (the reader is line-oriented, by design — see [DESIGN.md](docs/DESIGN.md)).
@@ -103,12 +111,12 @@ strings, including numeric JSON values. See
 
 ## The rows a filter rejects
 
-`negate=True`/`negate: true`/`--not` returns the complement of a filter —
-the rows it rejects, not the ones it accepts. Built for imports: the
-rejects are usually the *small* side, so pulling just them is much cheaper
-than pulling everything that passed. It inverts the whole `where` clause,
-so with no `where` it matches nothing (the negation of "keep everything"
-is "keep none").
+`negate=True`/`negate: true`/`--not` returns the complement of a filter:
+the rows it rejects, not the ones it accepts. Built for imports — the
+rejects are usually the small side, so pulling just them is cheaper than
+pulling everything that passed. It inverts the whole `where` clause. With
+no `where` it matches nothing: keeping everything negated is keeping
+nothing.
 
 ```python
 rejects = libscanio.scan_array("orders.csv", where=RULES, negate=True)
@@ -138,7 +146,7 @@ for e in report.errors:
 
 Rule keys: `type` (`any`/`integer`/`float`/`boolean`/`datetime`/`string`),
 `required`, `min`, `max`, `min_len`, `max_len`, `one_of`. No schema yet?
-`infer_schema(path)` drafts one from the file itself, for you to edit.
+`infer_schema(path)` drafts one from the file itself. Edit it.
 
 Same thing from the CLI, where report mode doubles as a shell gate:
 

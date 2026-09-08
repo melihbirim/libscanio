@@ -1,6 +1,6 @@
 # CPython API migration
 
-All 18 public Python functions now route native operations through `_native`,
+All 17 public Python functions now route native operations through `_native`,
 with the Zig core statically linked. There is no public ctypes fallback or
 row JSON transport. Query options and validation schemas are encoded once as
 JSON input. Python still handles API argument resolution, report classes, and
@@ -10,7 +10,6 @@ profile/describe/schema-inference composition.
 |---|---|
 | scan, scan_batches | Direct tuple/dictionary construction from borrowed fields |
 | scan_array | Parallel columnar collector by default; projected/limited batches otherwise |
-| scan_table | Read-only native buffers retained by CPython buffer exporters and Arrow |
 | count, aggregate | Native scalar results |
 | topk, order_by | Native sorting and direct result construction |
 | schema, build_mode | Native metadata |

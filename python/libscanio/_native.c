@@ -169,6 +169,5 @@ static PyMethodDef methods[] = {
 };
 static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "_native", NULL, -1, methods};
 PyMODINIT_FUNC PyInit__native(void) {
-    if (PyType_Ready(&ApiBufferType) < 0) return NULL;
     return PyModule_Create(&module);
 }
