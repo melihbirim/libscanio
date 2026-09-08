@@ -342,6 +342,27 @@ zig build diff-test                      # every client on the same queries, cro
 
 Not a database, not a dataframe, not a SQL engine, no query optimizer, no distributed execution, no mutation APIs (open/scan/close only — no write path). See [ROADMAP.md](ROADMAP.md) for the full list and reasoning.
 
+## Using this with Claude Code
+
+[skills/libscanio/SKILL.md](skills/libscanio/SKILL.md) is a Claude Code
+[skill](https://docs.claude.com/en/docs/claude-code/skills) — a file Claude
+Code auto-discovers and loads only when the task at hand matches its
+description, so it doesn't cost context on unrelated work. Skills live in
+`.claude/skills/<name>/SKILL.md`, either per-project or under `~/.claude/`
+for every project. To pick this one up:
+
+```bash
+mkdir -p .claude/skills/libscanio
+curl -fsSL https://raw.githubusercontent.com/melihbirim/libscanio/main/skills/libscanio/SKILL.md \
+  -o .claude/skills/libscanio/SKILL.md
+```
+
+(`~/.claude/skills/libscanio/` instead of `.claude/skills/` to make it
+available in every project, not just this one.) No CLAUDE.md edit needed —
+skills are discovered by directory, not referenced from CLAUDE.md. Claude
+reads the frontmatter `description` up front and loads the full file only
+when a task matches it (large CSV/NDJSON reads, filtering, validation).
+
 ## Docs
 
 - [docs/DESIGN.md](docs/DESIGN.md) — chunked-read architecture, measured memory/speed tradeoffs, allocator notes
