@@ -28,6 +28,30 @@ environment. Allow direct `npm publish`. The job uses Node 24 and npm 11,
 with provenance enabled. See the [npm instructions](https://docs.npmjs.com/trusted-publishers/)
 and [PyPI instructions](https://docs.pypi.org/trusted-publishers/adding-a-publisher/).
 
+## Local release helper
+
+The local, executable `release.sh` is ignored by Git and must never be committed.
+After merging this workflow and switching to a clean, up-to-date `main`:
+
+```sh
+./release.sh 0.1.1 --dry-run  # preview only
+./release.sh 0.1.1            # release an explicit version
+./release.sh next             # bump minor: 0.1.0 -> 0.2.0
+```
+
+Requires Git, GitHub CLI authenticated with `gh auth login`, and Python 3.11+.
+It updates both manifests and the package README install commands, creates a
+brief version commit, pushes main, waits for CI, then creates/pushes the tag
+and publishes the GitHub release. It waits for the Release workflow to finish.
+It stages only the four version-bearing files; `TODO.md` and the helper stay
+untracked. It does not change registry credentials or bypass branch protection.
+If direct pushes to main are prohibited, use the PR-based steps below instead.
+
+To finish an interrupted release after resolving the cause, use
+`./release.sh 0.1.1 --resume`. The current manifest versions must match, and any
+existing tag must point at the same commit. For a failed publishing job on an
+already-created release, rerun only failed jobs in Actions.
+
 ## Publish the next version
 
 1. Update `python/pyproject.toml` and `node/package.json` to the same version.
