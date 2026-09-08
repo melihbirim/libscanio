@@ -2,6 +2,7 @@ name: Build packages
 
 on:
   workflow_dispatch:
+  workflow_call:
   pull_request:
     paths:
       - '.github/workflows/packages.yml'
@@ -9,8 +10,6 @@ on:
       - 'node/**'
       - 'src/**'
       - 'build.zig'
-  push:
-    tags: ['v*']
 
 permissions:
   contents: read
@@ -122,7 +121,7 @@ jobs:
           npm pack ./node --pack-destination dist
           mkdir -p "$RUNNER_TEMP/scanio-npm-test"
           cd "$RUNNER_TEMP/scanio-npm-test"
-          npm install "$GITHUB_WORKSPACE/dist/libscanio-0.1.0.tgz"
+          npm install "$GITHUB_WORKSPACE"/dist/*.tgz
           node -e 'const fs=require("fs"),s=require("libscanio"); fs.writeFileSync("test.csv","id\n1\n2\n"); if(s.count("test.csv")!==2) throw Error("wrong row count")'
       - uses: actions/upload-artifact@v4
         with:

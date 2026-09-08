@@ -1,31 +1,65 @@
-# Building release packages
+# Releases
 
-`Build packages` (`.github/workflows/packages.yml`) runs on relevant pull
-requests, version tags, and manual dispatch. It only builds and tests artifacts;
-it does not publish to a registry and needs no PyPI or npm token.
+Publishing a stable GitHub release runs `.github/workflows/release.yml`:
 
-For version 0.1.0 it produces:
+1. Check that both package names are `libscanio` and both versions match the
+   release tag (`vX.Y.Z`). Prereleases are rejected by this workflow.
+2. Build C libraries and call `packages.yml` to build and test Python wheels
+   and Node binaries from the release's commit.
+3. Attach C libraries, Python wheels, and the npm tarball to the GitHub release.
+4. Upload the wheels to PyPI and the npm tarball to npm using trusted publishing.
+
+All builds must pass before registry publishing starts. Publishing jobs live
+in `release.yml`, so use that filename for both registries' trusted publishers.
+Neither registry requires a token stored in GitHub Secrets.
+
+## One-time registry setup
+
+For PyPI's `libscanio` publisher:
+
+- GitHub owner: `melihbirim`
+- Repository: `libscanio`
+- Workflow: `release.yml`
+- Environment: leave blank (the job does not specify one)
+
+For npm, open the existing `libscanio` package settings and add a GitHub Actions
+trusted publisher using the same owner, repository, workflow, and blank
+environment. Allow direct `npm publish`. The job uses Node 24 and npm 11,
+with provenance enabled. See the [npm instructions](https://docs.npmjs.com/trusted-publishers/)
+and [PyPI instructions](https://docs.pypi.org/trusted-publishers/adding-a-publisher/).
+
+## Publish the next version
+
+1. Update `python/pyproject.toml` and `node/package.json` to the same version.
+2. Merge the changes and wait for CI. Keep package README examples current.
+3. On GitHub, draft a release with the matching tag, for example `v0.1.1`,
+   targeting the reviewed commit on `main`.
+4. Publish the GitHub release. Creating or pushing a tag alone does not publish
+   packages. Draft releases do not publish packages either.
+5. Check the Release workflow and the package pages on PyPI and npm.
+
+npm `0.1.0` was published manually and cannot be overwritten. Use a new version
+for the next release. Registry publications are independent, not atomic: if one
+fails after the other succeeds, fix its configuration and rerun only failed
+jobs. PyPI skips existing files so an interrupted wheel upload can resume.
+Never move a published version's tag to different code.
+
+## Build without publishing
+
+Run `Release` manually in Actions to build the same artifacts without uploading
+to registries or modifying a GitHub release. `Build packages` also runs on
+relevant pull requests and can be run manually; it builds only Python and npm
+artifacts and never publishes.
+
+The package matrix produces:
 
 - 25 Python wheels: CPython 3.10–3.14, Linux x64/ARM64 (glibc 2.28+),
   Windows x64, macOS x64/ARM64 (macOS 14+).
-- One npm tarball containing native addons for those five platforms.
-  Linux addons target glibc 2.28; Alpine/musl and Windows ARM64 are not included.
+- One npm tarball containing addons for all five platforms.
+  Alpine/musl and Windows ARM64 are not included.
 
 Python wheels are repaired by cibuildwheel and installed for native API and
-Arrow buffer ownership tests. Node addons run both binding suites on their
-native runners; the assembled tarball is installed and smoke-tested on Linux.
-No source distribution is uploaded: the current Python source package needs
-the parent Zig repository to build.
-
-After the workflow succeeds, download the `wheels-*` artifacts and the
-`npm-package` artifact from its Actions page. Wheel artifact ZIP files must
-be extracted before uploading. Keep every platform wheel for the release.
-
-To publish Python from your machine, check the extracted wheels with
-`python -m twine check wheelhouse/*.whl`, then upload them with
-`python -m twine upload wheelhouse/*.whl`. Twine can prompt for the PyPI token
-or retrieve it from the OS keyring. Do not commit credentials.
-
-The existing `Release` workflow publishes C libraries to GitHub Releases.
-Registry publishing is separate from both build workflows. Before tagging,
-ensure both package manifests and the tag agree on the release version.
+Arrow ownership tests. Node binaries run both binding suites on native runners;
+the assembled tarball is installed and smoke-tested on Linux. Source distributions
+are not published because the Python source package requires the parent Zig
+repository to build.
