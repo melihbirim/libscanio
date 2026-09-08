@@ -74,7 +74,7 @@ class BuildNative(build_ext):
             archive = aligned
         for ext in self.extensions:
             ext.extra_objects = [str(archive)]
-            ext.depends = [str(archive)]
+            ext.depends = [str(archive), str(PKG_DIR / "_api.c")]
         super().run()
 
 

@@ -34,3 +34,8 @@ import runpy
 runpy.run_path(sys.argv[2], run_name='__main__')
 '''
     subprocess.check_call([sys.executable, '-I', '-c', code, str(target), str(root / 'python' / 'tests' / 'test_scan.py')], cwd=work)
+
+    # Public APIs must also work without any bundled C ABI shared library.
+    for name in ('libscanio.so', 'libscanio.dylib', 'scanio.dll'):
+        (target / 'libscanio' / name).unlink(missing_ok=True)
+    subprocess.check_call([sys.executable, '-I', str(root / 'python' / 'tests' / 'test_native_only.py'), str(target)], cwd=work)

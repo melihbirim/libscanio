@@ -67,9 +67,16 @@ def main():
                 order = [('before', baseline), ('after', current)]
                 if rep % 2: order.reverse()
                 for label, lib in order:
-                    _loader._lib_cache = lib
                     start = time.perf_counter()
-                    report = scan.validate_report(path, schema, max_errors=100)
+                    handle = lib.scanio_validate(path.encode(), json.dumps(schema).encode(), 100)
+                    if not handle:
+                        raise RuntimeError(lib.scanio_last_error())
+                    try:
+                        raw = json.loads(lib.scanio_validate_json(handle).decode())
+                    finally:
+                        lib.scanio_validate_free(handle)
+                    raw['errors'] = scan._validation_errors(raw['errors'])
+                    report = scan.ValidationReport(**raw)
                     elapsed = time.perf_counter() - start
                     got = snapshot(report)
                     assert report.rows_total == args.rows
@@ -82,7 +89,6 @@ def main():
             results.append(dict(scenario=name, before=before, after=after, speedup=before/after,
                                 samples=samples, report=reference))
             print(f'| {name} | {before*1000:.2f} ms | {after*1000:.2f} ms | {before/after:.2f}x |', flush=True)
-    _loader._lib_cache = current
     if args.json:
         Path(args.json).write_text(json.dumps(dict(rows=args.rows,reps=args.reps,
             platform=platform.platform(),python=sys.version,results=results),indent=2)+'\n')

@@ -53,3 +53,7 @@ pub export fn scanio_python_validate(input: [*]const u8, input_len: usize, schem
 pub export fn scanio_python_build_mode() [*:0]const u8 {
     return @tagName(@import("builtin").mode);
 }
+
+comptime {
+    _ = @import("python_api.zig");
+}

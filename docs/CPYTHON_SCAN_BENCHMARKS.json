@@ -1,0 +1,240 @@
+{
+  "rows": 200000,
+  "columns": 4,
+  "input_bytes": 6706911,
+  "reps": 5,
+  "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+  "python": "3.14.4",
+  "results": [
+    {
+      "workload": "stream",
+      "medians": {
+        "cpython": {
+          "ms": 61.692333,
+          "peak_mib": 17.75
+        },
+        "ctypes_baseline": {
+          "ms": 107.678583,
+          "peak_mib": 19.515625
+        },
+        "python": {
+          "ms": 111.073583,
+          "peak_mib": 17.3125
+        }
+      },
+      "samples": {
+        "cpython": [
+          {
+            "ms": 63.209875,
+            "peak_mib": 17.734375,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 61.259542,
+            "peak_mib": 17.875,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 61.552917,
+            "peak_mib": 17.75,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 61.817125,
+            "peak_mib": 17.671875,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 61.692333,
+            "peak_mib": 17.859375,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          }
+        ],
+        "ctypes_baseline": [
+          {
+            "ms": 107.678583,
+            "peak_mib": 19.53125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 117.32975,
+            "peak_mib": 19.46875,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 111.119084,
+            "peak_mib": 19.390625,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 107.385666,
+            "peak_mib": 19.546875,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 106.994666,
+            "peak_mib": 19.515625,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          }
+        ],
+        "python": [
+          {
+            "ms": 110.529208,
+            "peak_mib": 17.28125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 110.336042,
+            "peak_mib": 17.453125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 111.929667,
+            "peak_mib": 17.453125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 111.152667,
+            "peak_mib": 17.28125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 111.073583,
+            "peak_mib": 17.3125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          }
+        ]
+      }
+    },
+    {
+      "workload": "materialize",
+      "medians": {
+        "cpython": {
+          "ms": 32.458167,
+          "peak_mib": 100.921875
+        },
+        "ctypes_baseline": {
+          "ms": 122.868,
+          "peak_mib": 115.0625
+        },
+        "python": {
+          "ms": 92.218083,
+          "peak_mib": 76.78125
+        }
+      },
+      "samples": {
+        "cpython": [
+          {
+            "ms": 32.817375,
+            "peak_mib": 103.328125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 32.373959,
+            "peak_mib": 99.3125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 32.458167,
+            "peak_mib": 99.515625,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 32.125375,
+            "peak_mib": 102.4375,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 38.483,
+            "peak_mib": 100.921875,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          }
+        ],
+        "ctypes_baseline": [
+          {
+            "ms": 122.868,
+            "peak_mib": 115.140625,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 121.516916,
+            "peak_mib": 111.75,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 126.765167,
+            "peak_mib": 115.515625,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 122.109,
+            "peak_mib": 113.84375,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 126.658167,
+            "peak_mib": 115.0625,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          }
+        ],
+        "python": [
+          {
+            "ms": 92.218083,
+            "peak_mib": 76.84375,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 92.401959,
+            "peak_mib": 76.796875,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 91.895667,
+            "peak_mib": 76.65625,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 92.442542,
+            "peak_mib": 76.78125,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          },
+          {
+            "ms": 91.779541,
+            "peak_mib": 76.640625,
+            "rows": 200000,
+            "digest": "d1147c8557912b4f766d4fad4392fd87f169bfb403466ddd01e69fc221d04d3b"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
     python_core_mod.addImport("scanio", scanio_mod);
     const python_core = b.addLibrary(.{ .name = "scanio_python", .linkage = .static, .root_module = python_core_mod });
     python_core.linkLibC();
+    python_core.bundle_compiler_rt = true;
     const python_core_step = b.step("python-core", "Build the static core for the CPython extension");
     python_core_step.dependOn(&b.addInstallArtifact(python_core, .{}).step);
 
@@ -393,6 +394,9 @@ pub fn build(b: *std.Build) void {
     python_test.step.dependOn(&python_extension.step);
     const python_test_step = b.step("python-test", "Run the Python binding test suite (needs python3)");
     python_test_step.dependOn(&python_test.step);
+    const native_only_test = b.addSystemCommand(&.{ python_cmd, "python/tests/test_native_only.py" });
+    native_only_test.step.dependOn(&python_test.step);
+    python_test_step.dependOn(&native_only_test.step);
 
     // Node binding — N-API addon. `zig build node` must have already
     // produced zig-out/lib/scanio.node; these tests load it directly,

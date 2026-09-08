@@ -36,8 +36,8 @@ zig build python-test -Doptimize=ReleaseFast
 python -m pip install ./python
 ```
 
-Both the extension and packaged shared library use ReleaseFast. Other Python
-APIs still use the shared library via ctypes. The extension has no runtime
+Both the extension and packaged shared library use ReleaseFast. All public Python
+APIs now use the extension; see [API migration](CPYTHON_API_MIGRATION.md). The extension has no runtime
 dependency on that shared library. Wheels are specific to CPython version,
 platform and architecture. Installed-wheel tests run outside the checkout.
 macOS archive members are repacked for Apple's alignment requirements; Windows

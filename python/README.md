@@ -8,10 +8,12 @@ ok = libscanio.validate(b"amount\n10\n", {"amount": {"min": 0}})
 failures = libscanio.validate(b"amount\n-1\n", {"amount": {"min": 0}}, mode="full")
 ```
 
-Validation uses a CPython extension that creates rejected Python rows directly.
+All public APIs use a CPython extension with the Zig core statically linked.
+Rows and validation errors are constructed directly through the Python C API.
 Fast mode returns a boolean. Full mode returns all failed values and errors.
-The previous summary API is `validate_report()`. Other scanning APIs use the
-bundled C ABI shared library.
+The previous summary API is `validate_report()`. Arrow uses native buffer
+ownership. The bundled C ABI library is retained for private diagnostics; public
+APIs do not require it.
 
 Build from the repository checkout with Zig 0.15.2, CPython 3.10 or newer,
 Python development headers and a C compiler:

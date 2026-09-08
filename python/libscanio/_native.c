@@ -159,10 +159,16 @@ static PyObject *build_mode(PyObject *self, PyObject *ignored) {
     return PyUnicode_FromString(scanio_python_build_mode());
 }
 
+#include "_api.c"
+
 static PyMethodDef methods[] = {
+    API_METHODS
     {"build_mode", build_mode, METH_NOARGS, "Optimization mode of the statically linked Zig validator."},
     {"validate", validate, METH_VARARGS, "Validate borrowed bytes/path; build only rejected Python rows."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "_native", NULL, -1, methods};
-PyMODINIT_FUNC PyInit__native(void) { return PyModule_Create(&module); }
+PyMODINIT_FUNC PyInit__native(void) {
+    if (PyType_Ready(&ApiBufferType) < 0) return NULL;
+    return PyModule_Create(&module);
+}
