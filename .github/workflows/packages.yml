@@ -1,0 +1,131 @@
+name: Build packages
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/packages.yml'
+      - 'python/**'
+      - 'node/**'
+      - 'src/**'
+      - 'build.zig'
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: Python wheels (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        if: runner.os != 'Linux'
+        with:
+          version: 0.15.2
+      - uses: pypa/cibuildwheel@v4.2.1
+        with:
+          package-dir: python
+        env:
+          CIBW_BUILD: 'cp310-* cp311-* cp312-* cp313-* cp314-*'
+          CIBW_SKIP: '*-musllinux* *-win32 *-win_arm64'
+          CIBW_ARCHS: native
+          # Linux builds run inside manylinux containers, not on the host.
+          CIBW_BEFORE_ALL_LINUX: 'python -m pip install --target /opt/scanio-zig ziglang==0.15.2'
+          CIBW_ENVIRONMENT_LINUX: 'PATH=/opt/scanio-zig/ziglang:$PATH'
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_MACOS: 'MACOSX_DEPLOYMENT_TARGET=14.0'
+          CIBW_TEST_REQUIRES: pyarrow
+          # Run outside the checkout, against the repaired, installed wheel.
+          CIBW_TEST_COMMAND: 'python {project}/python/tests/test_native_only.py .'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  node:
+    name: Node binary (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-gnu.2.28
+          - os: ubuntu-24.04-arm
+            target: aarch64-linux-gnu.2.28
+          - os: windows-latest
+            target: x86_64-windows-msvc
+          - os: macos-14
+            target: aarch64-macos.14.0
+          - os: macos-15-intel
+            target: x86_64-macos.14.0
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build and test native addon
+        shell: bash
+        run: |
+          VERSION=$(node -p 'process.versions.node')
+          curl -fsSL "https://nodejs.org/dist/v${VERSION}/node-v${VERSION}-headers.tar.gz" -o node-headers.tar.gz
+          tar -xzf node-headers.tar.gz
+          EXTRA=()
+          if [ "$RUNNER_OS" = Windows ]; then
+            curl -fsSL "https://nodejs.org/dist/v${VERSION}/win-x64/node.lib" -o node.lib
+            EXTRA+=("-Dnode-lib=$(pwd)/node.lib")
+          fi
+          zig build node -Doptimize=ReleaseFast '-Dtarget=${{ matrix.target }}' "-Dnode-include=node-v${VERSION}/include/node" "${EXTRA[@]}"
+          node node/test/addon_test.js
+          node node/test/test.js
+          mkdir -p node/binaries
+          cp zig-out/lib/scanio.node "node/binaries/$(node -p 'process.platform + "-" + process.arch').node"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.os }}
+          path: node/binaries/*.node
+          if-no-files-found: error
+
+  npm-package:
+    needs: node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          path: node/binaries
+          merge-multiple: true
+      - name: Assemble npm package
+        shell: bash
+        run: |
+          for PLATFORM in linux-x64 linux-arm64 win32-x64 darwin-x64 darwin-arm64; do
+            test -s "node/binaries/$PLATFORM.node"
+          done
+          cp LICENSE node/LICENSE
+          mkdir -p dist
+          npm pack ./node --pack-destination dist
+          mkdir -p "$RUNNER_TEMP/scanio-npm-test"
+          cd "$RUNNER_TEMP/scanio-npm-test"
+          npm install "$GITHUB_WORKSPACE/dist/libscanio-0.1.0.tgz"
+          node -e 'const fs=require("fs"),s=require("libscanio"); fs.writeFileSync("test.csv","id\n1\n2\n"); if(s.count("test.csv")!==2) throw Error("wrong row count")'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: dist/*.tgz
+          if-no-files-found: error
