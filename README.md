@@ -110,6 +110,18 @@ while (scanio_next(s, &fields, &n) == 1) {
 scanio_close(s);
 ```
 
+## CSV, NDJSON, and JSON files
+
+The Python and Node APIs accept `.csv`, `.ndjson`, and `.json` paths. NDJSON
+contains one flat object per line; JSON files contain an array of flat objects.
+The same scan, filter, count, batching, and validation APIs work across formats.
+Scanned field values are strings, including numeric JSON values.
+
+See the [Python examples](python/README.md#supported-file-formats) and
+[Node examples](node/README.md#supported-file-formats) for equivalent input
+files and runnable examples of all three formats. Python uploaded bytes need
+`format="json"` or `format="ndjson"`; CSV is the default for bytes.
+
 ## The rows a filter rejects
 
 Every filter has a complement, and for an import that complement is the

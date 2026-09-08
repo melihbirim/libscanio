@@ -14,25 +14,57 @@ x64/ARM64 (glibc 2.28+), Windows x64, and macOS 14+ on Intel and Apple Silicon.
 No Zig compiler or third-party npm runtime dependencies are required.
 Alpine/musl, Windows ARM64, and browsers are not supported by these binaries.
 
-## Scan and filter
+## Supported file formats
 
-Given `orders.csv` with `id` and `amount` columns:
+These three files represent the same rows:
+
+**`orders.csv`**
+
+```csv
+id,amount
+1,50
+2,150
+```
+
+**`orders.ndjson`** — one flat JSON object per line:
+
+```jsonl
+{"id": 1, "amount": 50}
+{"id": 2, "amount": 150}
+```
+
+**`orders.json`** — an array of flat JSON objects:
+
+```json
+[
+  {"id": 1, "amount": 50},
+  {"id": 2, "amount": 150}
+]
+```
+
+File-based APIs select the format from the file extension. The same filters,
+scans, batches, and validation rules work across all three formats. Scanned
+values are strings, including numbers from JSON.
+
+## Scan and filter
 
 ```js
 const scanio = require('libscanio');
 
 async function main() {
-  for await (const row of scanio.scan('orders.csv', {where: 'amount > 100'})) {
-    console.log(row); // object with string values
-  }
+  for (const path of ['orders.csv', 'orders.ndjson', 'orders.json']) {
+    for await (const row of scanio.scan(path, {where: 'amount > 100'})) {
+      console.log(row); // { id: '2', amount: '150' }
+    }
 
-  console.log(scanio.count('orders.csv', 'amount > 100'));
+    console.log(scanio.count(path, 'amount > 100')); // 1
 
-  for await (const batch of scanio.scanBatches('orders.csv', {
-    batchSize: 1024,
-    asObjects: false,
-  })) {
-    console.log(batch); // arrays of string values
+    for await (const batch of scanio.scanBatches(path, {
+      batchSize: 1024,
+      asObjects: false,
+    })) {
+      console.log(batch); // arrays of string values
+    }
   }
 }
 
@@ -44,8 +76,10 @@ main().catch(console.error);
 ```js
 const scanio = require('libscanio');
 
-const report = scanio.validate('orders.csv', {amount: {min: 0}});
-console.log(report);
+for (const path of ['orders.csv', 'orders.ndjson', 'orders.json']) {
+  const report = scanio.validate(path, {amount: {min: 0}});
+  console.log(report); // both rows are valid in every format
+}
 ```
 
 `validate()` returns a validation report. `validateIter()` and

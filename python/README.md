@@ -18,21 +18,52 @@ The core APIs have no third-party Python runtime dependencies. Only
 `scan_table()` requires an optional installation of PyArrow and currently
 returns a `pyarrow.Table`.
 
-## Scan and filter
+## Supported file formats
 
-Given `orders.csv` with `id` and `amount` columns:
+These three files represent the same rows:
+
+**`orders.csv`**
+
+```csv
+id,amount
+1,50
+2,150
+```
+
+**`orders.ndjson`** — one flat JSON object per line:
+
+```jsonl
+{"id": 1, "amount": 50}
+{"id": 2, "amount": 150}
+```
+
+**`orders.json`** — an array of flat JSON objects:
+
+```json
+[
+  {"id": 1, "amount": 50},
+  {"id": 2, "amount": 150}
+]
+```
+
+File-based APIs select the format from the file extension. The same filters,
+scans, batches, and validation rules work across all three formats. Scanned
+values are strings, including numbers from JSON.
+
+## Scan and filter
 
 ```python
 import libscanio
 
-for row in libscanio.scan("orders.csv", where="amount > 100"):
-    print(row)  # dictionary of string values
+for path in ("orders.csv", "orders.ndjson", "orders.json"):
+    for row in libscanio.scan(path, where="amount > 100"):
+        print(row)  # {"id": "2", "amount": "150"}
 
-count = libscanio.count("orders.csv", where="amount > 100")
+    count = libscanio.count(path, where="amount > 100")  # 1
 
-for batch in libscanio.scan_batches("orders.csv", batch_size=1024, as_dict=False):
-    for values in batch:
-        print(values)  # tuple of strings
+    for batch in libscanio.scan_batches(path, batch_size=1024, as_dict=False):
+        for values in batch:
+            print(values)  # tuple of strings
 ```
 
 Streaming keeps memory bounded by parser buffers and the current batch.
@@ -48,6 +79,14 @@ schema = {"amount": {"min": 0}}
 
 # Default: stop at the first failure and return a boolean.
 ok = libscanio.validate(b"amount\n10\n", schema)
+
+# Uploaded JSON and NDJSON bytes require an explicit format.
+ok_json = libscanio.validate(b'[{"amount": 10}]', schema, format="json")
+ok_ndjson = libscanio.validate(b'{"amount": 10}\n', schema, format="ndjson")
+
+# Paths infer the format from their extension.
+for path in ("orders.csv", "orders.ndjson", "orders.json"):
+    assert libscanio.validate(path, schema)
 
 # Full: return only failed rows and their errors.
 failures = libscanio.validate(b"amount\n-1\n", schema, mode="full")
