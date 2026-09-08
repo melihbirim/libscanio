@@ -144,7 +144,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python comparison engines
-        run: python -m pip install polars==1.44.1 pyarrow==25.0.1
+        run: python -m pip install polars==1.44.1 pyarrow==25.0.1 setuptools wheel
+
+      - name: Build the CPython comparison extension
+        run: zig build python-extension -Doptimize=ReleaseFast
 
       - name: Benchmark (report timings, gate on rows + memory ceiling)
         shell: bash

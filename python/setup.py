@@ -1,6 +1,6 @@
 """
-Build the shared library for ctypes APIs and a CPython extension statically
-linked to the Zig validator. Both use ReleaseFast; wheels are platform-specific.
+Build the diagnostic C ABI library and a CPython extension statically
+linked to the Zig core. Both use ReleaseFast; wheels are platform-specific.
 """
 
 import platform
@@ -79,6 +79,9 @@ class BuildNative(build_ext):
 
 
 setup(
-    ext_modules=[Extension("libscanio._native", ["libscanio/_native.c"])],
+    # Zig's Windows filesystem implementation calls NT APIs directly. Static
+    # archives do not propagate their system-library dependencies to MSVC.
+    ext_modules=[Extension("libscanio._native", ["libscanio/_native.c"],
+                           libraries=["ntdll"] if sys.platform == "win32" else [])],
     cmdclass={"build_py": BuildZigLib, "build_ext": BuildNative},
 )
