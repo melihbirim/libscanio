@@ -735,5 +735,69 @@ check('ragged fields retained', libscanio.validate(b'a\n1,extra\n', {}, mode='fu
 check('duplicate headers retained', libscanio.validate(b'a,a\nbad,2\n', rules, mode='full')[0]['values'], ['bad','2'])
 check('large record crosses buffers', libscanio.validate(b'a\n' + b'x' * 200000 + b'\n', rules, mode='full')[0]['values'], ['x' * 200000])
 
+
+# CPython extension vs the retained C JSON bridge: exact result contracts.
+from libscanio import _native, _loader
+import ctypes
+check('CPython core is ReleaseFast', _native.build_mode(), 'ReleaseFast')
+for payload, fmt in [(b'a,b\n1,ok\n-2,\nbad,x\n5,too-long\n1,ok,extra\n', 1),
+                     (b'[{"a":1,"b":"ok"},{"a":-2,"b":""},{"a":"bad","b":"x"}]', 2)]:
+    sch = {'a': {'type':'integer', 'min':0}, 'b': {'required':True, 'min_len':2, 'max_len':3}}
+    lib = _loader.load()
+    for full in [False, True]:
+        ptr = lib.scanio_validate_outcome(payload, len(payload), json.dumps(sch).encode(), fmt, full)
+        if not ptr: raise AssertionError('JSON reference failed')
+        try: expected = json.loads(ctypes.string_at(ptr))
+        finally: lib.scanio_outcome_free(ptr)
+        actual = _native.validate(payload, json.dumps(sch).encode(), fmt, full)
+        check(f'CPython/JSON parity format={fmt} full={full}', actual, expected)
+        if full:
+            original = json.loads(json.dumps(actual))
+            for _ in range(100): _native.validate(payload, json.dumps(sch).encode(), fmt, True)
+            check('CPython retained output owns its strings', actual, original)
+            actual[0]['errors'][0]['rule'] = 'edited'
+            check('CPython failures are independent', actual[1:], original[1:])
+check_raises('CPython raw input type', lambda: _native.validate('a', b'{}', 1, 0), TypeError)
+check_raises('CPython raw format', lambda: _native.validate(b'a', b'{}', 3, 0), ValueError)
+check_raises('CPython raw mode', lambda: _native.validate(b'a', b'{}', 1, 2), ValueError)
+for _ in range(100):
+    try: libscanio.validate(b'a\nbad\n"unfinished', rules, mode='full')
+    except libscanio.ScanError: pass
+    else: raise AssertionError('malformed tail accepted')
+check('CPython usable after partial-result failures', libscanio.validate(b'a\n1\n', rules), True)
+
+
+# A long native scan must remain interruptible while holding the GIL.
+import signal
+if hasattr(signal, 'setitimer'):
+    payload = b'a\n' + b'1\n' * 2000000
+    previous = signal.getsignal(signal.SIGALRM)
+    def interrupt_validation(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGALRM, interrupt_validation)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.001)
+        check_raises('CPython long scan handles signals', lambda: libscanio.validate(payload, rules), KeyboardInterrupt)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+# Containers must participate in GC once published to mutable Python callers.
+import gc
+import weakref
+class CycleMarker:
+    pass
+result = libscanio.validate(b'a\nbad\n', rules, mode='full')
+check('CPython published containers are GC tracked',
+      all(gc.is_tracked(x) for x in [result, result[0], result[0]['values'], result[0]['errors']]), True)
+marker = CycleMarker()
+reference = weakref.ref(marker)
+result[0]['values'].extend([marker, result])
+result[0]['errors'].append(result)
+del marker, result
+gc.collect()
+check('CPython caller-created cycles are collected', reference() is None, True)
+
 print(f"\n{passed}/{total} Python binding tests passed")
 sys.exit(0 if passed == total else 1)

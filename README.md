@@ -166,8 +166,9 @@ failed = libscanio.validate(uploaded_bytes, schema, mode="full")
 ```
 
 Full mode returns every failed record and every error, without row numbers.
-Valid rows never become Python objects. Its memory use grows with rejected
-data. Bytes accept `format="csv"`, `"ndjson"`, or `"json"`; paths infer format
+Valid rows never become Python objects. A CPython extension creates failed
+rows directly, without intermediate row JSON. Its memory use grows with
+rejected data. See [CPython validation benchmarks](docs/CPYTHON_VALIDATION.md). Bytes accept `format="csv"`, `"ndjson"`, or `"json"`; paths infer format
 from their extension. File-like objects/chunk streams are not yet accepted.
 Input bytes stay owned by Python and are read through a bounded native buffer.
 Fast mode stops after the first invalid record and does not inspect the rest;

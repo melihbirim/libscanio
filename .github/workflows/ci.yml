@@ -39,8 +39,8 @@ jobs:
       # arrays) is exactly the platform-specific surface CI exists to
       # catch — install pyarrow so its tests actually run here instead
       # of only ever being exercised on whichever machine has it locally.
-      - name: pip install pyarrow
-        run: python3 -m pip install pyarrow
+      - name: pip install pyarrow setuptools wheel
+        run: python3 -m pip install pyarrow setuptools wheel
 
       - uses: actions/setup-node@v4
         with:
@@ -57,6 +57,9 @@ jobs:
 
       - name: zig build python-test
         run: zig build python-test
+
+      - name: Build and test installed Python wheel
+        run: python python/tests/test_wheel.py
 
       # Node binding tested in the separate node-napi job below, not here
       # — it needs Windows-specific setup (node.lib fetch) that job

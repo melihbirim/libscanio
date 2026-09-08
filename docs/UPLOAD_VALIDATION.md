@@ -4,6 +4,7 @@ Python `validate(source, schema)` now returns a boolean and defaults to fast
 mode. It stops after the first invalid record. `mode="full"` scans the entire
 input and returns every failed record, with all its errors and no row numbers.
 Valid records are never serialized or converted into Python objects.
+Python validation uses the CPython extension; see [CPYTHON_VALIDATION.md](CPYTHON_VALIDATION.md) for current speed and memory measurements.
 
 ```python
 import libscanio
@@ -29,8 +30,8 @@ names and extra fields on ragged rows. Errors identify the zero-based column
 and its name; structural errors have a null column. JSON uses the same flat
 record parser and first-record column inference as the existing scanner.
 
-Full mode has no failure cap. Memory grows with rejected data; during conversion
-native JSON and Python results can coexist. Fast mode retains no error list;
+Full mode has no failure cap. Memory grows with rejected data. The CPython
+extension constructs failed rows directly, without an intermediate JSON copy. Fast mode retains no error list;
 parser memory depends on buffering, record size and schema. Encountered I/O,
 UTF-8, schema and parser errors raise `ScanError`. A malformed tail after an
 early validation failure is deliberately not examined in fast mode.
@@ -42,7 +43,7 @@ is now `validate_report(...)`. Repository callers have been migrated.
 Node, CLI and existing C report functions retain their previous contracts.
 The additive C API is `scanio_validate_outcome` / `scanio_outcome_free`.
 
-## Performance evidence
+## Historical JSON-bridge performance evidence
 
 ```sh
 zig build c-lib -Doptimize=ReleaseFast

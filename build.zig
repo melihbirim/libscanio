@@ -84,6 +84,18 @@ pub fn build(b: *std.Build) void {
     const run_where_parser_tests = b.addRunArtifact(where_parser_tests);
     test_step.dependOn(&run_where_parser_tests.step);
 
+    const python_core_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/python_core.zig"),
+        .pic = true,
+    });
+    python_core_mod.addImport("scanio", scanio_mod);
+    const python_core = b.addLibrary(.{ .name = "scanio_python", .linkage = .static, .root_module = python_core_mod });
+    python_core.linkLibC();
+    const python_core_step = b.step("python-core", "Build the static core for the CPython extension");
+    python_core_step.dependOn(&b.addInstallArtifact(python_core, .{}).step);
+
     const c_lib = b.addLibrary(.{
         .name = "scanio",
         .linkage = .dynamic,
@@ -372,8 +384,13 @@ pub fn build(b: *std.Build) void {
     const smoke_test_step = b.step("smoke-test", "dlopen() the built C ABI shared library and exercise it for real (needs python3)");
     smoke_test_step.dependOn(&smoke_test.step);
 
+    const python_extension = b.addSystemCommand(&.{ python_cmd, "setup.py", "build_ext", "--inplace" });
+    python_extension.setCwd(b.path("python"));
+    const python_extension_step = b.step("python-extension", "Build the ReleaseFast CPython extension");
+    python_extension_step.dependOn(&python_extension.step);
     const python_test = b.addSystemCommand(&.{ python_cmd, "python/tests/test_scan.py" });
     python_test.step.dependOn(c_lib_step);
+    python_test.step.dependOn(&python_extension.step);
     const python_test_step = b.step("python-test", "Run the Python binding test suite (needs python3)");
     python_test_step.dependOn(&python_test.step);
 

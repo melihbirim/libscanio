@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "libscanio"
 version = "0.1.0"
 description = "Scan huge CSV files without loading them into memory — a tiny, fast streaming scan engine"
-readme = "../README.md"
+readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 keywords = ["csv", "scan", "streaming", "fast", "embeddable"]
@@ -30,4 +30,4 @@ where = ["."]
 include = ["libscanio*"]
 
 [tool.setuptools.package-data]
-libscanio = ["*.so", "*.dylib", "*.dll"]
+libscanio = ["libscanio.so", "libscanio.dylib", "scanio.dll"]

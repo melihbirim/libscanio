@@ -7,3 +7,8 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+python/libscanio/_native*.so
+python/libscanio/_native*.pyd
+python/libscanio/*.dylib
+python/libscanio/*.dll

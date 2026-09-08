@@ -1035,17 +1035,14 @@ def validate(source, schema: dict, *, mode="fast", format=None):
         if b"\x00" in data:
             raise ValueError("path contains NUL")
         source_format = 0
-    lib = load()
-    native = getattr(lib, "scanio_validate_outcome", None)
-    if native is None:
-        raise ScanError("Rebuild libscanio: zig build c-lib -Doptimize=ReleaseFast")
-    result = native(data, len(data), json.dumps(schema).encode(), source_format, mode == "full")
-    if not result:
-        _raise_last_error(lib, "validate failed")
     try:
-        return json.loads(ctypes.string_at(result))
-    finally:
-        lib.scanio_outcome_free(result)
+        from . import _native
+    except ImportError as exc:
+        raise ScanError("Build the CPython extension: zig build python-extension (requires setuptools and a C compiler)") from exc
+    try:
+        return _native.validate(data, json.dumps(schema).encode(), source_format, mode == "full")
+    except ValueError as exc:
+        raise ScanError(str(exc)) from exc
 
 
 def validate_report(path: str, schema: dict, max_errors: int = 100) -> ValidationReport:

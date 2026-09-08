@@ -320,14 +320,20 @@ pub const Validator = struct {
         return .{ .allocator = allocator, .query = query, .schema = schema, .owned_schema = schema };
     }
 
+    /// Validation outcome traversal, with no retained errors in fast mode.
+    pub fn nextOutcome(self: *Validator, full: bool) !?ValidatedRow {
+        const item = (try self.nextWithSink(if (full) std.math.maxInt(usize) else 0, null)) orelse return null;
+        for (item.row.fields) |field| if (!std.unicode.utf8ValidateSlice(field)) return error.InvalidUtf8;
+        return item;
+    }
+
     /// Only failed records are serialized. Fast mode returns immediately
     /// after the first invalid record, without constructing output rows.
     pub fn writeOutcome(self: *Validator, w: *std.io.Writer, full: bool) !void {
         for (self.header()) |field| if (!std.unicode.utf8ValidateSlice(field)) return error.InvalidUtf8;
         if (full) try w.writeByte('[');
         var first = true;
-        while (try self.nextWithSink(if (full) std.math.maxInt(usize) else 0, null)) |item| {
-            for (item.row.fields) |field| if (!std.unicode.utf8ValidateSlice(field)) return error.InvalidUtf8;
+        while (try self.nextOutcome(full)) |item| {
             if (!full) {
                 if (self.rows_invalid > 0) return w.writeAll("false");
                 continue;
