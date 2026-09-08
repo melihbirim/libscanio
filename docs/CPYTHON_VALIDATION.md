@@ -71,4 +71,5 @@ is faster in handwritten Python. These are local measurements, not Lambda
 latency guarantees or evidence for every schema and file shape.
 
 Reproduce with `python3 bench/upload_validation_memory.py` on macOS/Linux.
-The script writes [raw samples](CPYTHON_VALIDATION_BENCHMARKS.json).
+The script writes `cpython-validation-results.json` locally; generated samples
+are not committed.

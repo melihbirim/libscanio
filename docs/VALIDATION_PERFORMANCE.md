@@ -4,7 +4,7 @@ For the newer native file-routing path that avoids host-language conversion,
 see [native imports](NATIVE_IMPORT.md). The numbers below describe the earlier
 rule-evaluation optimization.
 
-`validate()` runs a native scan and returns a report. Streaming validation
+`validate_report()` runs a native scan and returns a report. Streaming validation
 also returns every row and its failures to the host language. Optimizing
 one does not remove the costs of conversion, application logic, or writing
 the destination in the other.
@@ -63,37 +63,6 @@ python3 bench/validation.py --baseline /path/to/saved/library \
 Use the platform's `.dylib`, `.so`, or `.dll` file. The baseline must provide
 the current binding symbols; this comparison starts at `e0372c4`.
 
-## Complete import benchmark
-
-This fixture has four columns, four validation rules, and 200,000 rows.
-Each implementation writes accepted rows as CSV and rejected rows as JSONL
-containing their original values and every failure. Native Python implements
-these fixture rules independently. The output hashes match exactly: 180,000
-accepted rows, 20,000 rejected rows. This is a local file import, not a
-network/database load benchmark.
-
-After one warmup, three repetitions rotate engine order. Median time includes
-opening, validation, conversion, writing, and closing both output files.
-Input generation and output verification are excluded. Writes use the OS
-cache; there is no fsync durability guarantee in this benchmark.
-
-| Implementation | Complete import |
-|---|---:|
-| Handwritten Python CSV validation | 570 ms |
-| Python `validate_iter()` | 746 ms |
-| Python `validate_batches()` | 539 ms |
-
-Batches and native Python are comparable here. Native samples ranged from
-512 to 623 ms and batch samples from 531 to 559 ms, so the median difference
-is not a reliable superiority claim. The row iterator remains slower. Output work
-and host-language object conversion can outweigh native validation gains.
-
-```sh
-zig build c-lib -Doptimize=ReleaseFast
-python3 bench/import_validation.py --rows 200000 --reps 3 --json import-results.json
-```
-
-[Measurement samples and output hashes](VALIDATION_BENCHMARKS.json) accompany
-this snapshot. CI runs a small import checksum test without a timing gate.
-Calendar, numeric edge cases, enum lookup parity, report-cap boundaries,
-and allocation cleanup are covered by core and cross-client tests.
+For complete import measurements and reproduction instructions, see
+[native imports](NATIVE_IMPORT.md). Generated samples are kept locally or
+as CI artifacts.

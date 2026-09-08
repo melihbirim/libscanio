@@ -86,7 +86,7 @@ Engine order rotates, one warmup is excluded, and the OS cache is not cleared.
 CI runs this path on a small fixture and gates output equality, not speed.
 
 
-## Local results
+## Historical local results (before the CPython migration)
 
 macOS arm64, Python 3.14.4, Zig 0.15.2 ReleaseFast. Five measured repetitions
 at 200,000 rows and three at 1,000,000 rows, after a warmup:
@@ -106,6 +106,7 @@ saving. Output hashes were identical across engines: 180,000 accepted /
 This benefit applies when the native file outputs satisfy the actual import
 requirement; it does not accelerate arbitrary Python per-row business logic.
 
-[Samples and output hashes](NATIVE_IMPORT_BENCHMARKS.json) are recorded here.
+The reproduction command writes samples and output hashes to `import-results.json`.
+Generated results are kept locally or as CI artifacts.
 Numbers from the older import benchmark are not directly interchangeable:
 all engines now emit the same compact positional rejection JSONL format.

@@ -81,43 +81,5 @@ includes runtime/imports; Python RSS is unavailable on Windows. Timing and
 memory differences depend on batch size, row width, invalid-row rate,
 runtime, and machine. CI runs a small checksum smoke test with no speed gate.
 
-## Local measurement snapshot
-
-200,000 rows, three repetitions, batch size 1,024, 1 MiB byte target;
-macOS arm64, Python 3.14.4, Node 22.21.0, ReleaseFast. Medians below are
-from this implementation. `csv-reader` returns lists, `python-batch-tuple`
-returns tuples; both use the same sequence consumer. Dictionary rows use
-identical dictionary consumers. Node array/object results have their own
-matching consumer. These are consumption benchmarks, not claims about all
-API functions or other schemas. Raw data: [BATCH_BENCHMARKS.json](BATCH_BENCHMARKS.json).
-
-
-Scan + consume all fields
-| engine | cold process | warm query | cold peak RSS |
-|---|---:|---:|---:|
-| csv-dict | 375.8 ms | 342.7 ms | 22.9 MiB |
-| python-row | 556.2 ms | 485.9 ms | 24.2 MiB |
-| python-batch-dict | 354.8 ms | 296.9 ms | 25.8 MiB |
-| csv-reader | 233.7 ms | 178.8 ms | 22.8 MiB |
-| python-batch-tuple | 251.8 ms | 186.6 ms | 25.7 MiB |
-| node-row | 322.4 ms | 222.8 ms | 60.5 MiB |
-| node-batch-object | 274.1 ms | 160.3 ms | 75.4 MiB |
-| node-batch-array | 243.3 ms | 128.9 ms | 75.2 MiB |
-
-Validation + consume all fields/errors
-| engine | cold process | warm query | cold peak RSS |
-|---|---:|---:|---:|
-| csv-dict | 430.9 ms | 375.9 ms | 22.8 MiB |
-| python-row | 703.5 ms | 624.1 ms | 24.4 MiB |
-| python-batch-dict | 475.0 ms | 403.4 ms | 26.6 MiB |
-| csv-reader | 268.8 ms | 210.2 ms | 23.0 MiB |
-| python-batch-tuple | 370.0 ms | 302.1 ms | 26.7 MiB |
-| node-row | 379.7 ms | 278.3 ms | 60.4 MiB |
-| node-batch-object | 320.6 ms | 196.5 ms | 91.9 MiB |
-| node-batch-array | 277.8 ms | 173.1 ms | 76.0 MiB |
-
-Batching improved warm dictionary/object scan and validation in this run,
-with higher peak RSS. Python's built-in reader remained faster for sequence
-consumption, and the handwritten Python validation loop remained faster
-than our batched validation. JSON transport and runtime object creation
-still cost time; batching reduces those costs without eliminating them.
+For current Python bridge measurements, see [CPython API migration](CPYTHON_API_MIGRATION.md).
+Generated JSON results remain local or in CI artifacts.

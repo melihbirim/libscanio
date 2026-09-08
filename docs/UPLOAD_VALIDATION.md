@@ -43,31 +43,5 @@ is now `validate_report(...)`. Repository callers have been migrated.
 Node, CLI and existing C report functions retain their previous contracts.
 The additive C API is `scanio_validate_outcome` / `scanio_outcome_free`.
 
-## Historical JSON-bridge performance evidence
-
-```sh
-zig build c-lib -Doptimize=ReleaseFast
-PYTHONPATH=python python3 bench/upload_validation.py --rows 200000 --reps 5
-```
-
-200,000 in-memory CSV records, five repetitions, macOS arm64 / Python 3.14.4.
-The Python baseline uses csv.reader and a handwritten float/minimum check.
-Both implementations produce identical decisions and rejected values/errors
-for these fixtures. Generation and warmup are excluded. Full timings include
-constructing the returned Python objects. This is a warm local benchmark,
-not an AWS Lambda measurement or a comparison of every supported rule.
-
-| Scenario | Mode | Native median | Python median |
-|---|---|---:|---:|
-| All valid | fast | 7.46 ms | 40.58 ms |
-| All valid | full | 7.58 ms | 40.52 ms |
-| First invalid | fast | 0.011 ms | 0.005 ms |
-| Only first invalid | full | 7.54 ms | 41.15 ms |
-| 1% invalid | full | 9.33 ms | 43.27 ms |
-| All invalid | full | 215.44 ms | 121.71 ms |
-
-Call/setup overhead dominates an immediate failure. Full mode with widespread
-failures is slower than handwritten Python because every rejected value and
-error crosses the JSON boundary. The speedup applies to complete scans with
-few failures, not universally. Raw samples are in
-[UPLOAD_VALIDATION_BENCHMARKS.json](UPLOAD_VALIDATION_BENCHMARKS.json).
+For current measurements and reproduction instructions, see
+[CPython validation](CPYTHON_VALIDATION.md).

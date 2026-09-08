@@ -1,4 +1,6 @@
-# Categorized benchmark snapshot
+# Historical categorized benchmark snapshot
+
+These results predate the CPython migration. See [current Python measurements](CPYTHON_API_MIGRATION.md).
 
 Measured locally on 2026-09-07; 200,000 input rows per format, median of
 three repetitions per timing mode. Zig 0.15.2 ReleaseFast, Apache Arrow JS

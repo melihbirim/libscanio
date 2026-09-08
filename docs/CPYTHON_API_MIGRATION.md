@@ -50,7 +50,7 @@ Materialization retains the parallel columnar allocation while constructing
 Python rows, so its peak memory remains higher than csv.reader. These are local
 fixture measurements, not universal or Lambda performance guarantees.
 
-[Raw samples](CPYTHON_SCAN_BENCHMARKS.json). Reproduce with
+Reproduce with
 `SCANIO_BASELINE_PACKAGE=/path/to/old/package/parent python bench/cpython_scan.py`.
 Build both package versions in ReleaseFast first. The script writes
 `cpython-scan-results.json` in the working directory.
@@ -64,4 +64,5 @@ embedded NULs, empty buffers, and Arrow ownership after garbage collection.
 The installed wheel passes after removing its bundled shared library, and
 Python tests pass with `PYTHONMALLOC=debug`. A separate before/after comparison
 matched 117 cases across CSV, NDJSON, and JSON, including batch boundaries.
-Linux and Windows execution remains for CI; local verification is macOS only.
+The Linux, Windows, and macOS CI jobs also pass, including installed-wheel
+tests and cross-client differential checks.

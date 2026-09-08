@@ -12,3 +12,7 @@ python/libscanio/_native*.so
 python/libscanio/_native*.pyd
 python/libscanio/*.dylib
 python/libscanio/*.dll
+
+# Generated benchmark samples belong in local output or CI artifacts.
+/*-results.json
+/docs/*BENCHMARKS.json
