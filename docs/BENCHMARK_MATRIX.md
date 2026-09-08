@@ -6,7 +6,7 @@ Measured locally on 2026-09-07; 200,000 input rows per format, median of
 three repetitions per timing mode. Zig 0.15.2 ReleaseFast, Apache Arrow JS
 21.2.0, csv-parse 7.0.2; other runtime versions appear below. These are
 single-machine observations, not universal speed or memory guarantees.
-See [methodology](BENCHMARKS.md#ecosystem-comparison--equivalent-workloads).
+See [methodology](BENCHMARKS.md#ecosystem-comparison-pyarrow-polars-nodearrow-js).
 
 ```bash
 python bench/compare.py --rows 200000 --reps 3 \
