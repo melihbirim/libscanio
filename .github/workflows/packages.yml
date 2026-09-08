@@ -117,7 +117,7 @@ jobs:
           for PLATFORM in linux-x64 linux-arm64 win32-x64 darwin-x64 darwin-arm64; do
             test -s "node/binaries/$PLATFORM.node"
           done
-          cp LICENSE node/LICENSE
+          cp LICENSE.md node/LICENSE
           mkdir -p dist
           npm pack ./node --pack-destination dist
           mkdir -p "$RUNNER_TEMP/scanio-npm-test"
