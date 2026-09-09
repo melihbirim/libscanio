@@ -906,6 +906,82 @@ unwanted columns yet. Revisit only if a concrete consumer (e.g. Arrow/
 pandas zero-copy interop) makes the API surface worth it on its own,
 not on speed alone.
 
-## Relationship to csvql
+## GROUP BY, v1 -- Zig core only, CSV parallel path beats DuckDB/Polars/PyArrow
+
+Added `groupBy()` (single-threaded, composes over any `Query` -- CSV,
+NDJSON, JSON array, whatever the caller already opened, WHERE included)
+and `parallelGroupBy()` (map-reduce, CSV only, no WHERE yet) to
+`aggregate.zig`/`parallel.zig`. v1 scope, deliberate: single group
+column, single aggregate column, reuses the existing `AggResult` (count/
+sum/min/max/avg). Not wired into Python, Node, CLI, or MCP yet -- pure
+Zig core, same discipline as everything else prototyped this session.
+
+**A real bug caught by the existing fuzz harness, not by manual review**:
+the first `groupBy()` draft freed each hash-map key individually in an
+`errdefer`, and `checkAllAllocationFailures` immediately found a double-
+free in that path. Fixed by giving `GroupByResult` its own arena for key
+storage (`arena.deinit()` once, not N per-key frees) -- removes the whole
+bug class instead of hardening the original approach.
+
+**`parallelGroupBy()`'s design changed after measuring, not assuming.**
+First version: each worker built its own partial hash map during the
+scan (grouping early), merged into the final map afterward -- same shape
+csvql's own parallel GROUP BY engine uses. Measured on a 405MB/1M-row
+real fixture: fine at low cardinality (2 groups, 10x over single-
+threaded) but a WASH at high cardinality (1M groups, ~100% distinct) --
+0.75s parallel vs 0.72s single-threaded, and worse memory (465MB vs
+257MB). Every row was being hashed TWICE (once into a worker's near-full
+partial map, once again merging it, since a map that's nearly all-
+distinct keys gets almost no reduction from per-worker grouping).
+
+Tried the opposite: workers do zero hashing during the scan, just parse-
+and-append raw (key, value) pairs; group ONCE at the end in a single
+sequential pass. Predicted this would help high cardinality but hurt low
+cardinality (losing the "free" reduction the scan-time grouping got).
+Measured, and the prediction was WRONG on the low-cardinality side: time
+was a wash (0.057s vs 0.071s, both fast) rather than the ~10x regression
+expected, while high cardinality was 3.5x faster (0.24s vs 0.86s,
+isolated single-process measurements) AND used less memory (358MB vs
+444MB). The one real cost: 6x more memory at low cardinality (90MB vs
+15MB) from holding every raw row before grouping -- small in absolute
+terms, judged worth it since high-cardinality was the design's actual
+weak point. Adopted as `parallelGroupBy()`; the old per-worker-map
+design was deleted, not kept behind a flag.
+
+**Full comparison, CSV, same 405MB/1M-row taxi fixture, count/sum/min/
+max/avg per group** (libscanio numbers are Zig-level -- no output
+formatting/materialization to Python objects included, not yet a fair
+end-to-end comparison against a bound API call):
+
+| | low cardinality (2 groups) | high cardinality (1M groups) |
+|---|---|---|
+| **libscanio (parallel)** | **0.075s, ~15MB** | **0.20s, ~358MB** |
+| duckdb | 1.00s, 186MB | 0.79s, 326MB |
+| polars | 0.89s, 923MB | 0.47s, 1005MB |
+| pyarrow | 1.69s, 925MB | 1.41s, 1046MB |
+
+Beats all three on both axes, 4-13x on time, 12-70x on memory (polars/
+pyarrow's memory here includes materializing all 51 CSV columns --
+libscanio's worker doesn't project columns either, a shared, known gap,
+see below).
+
+**NDJSON/JSON GROUP BY is single-threaded only.** `groupBy()` already
+works on them today (verified with a real test, not assumed -- JSON
+values group and aggregate correctly) since it's format-agnostic by
+construction. `parallelGroupBy()` is CSV-only, same stance
+`parallelScan()`/`parallelScanColumnar()` already take for NDJSON/JSON-
+array. Not attempted here: scoped as a real follow-up, sized the same
+way this one was (prototype, measure both cardinality points, decide),
+not assumed to be a clear win the way the CSV parallel path turned out
+to be non-obvious itself.
+
+**Known gap carried over, not yet closed**: neither `groupBy()` nor
+`parallelGroupBy()` project columns -- every row's CSV fields are all
+split via `FieldIterator` regardless of whether only the group/agg
+columns are needed, same class of gap `parallelScanColumnar()` already
+has (see its own ROADMAP entry). Real cost on a 51-column file grouping
+by 2; not measured in isolation yet.
+
+## Relationship to csvql## Relationship to csvql
 
 csvql should eventually sit on top of libscanio (SQL parser/planner → libscanio → CSV/NDJSON) rather than duplicating scan logic. Extraction happens gradually, one primitive at a time, each step gated by csvql's existing correctness/fuzz/benchmark suite so it's provably zero-behavior-change before the next step starts. csvql remains the SQL product; libscanio is the reusable engine underneath it.

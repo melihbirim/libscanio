@@ -117,6 +117,8 @@ pub const batch = @import("batch.zig");
 const aggregate_mod = @import("aggregate.zig");
 pub const AggResult = aggregate_mod.AggResult;
 pub const aggregate = aggregate_mod.aggregate;
+pub const GroupByResult = aggregate_mod.GroupByResult;
+pub const groupBy = aggregate_mod.groupBy;
 
 const topk_mod = @import("topk.zig");
 pub const TopK = topk_mod.TopK;
@@ -133,6 +135,7 @@ pub const ScannedRows = parallel_mod.ScannedRows;
 pub const parallelScanColumnar = parallel_mod.parallelScanColumnar;
 pub const ColumnarScanResult = parallel_mod.ColumnarScanResult;
 pub const ColumnBuf = parallel_mod.ColumnBuf;
+pub const parallelGroupBy = parallel_mod.parallelGroupBy;
 /// Test-only introspection: parallel_mod.debug_spawn_count, for dispatch-
 /// path regression tests (see python_api.zig's tests and ROADMAP.md).
 pub const parallel_debug = parallel_mod;

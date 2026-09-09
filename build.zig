@@ -382,6 +382,23 @@ pub fn build(b: *std.Build) void {
     const tok_bench_step = b.step("tok-bench", "Isolated SIMD tokenizer throughput (no allocation, no field parsing)");
     tok_bench_step.dependOn(&run_tok_bench.step);
 
+    const groupby_bench = b.addExecutable(.{
+        .name = "groupby_bench",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("examples/groupby_bench.zig"),
+        }),
+    });
+    groupby_bench.root_module.addImport("scanio", scanio_mod);
+    groupby_bench.linkLibC();
+    const install_groupby_bench = b.addInstallArtifact(groupby_bench, .{});
+    const run_groupby_bench = b.addRunArtifact(groupby_bench);
+    run_groupby_bench.step.dependOn(&install_groupby_bench.step);
+    if (b.args) |args| run_groupby_bench.addArgs(args);
+    const groupby_bench_step = b.step("groupby-bench", "Time+memory for groupBy() on a real file (low and high cardinality)");
+    groupby_bench_step.dependOn(&run_groupby_bench.step);
+
     const bench = b.addExecutable(.{
         .name = "bench",
         .root_module = b.createModule(.{
