@@ -9,7 +9,8 @@ extern void py_query_close(void *);
 extern size_t py_query_ncols(void *);
 extern Slice py_query_name(void *,size_t);
 extern int py_query_next(void *,size_t,size_t,void *,ApiEmit,char *);
-extern int py_query_count(void *,uint64_t *,char *);
+extern int py_count_rows_parallel(const char *,size_t,uint64_t *,char *);
+extern int py_count_rows_where_parallel(const char *,size_t,const char *,size_t,uint64_t *,char *);
 extern int py_query_aggregate(void *,size_t,ApiAgg *,char *);
 extern int py_query_sort(void *,size_t,size_t,int,int,void *,ApiEmit,char *);
 extern void *py_columnar(void *,char *);
@@ -158,11 +159,21 @@ static PyObject *api_next(PyObject *self,PyObject *args){
     if(rc<0){Py_DECREF(out);api_destroy(h);return api_error(err);}
     PyObject_GC_Track(out);return out;
 }
-static PyObject *api_count(PyObject *self,PyObject *cap){
-    (void)self;ApiHandle *h=api_handle(cap,1);if(!h)return NULL;
-    char err[256]={0};uint64_t n;
-    if(py_query_count(h->ptr,&n,err)<0)return api_error(err);
-    return PyLong_FromUnsignedLongLong(n);
+static PyObject *api_count_parallel(PyObject *self,PyObject *args){
+    (void)self;const char *path;Py_ssize_t n;
+    if(!PyArg_ParseTuple(args,"y#",&path,&n))return NULL;
+    if(memchr(path,0,(size_t)n)){PyErr_SetString(PyExc_ValueError,"path contains NUL");return NULL;}
+    char err[256]={0};uint64_t count;
+    if(py_count_rows_parallel(path,(size_t)n,&count,err)<0)return api_error(err);
+    return PyLong_FromUnsignedLongLong(count);
+}
+static PyObject *api_count_where_parallel(PyObject *self,PyObject *args){
+    (void)self;const char *path,*opts;Py_ssize_t n,m;
+    if(!PyArg_ParseTuple(args,"y#y#",&path,&n,&opts,&m))return NULL;
+    if(memchr(path,0,(size_t)n)){PyErr_SetString(PyExc_ValueError,"path contains NUL");return NULL;}
+    char err[256]={0};uint64_t count;
+    if(py_count_rows_where_parallel(path,(size_t)n,opts,(size_t)m,&count,err)<0)return api_error(err);
+    return PyLong_FromUnsignedLongLong(count);
 }
 static PyObject *api_aggregate(PyObject *self,PyObject *args){
     (void)self;PyObject *cap;Py_ssize_t col;
@@ -242,7 +253,8 @@ static PyObject *api_import(PyObject *self,PyObject *args){
     {"close",api_close,METH_O,NULL}, \
     {"names",api_names,METH_O,NULL}, \
     {"next_batch",api_next,METH_VARARGS,NULL}, \
-    {"count",api_count,METH_O,NULL}, \
+    {"count_rows_parallel",api_count_parallel,METH_VARARGS,NULL}, \
+    {"count_rows_where_parallel",api_count_where_parallel,METH_VARARGS,NULL}, \
     {"aggregate",api_aggregate,METH_VARARGS,NULL}, \
     {"sort",api_sort,METH_VARARGS,NULL}, \
     {"columnar",api_columnar,METH_O,NULL}, \

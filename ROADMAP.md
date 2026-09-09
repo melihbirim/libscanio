@@ -515,6 +515,271 @@ New shape, deliberately narrow: one method (filtered `count()` via the real Pyth
 
 Old `bench/compare.py`/`bench/engine.py` ecosystem-comparison scripts were **not** deleted — only the two scan_table call sites inside them were patched to not crash (see above). They're orphaned from the current docs (nothing links to them as the source of a published number anymore) but left in place rather than removed, since deleting them wasn't part of what was asked and `build.zig`'s `bench-compare` step still depends on them.
 
+## Benchmark suite deleted entirely, starting over on real data
+
+**What prompted it:** the synthetic 9-engine matrix (`bench/simple/`,
+this file's previous "Benchmark docs rebuilt from scratch" entry above)
+used a bare single-column `WHERE category = 'B'` count on a synthetic
+3-column fixture — verified correct (independent `awk` ground truth
+matched every engine, at every tier, before any number was trusted), but
+it was polars'/duckdb's best case, not a fixture libscanio has a real
+edge on. Cross-checked against the project's own pre-existing
+`bench/compare.py` harness on real synthetic taxi-shaped data: libscanio
+lost warm-query time to polars there too (count: 21.9ms vs 17.2ms CSV;
+streaming: 475.6ms vs 370.9ms CSV), consistent with the new numbers, not
+contradicting them. libscanio's real, reproducible edge in both harnesses
+was peak RSS (8-17x less) and cold-process time, never warm per-call
+speed on a narrow low-column-count file.
+
+**Decision: delete the whole comparison/benchmark suite and start over**,
+rather than keep a synthetic-fixture matrix that documents libscanio
+losing on the one axis (raw warm speed) casual readers weight most,
+without the real fixture/query shape that plays to its actual strengths
+(wide files, low selectivity, NDJSON after the `tryFastRow` fix — see the
+M9-era sections above). Deleted outright: `bench/compare.py`,
+`bench/engine.py`, `bench/engine.js`, `bench/test_compare.py`,
+`bench/lambda/` (the whole directory), `bench/simple/` (the whole
+directory, including its README and every `bench_*`/`gen_fixture*`
+script) — no superseded-but-kept split this time, since none of it
+survives the next iteration. `build.zig`'s `bench-compare` step and
+`ci.yml`'s benchmark-timing/memory-ceiling CI step (which ran
+`compare.py`/`test_compare.py`) were removed too, since their only
+purpose was running the deleted scripts; `ci.yml`'s "Batch API benchmark
+smoke" step (`batches.py`/`import_validation.py`, unrelated — a
+correctness gate for the batch APIs, not an ecosystem comparison) picked
+up the `zig build c-lib` call the removed step used to provide, so it
+keeps working standalone. `docs/BENCHMARK_MATRIX.md`'s deletion (logged
+above) already tracked this; `docs/BENCHMARKS.md` is now a placeholder
+stating plainly that it has no numbers yet, rather than either the old
+content or a new unverified table.
+
+**Built, on real NYC taxi CSV data** (`bench/.taxi-data/` in the csvql
+repo — `sample.csv` 417MB/1M rows and `trips.csv` 8.5GB/20M rows, both 51
+columns), not synthetic. `WHERE rate_code_id = '6'` chosen deliberately —
+early column (6 of 51), 0.0026% selectivity (26/1,000,000 rows) — the
+case `stop_after_column` is built for. New suite: `bench/real/`.
+
+**Result: libscanio wins outright at 417MB** — 0.089-0.097s / 16-40MB
+versus polars (0.122s/538MB), duckdb (0.306s/238MB), pyarrow.dataset
+(0.785s/159MB). Every row count cross-checked against an independent
+`awk` scan of the raw file before trusting any engine's number, including
+libscanio's own.
+
+**At 8.5GB (20x the file), an honest mixed result, reported as measured**:
+duckdb is actually faster than libscanio there (3.08s vs 4.03s) — not
+hidden because it doesn't fit the thesis. libscanio still wins memory by
+4-140x (17-41MB vs 182MB-2.4GB) and its RSS barely moved going from 417MB
+to 8.5GB while every other engine's memory scaled with the file (polars
+538MB → 2.4GB is the starkest case).
+
+**Extended to four more query shapes** (`bench/real/`: `bench_count*`,
+`bench_select2*`, `bench_selectall*`, `bench_validate*`), all on the same
+417MB fixture, all row-count cross-checked:
+
+- Bare `count()` (no WHERE): polars wins on time (0.015s vs libscanio's
+  0.059s/0.050s) — its native Rust column scan is genuinely fast at this
+  specific shape, reported as measured, not spun. libscanio still uses
+  6-32x less memory.
+- 2-column projection + WHERE: same pattern, polars edges libscanio on
+  time (0.124s vs 0.177s), libscanio uses 33x less memory. Node's
+  `scanArray()` with `columns` set falls back to the single-threaded path
+  (no parallel-engine projection support yet), so it's slower than Python
+  here (0.352s) despite usually beating it on bare counts.
+- **All 51 columns + WHERE: libscanio wins outright again**, both axes
+  (0.049s/29MB vs polars' 0.235s/883MB, pyarrow's 1.330s/188MB, duckdb's
+  0.437s/298MB) — a highly selective WHERE returning full rows is exactly
+  the shape the flat-memory chunked design targets, unlike a bare count
+  or narrow projection where other engines' columnar scan already does
+  minimal work.
+- `validate_report()`: no other engine here has an equivalent built-in
+  feature (schema rules — `min`/`max`/`required` per column — not just
+  type casting), so the only real comparison is a naive hand-rolled
+  Python loop doing the same four checks: 0.391s vs 5.920s, 15.1x faster,
+  both agreeing exactly on which 58 of 1,000,000 rows were invalid.
+
+**Honest summary of the whole exercise**: libscanio does not win every
+shape against every engine — polars' raw column-scan speed beats it on
+count-only and narrow-projection shapes. It wins decisively, both time
+and memory, on the shape its actual architecture targets (selective
+WHERE, full-row materialization), and wins memory by a wide margin on
+every shape without exception, including the two it loses time on. That
+is the honest, falsifiable version of "libscanio wins" — not "libscanio
+is fastest at everything."
+
+## Root-caused and fixed: bare `count()` was single-threaded for no reason
+
+**The bare-count loss above wasn't a ceiling — it was a wiring gap.**
+Investigated directly: pure-Zig `Query.count()` (0.047-0.059s) was
+already near-identical to the Python binding's time (0.059s), ruling out
+binding overhead. `src/simd_count.zig`'s newline count was already
+vectorized (confirmed by reading it — `countByte()`, widest-SIMD-lane
+popcount, this session's own M-something fix). Then found the real
+cause: `parallelCountRows()` — a complete, already-tested, multi-threaded
+row counter — has existed in `src/parallel.zig` since M9 and is even
+re-exported publicly from `root.zig`, but **nothing calls it**. Not the C
+ABI (`py_query_count` in `python_api.zig` always called the
+single-threaded `Query.count()`), not Node's `countWork()`, not the CLI.
+Confirmed by invoking it directly (temporary investigation code in
+`bench_tool.zig`, reverted after measuring, never shipped): 0.011-0.028s
+— already at or beating polars' 0.015s.
+
+**Fixed by wiring it in, not by writing new counting logic.** Added
+`py_count_rows_parallel()` (`python_api.zig`) + `count_rows_parallel`
+method (`_api.c`), and Python's `count(path)` now dispatches to it
+whenever `where is None and not negate` (the only case
+`parallelCountRows()` — an unconditional, unfiltered count — can
+correctly answer). Node's `countWork()` (`node_binding.zig`) got the
+same dispatch. Real, measured result on the 417MB/1M-row/51-col fixture:
+Python 0.059s → **0.016s**, Node 0.050s → **0.016s** — both now
+essentially tied with polars (0.015s) instead of 3-4x behind, while still
+using 6-17x less memory (28-51MB vs polars' 473MB). Full suite reverified
+green: 94 Zig, 246+17 Python, 33+177 Node.
+
+**Predicted this exact gap would recur elsewhere — checked, and it did.**
+Audited every public entry point against what `parallel.zig` actually
+builds: only 4 parallel primitives exist total (`parallelCountRows`,
+`parallelCountRowsWhere`, `parallelScan`, `parallelScanColumnar`) — no
+parallel aggregate/topk/orderBy exist at all, so those weren't a wiring
+gap, there's simply nothing built yet to wire. But
+`parallelCountRowsWhere()` — the WHERE-filtered sibling of the function
+just fixed above — had the identical problem: exists since M9,
+re-exported from `root.zig`, referenced only in a comment in `c_api.zig`,
+never actually called by Python, Node, or the CLI. Every WHERE-filtered
+`count()` call, in every binding, was single-threaded the entire time
+this project has had a multi-threaded filtered-count engine.
+
+**Measured before fixing, same discipline as before**: temporary
+investigation code in `bench_tool.zig` (reverted after measuring, never
+shipped) showed `parallelCountRowsWhere()` at 0.015-0.017s on the
+417MB/1M-row/51-col fixture's `WHERE rate_code_id = 6` query, versus the
+single-threaded path's 0.097s — a ~6x win, confirmed before spending
+effort wiring it in.
+
+**Fixed identically to the first gap — wired, not rewritten.** Node's
+`countWork()` (`node_binding.zig`) collapsed entirely into one call to
+`scan.parallelCountRowsWhere()` — it already handles empty predicates
+(dispatching internally to `parallelCountRows()`), negate (including the
+negate-with-no-predicates zero-scan case), and `stop_after_column`, so
+the old single-threaded `Query.open()`/`.count()` branch had nothing left
+to do. Python got a new C export, `py_count_rows_where_parallel()`
+(`python_api.zig`) + `count_rows_where_parallel` method (`_api.c`),
+mirroring `QueryCtx.open()`'s existing predicate-JSON-decode logic
+exactly; `count()` (`__init__.py`) now probes the header for column
+names, resolves the WHERE string to predicates the same way it always
+did, then calls the new export instead of opening a `Query`. Verified
+against an independent `awk` scan for both a single predicate and a
+compound `AND` clause (19/1,000,000 for `rate_code_id=6 AND
+vendor_id=CMT`), plus both negate variants. Full suite reverified green:
+94 Zig, 246+17 Python, 33+177 Node.
+
+**Real numbers**: 417MB fixture, `WHERE rate_code_id=6`: Python
+0.097s→**0.023s**, Node 0.089s→**0.016s** — both now clearly ahead of
+polars (0.122s) instead of roughly tied with it. At 8.5GB scale, the
+fix's effect is bigger, not smaller: Python 4.03s→**1.75s**, Node
+4.06s→**1.46s** — this was the one shape where duckdb (3.08s) beat
+libscanio outright; it no longer does. Two real wiring bugs found and
+fixed via the exact same audit-then-measure-then-connect method, not two
+different investigations.
+
+**Still open, not done in this pass**: whether `scan_array(columns=...)`
+(Python) has an equivalent gap — checked directly: no, it's a real
+capability gap, not a wiring one. `parallelScanColumnar()` (`parallel.zig`)
+has no `columns` parameter at all — it unconditionally builds every
+column (`n_cols = q.header().len`), in both its CSV and JSON-array
+branches. There is nothing sitting built-and-disconnected to wire here;
+adding projection support means extending the function itself. Bigger,
+separate scope from the two wiring fixes above — not started.
+
+**Dispatch-path test added, closing the "doesn't scale" gap above.**
+Two instances of the same bug class (a correct, complete, multi-threaded
+function sitting fully built but uncalled) were found this session by
+manual audit alone — not a repeatable process. Added
+`parallel_mod.debug_spawn_count`, a `pub var` incremented once inside
+`spawnAndJoin()` (`parallel.zig`) — the single choke point every parallel
+primitive in the file funnels through, so one counter covers all of them,
+not just the two just fixed. Discovered `src/python_api.zig` needs no
+`Python.h` `@cImport` at all (pure Zig, `extern "C"` boundary only), so it
+was previously untested by `zig build test` for no real reason — added it
+as its own test module in `build.zig` (same shape as `where_parser.zig`'s
+existing Node-header-free module, re-exported `parallel_mod` as
+`root.zig`'s `parallel_debug` for test-only introspection) and wrote two
+tests there asserting `py_count_rows_parallel`/
+`py_count_rows_where_parallel` both increase the spawn counter, not just
+return the right answer. **Verified the tests actually catch the
+regression they exist for**, not just that they pass: temporarily
+disabled the counter increment, confirmed all three new tests (two in
+`python_api.zig`, one in `parallel.zig` itself) fail, then restored it —
+a correctness-only test would have stayed green through that change,
+which is exactly the blind spot that let the original bug ship
+unnoticed. Full suite green after: 180 Zig test blocks (up from 177),
+246+17 Python, 33+177 Node.
+
+Node's `countWork()` (`node_binding.zig`) still has no equivalent
+dispatch test — it needs real Node headers to compile at all, so it
+can't join `python_api.zig`/`parallel.zig` in `zig build test`; covering
+it would mean exposing `debug_spawn_count` through the N-API surface
+itself for `node/test/addon_test.js` to read, which pollutes a shipped
+API with test-only introspection. Not done — the Node-side risk is
+lower now anyway, since `countWork()` no longer has a single-threaded
+branch left to regress to (see the fix above: it collapsed to one
+unconditional call).
+
+**Checked whether the 8.5GB duckdb win generalizes to a bigger scale, on
+request — it doesn't hold, it reverses.** Found and used a third real
+fixture, `bench/.taxi-data/trips_16gb.csv` (17GB, 40M rows, same schema),
+not synthetic. Same `WHERE rate_code_id = '6'` query: libscanio 3.40s/
+30.2MB vs duckdb 7.01s/460.8MB — libscanio wins both axes by roughly the
+same margin as at 8.5GB, not by a shrinking one. 634/40,000,000 rows,
+confirmed against an independent `awk` scan before trusting either
+engine, matching all three fixtures' discipline. No case has been found,
+at any tested scale, where duckdb currently beats libscanio — the 8.5GB
+loss documented earlier in this file was real at the time and is now
+closed by the `parallelCountRowsWhere()` fix, not superseded by a new
+loss elsewhere.
+
+## Found and fixed a third instance — the CLI's `--count`, on request
+
+Asked directly whether anything still called the single-threaded
+`Query.count()` path, since Python's and Node's bindings had both moved
+off it. Answer: yes — `cli.zig`'s `--count` was the third and last
+binding still calling `q.count()` unconditionally, same bug class as the
+two already fixed. Fixed the same way: `--count` now calls
+`parallelCountRowsWhere()` directly and skips opening the single-threaded
+`Query` entirely for that path (the header probe earlier in `main()`
+already resolves `--where` into predicates, so nothing else needed
+opening a `Query` first). Verified against the real 417MB fixture:
+`scanio file.csv --count` → 1,000,000; `--where "rate_code_id = 6"
+--count` → 26; the same with `--not` → 999,974 — all correct, `user`
+time (0.72-0.76s) far exceeding `real` time (0.07-0.13s) confirming
+genuine multi-core parallelism, not a fluke. `zig build test`,
+`diff-test` (743/743), and `smoke-test` all green after.
+
+**One real behavior change, deliberately not preserved**: `--count`
+combined with `--limit` used to cap the count at the limit (an
+incidental side effect of sharing `Query.open()`'s options struct with
+the row-output path, never a documented feature — no runtime test
+asserted it, only argument-parsing). `parallelCountRowsWhere()` has no
+limit concept, matching Python's and Node's `count()`, neither of which
+ever exposed a `limit` parameter for counting. Chose consistency across
+all three bindings over preserving an undocumented, untested CLI-only
+quirk.
+
+**Asked whether the now-fully-dead single-threaded count path should be
+deleted — checked precisely, then removed exactly the dead part, not
+the whole thing.** `Query.count()` itself (`query.zig`) stays: `c_api.zig`'s
+public `scanio_count()` still legitimately calls it, and that's a real,
+documented C ABI function (`include/libscanio.h`) operating on an
+already-open `scanio_t` handle — a shape `parallelCountRowsWhere()`
+can't serve without reopening the file mid-stream, changing the API
+contract for any external C/ctypes caller. But `py_query_count()`
+(`python_api.zig`) — the CPython-specific wrapper around `QueryCtx`'s
+`Query.count()` — had zero remaining callers once Python's `count()`
+moved fully onto the two parallel exports; removed it, its `_api.c`
+glue (`api_count`, the `extern` declaration, the `"count"` method-table
+entry), and `_open_query()`'s `_count_only` parameter (also confirmed
+zero callers passing `True` — it existed solely to compute `max_column`
+for the old count path). Full suite green after the removal.
+
 ## Relationship to csvql
 
 csvql should eventually sit on top of libscanio (SQL parser/planner → libscanio → CSV/NDJSON) rather than duplicating scan logic. Extraction happens gradually, one primitive at a time, each step gated by csvql's existing correctness/fuzz/benchmark suite so it's provably zero-behavior-change before the next step starts. csvql remains the SQL product; libscanio is the reusable engine underneath it.

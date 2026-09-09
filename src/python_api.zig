@@ -115,8 +115,32 @@ export fn py_query_next(c: *QueryCtx, max_rows: usize, target: usize, ctx: ?*any
     }
     return 1;
 }
-export fn py_query_count(c: *QueryCtx, out: *u64, err: *[256]u8) c_int {
-    out.* = c.q.count() catch |e| return fail(err, e);
+/// Unfiltered row count via the multi-threaded engine, bypassing QueryCtx
+/// entirely (parallelCountRows() opens its own per-worker file views —
+/// no single already-open Query/Scanner to hand it). Real, measured win
+/// over Query.count()'s single-threaded newline-count fast path: 0.05s ->
+/// 0.01-0.03s on a 417MB/1M-row file (see ROADMAP.md).
+export fn py_count_rows_parallel(path: [*]const u8, n: usize, out: *u64, err: *[256]u8) c_int {
+    out.* = @intCast(scan.parallelCountRows(A, path[0..n], 0) catch |e| return fail(err, e));
+    return 0;
+}
+const CountWhereOptions = struct { where: []const Where = &.{}, negate: bool = false };
+/// WHERE-filtered row count via the multi-threaded engine — same
+/// bypass-QueryCtx shape as py_count_rows_parallel() above, since
+/// parallelCountRowsWhere() opens its own per-worker file views too.
+/// Real, measured win over Query.count()'s single-threaded loop: 0.097s
+/// -> 0.015-0.017s on a low-selectivity, early-column WHERE (417MB/1M
+/// rows/51 cols, see ROADMAP.md).
+export fn py_count_rows_where_parallel(path: [*]const u8, path_len: usize, opts: [*]const u8, opts_len: usize, out: *u64, err: *[256]u8) c_int {
+    const parsed = std.json.parseFromSlice(CountWhereOptions, A, opts[0..opts_len], .{ .allocate = .alloc_always }) catch |e| return fail(err, e);
+    defer parsed.deinit();
+    const preds = A.alloc(scan.Predicate, parsed.value.where.len) catch |e| return fail(err, e);
+    defer A.free(preds);
+    for (parsed.value.where, 0..) |p, i| {
+        if (p.op > 6) return fail(err, error.BadPredicate);
+        preds[i] = if (p.op == 6) scan.Predicate.initIn(p.column, p.values) else scan.Predicate.init(p.column, @enumFromInt(p.op), p.value);
+    }
+    out.* = @intCast(scan.parallelCountRowsWhere(A, path[0..path_len], ',', preds, parsed.value.negate, 0) catch |e| return fail(err, e));
     return 0;
 }
 const Agg = extern struct { count: u64, sum: f64, min: f64, max: f64, avg: f64, has_values: c_int };
@@ -217,4 +241,51 @@ export fn py_validator_report(c: *ValidatorCtx, max_errors: usize, out: *ReportS
 export fn py_import(path: [*]const u8, n: usize, schema: [*]const u8, m: usize, good: [*]const u8, ng: usize, bad: [*]const u8, nb: usize, out: *scan.validation_import.Stats, err: *[256]u8) c_int {
     out.* = scan.validation_import.run(A, path[0..n], schema[0..m], good[0..ng], bad[0..nb]) catch |e| return fail(err, e);
     return 0;
+}
+
+// Dispatch-path regression guard, not just correctness: these two exports
+// exist because parallelCountRows()/parallelCountRowsWhere() sat fully
+// built and correct but uncalled by this file for an unknown period —
+// invisible to every prior test, since the single-threaded fallback gave
+// the same answer, just slower (see ROADMAP.md). A correctness-only test
+// would pass whether or not the fix regressed; asserting
+// parallel_debug.debug_spawn_count actually increases proves the
+// multi-threaded engine, not a scan fallback, produced the answer.
+test "py_count_rows_parallel dispatches to the multi-threaded engine, not a fallback scan" {
+    const allocator = std.testing.allocator;
+    const path = "test_python_api_dispatch.csv";
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "id,name\n");
+    var i: usize = 0;
+    while (i < 200_000) : (i += 1) try data.writer(allocator).print("{d},row-{d}\n", .{ i, i });
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var out: u64 = 0;
+    var err: [256]u8 = undefined;
+    const before = scan.parallel_debug.debug_spawn_count.load(.monotonic);
+    try std.testing.expectEqual(@as(c_int, 0), py_count_rows_parallel(path.ptr, path.len, &out, &err));
+    try std.testing.expectEqual(@as(u64, 200_000), out);
+    try std.testing.expect(scan.parallel_debug.debug_spawn_count.load(.monotonic) > before);
+}
+
+test "py_count_rows_where_parallel dispatches to the multi-threaded engine, not a fallback scan" {
+    const allocator = std.testing.allocator;
+    const path = "test_python_api_dispatch_where.csv";
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "id,name\n");
+    var i: usize = 0;
+    while (i < 200_000) : (i += 1) try data.writer(allocator).print("{d},row-{d}\n", .{ i, i });
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const opts = "{\"where\":[{\"column\":1,\"op\":0,\"value\":\"row-5\"}]}";
+    var out: u64 = 0;
+    var err: [256]u8 = undefined;
+    const before = scan.parallel_debug.debug_spawn_count.load(.monotonic);
+    try std.testing.expectEqual(@as(c_int, 0), py_count_rows_where_parallel(path.ptr, path.len, opts.ptr, opts.len, &out, &err));
+    try std.testing.expectEqual(@as(u64, 1), out);
+    try std.testing.expect(scan.parallel_debug.debug_spawn_count.load(.monotonic) > before);
 }

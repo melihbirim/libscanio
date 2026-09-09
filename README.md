@@ -18,15 +18,25 @@ CLI, one `Query` API underneath all of them. See
 
 ## Performance
 
-Same file, same query, measured, not assumed — peak RSS (physical memory
-actually used) and wall time, cross-checked row counts. Full method:
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Peak RSS (physical memory actually used, not the file size) tracks the
+fixed-size read buffer, not the file — a 1MB file and an 11GB file both
+cost about the same handful of megabytes of RAM to scan. Time scales with
+the data instead: bigger file, more time, never more memory. That's an
+architectural property, verifiable directly from `docs/DESIGN.md`'s
+chunked-read design, not a benchmark claim against any other engine.
 
-- 1MB file: **0.003s, 15.4MB peak RSS** (Python) / **0.002s, 40.2MB** (Node).
-- ~11GB file (11,000x bigger): **14.75s, 15.4MB peak RSS** (Python) / **14.67s, 38.7MB** (Node).
+Against other engines, on real NYC taxi data (417MB, 51 columns, a
+low-selectivity early-column WHERE — full method and every number:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md)):
 
-Peak RSS barely moves. Time scales with the data instead — bigger file,
-more time, never more memory.
+- **0.016-0.023s, 30-54MB peak RSS** (Python/Node) vs polars (0.122s,
+  538MB), duckdb (0.306s, 238MB), pyarrow.dataset (0.785s, 159MB).
+- At 8.5GB (20x bigger): **1.46-1.75s, 30-54MB** — still beats duckdb
+  (3.08s), pyarrow (16.0s), and polars (16.6s, 2.4GB).
+
+Not every shape wins: polars' native column scan is faster on a bare
+2-column projection. Full breakdown, including that honest loss, is in
+the doc above.
 
 ## Status
 

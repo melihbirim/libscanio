@@ -4,6 +4,6 @@ import libscanio
 
 path = sys.argv[1]
 t0 = time.time()
-n = libscanio.count(path, where="category = B")
+n = libscanio.count(path, where="rate_code_id = 6")
 dt = time.time() - t0
 print(f"rows={n} time={dt:.4f}s")

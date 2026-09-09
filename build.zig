@@ -70,6 +70,23 @@ pub fn build(b: *std.Build) void {
     const run_csv_tests = b.addRunArtifact(csv_tests);
     test_step.dependOn(&run_csv_tests.step);
 
+    // CPython native extension glue: no Python.h @cImport, pure Zig, so
+    // `zig build test` can cover it directly — including a dispatch-path
+    // regression guard (parallel_mod.debug_spawn_count) for the exact bug
+    // class where a complete multi-threaded function sat uncalled by this
+    // file for an unknown period, invisible to every correctness test
+    // since the single-threaded fallback gave the same answer. See
+    // ROADMAP.md.
+    const python_api_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/python_api.zig"),
+    });
+    python_api_mod.addImport("scanio", scanio_mod);
+    const python_api_tests = b.addTest(.{ .root_module = python_api_mod });
+    const run_python_api_tests = b.addRunArtifact(python_api_tests);
+    test_step.dependOn(&run_python_api_tests.step);
+
     // WHERE-string parsing for the N-API Node binding — its own module
     // (not node_binding.zig itself, which needs node_api.h available to
     // even compile) so `zig build test` covers it without needing Node
@@ -414,19 +431,6 @@ pub fn build(b: *std.Build) void {
     if (node_install_step) |s| diff_test.step.dependOn(s);
     const diff_test_step = b.step("diff-test", "Cross-client differential test (Python vs Node vs CLI vs an oracle)");
     diff_test_step.dependOn(&diff_test.step);
-
-    // Ecosystem comparison — libscanio's three front doors against
-    // pyarrow, polars, apache-arrow and hand-written baselines. Optional
-    // engines skip themselves when their dependency is absent, so this
-    // runs anywhere; see bench/compare.py's doc comment for what the
-    // numbers do and don't mean.
-    const bench_compare = b.addSystemCommand(&.{ python_cmd, "bench/compare.py" });
-    bench_compare.step.dependOn(c_lib_step);
-    bench_compare.step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
-    if (node_install_step) |s| bench_compare.step.dependOn(s);
-    if (b.args) |extra| bench_compare.addArgs(extra);
-    const bench_compare_step = b.step("bench-compare", "Compare against pyarrow/polars/apache-arrow and native baselines");
-    bench_compare_step.dependOn(&bench_compare.step);
 
     const node_addon_test = b.addSystemCommand(&.{ "node", "node/test/addon_test.js" });
     if (node_install_step) |s| node_addon_test.step.dependOn(s);

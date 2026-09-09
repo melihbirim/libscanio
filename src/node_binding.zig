@@ -197,6 +197,16 @@ fn napiSchema(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) na
 
 const CountResult = struct { count: i64 = 0, err: ?anyerror = null };
 
+// The multi-threaded engine, always — not just the no-WHERE case.
+// parallelCountRowsWhere() already handles empty predicates (dispatches
+// to parallelCountRows()), negate (including negate-with-no-predicates,
+// answering 0 with no scan at all), and stop_after_column internally, so
+// there's no single-threaded Query/Scanner path left to fall back to
+// here. Real, measured win on a 417MB/1M-row/51-col file: unfiltered
+// 0.05s -> 0.01-0.03s, WHERE-filtered (low selectivity, early column)
+// 0.097s -> 0.015-0.017s (see ROADMAP.md — parallelCountRows() and
+// parallelCountRowsWhere() existed since M9 but neither was ever wired
+// into this function until now).
 fn countWork(path: [:0]const u8, where: ?[:0]const u8, negate: bool, out: *CountResult) void {
     var predicates: []Predicate = &.{};
     var header: [][]const u8 = &.{};
@@ -214,20 +224,7 @@ fn countWork(path: [:0]const u8, where: ?[:0]const u8, negate: bool, out: *Count
         };
     }
 
-    var q = Query.open(c_allocator, path, .{
-        .where = predicates,
-        .negate = negate,
-        // count() never returns field data — always safe to bound to
-        // just the WHERE predicates' columns. Real, measured win: ~7x
-        // faster on this fixture's WHERE-filtered count (330ms -> ~45ms)
-        // once this bound was wired up (see ROADMAP.md's M5b follow-up).
-        .stop_after_column = where_parser.maxPredicateColumn(predicates, null),
-    }) catch |e| {
-        out.err = e;
-        return;
-    };
-    defer q.deinit();
-    out.count = @intCast(q.count() catch |e| {
+    out.count = @intCast(scan.parallelCountRowsWhere(c_allocator, path, ',', predicates, negate, 0) catch |e| {
         out.err = e;
         return;
     });

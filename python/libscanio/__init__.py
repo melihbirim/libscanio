@@ -155,7 +155,7 @@ def scan(path, columns=None, where=None, limit=None, negate=False):
 
 
 def _open_query(path, columns=None, where=None, limit=None, negate=False, *,
-                _scalar_column=None, _count_only=False):
+                _scalar_column=None):
     path = _path(path)
     probe = _call("query_open", path, b"{}")
     if not columns and not where and limit is None and not negate and _scalar_column is None:
@@ -170,7 +170,7 @@ def _open_query(path, columns=None, where=None, limit=None, negate=False, *,
         options = {"columns": indices, "where": predicates,
                    "limit": limit if limit is not None and limit >= 0 else None,
                    "negate": bool(negate),
-                   "max_column": max(needed) if needed and (indices or _scalar_column is not None or _count_only) else None}
+                   "max_column": max(needed) if needed and (indices or _scalar_column is not None) else None}
     finally:
         _call("close", probe)
     return _call("query_open", path, _json(options))
@@ -212,12 +212,21 @@ def schema(path):
 
 
 def count(path, where=None, negate=False):
-    """Count matching rows in Zig; unfiltered counts retain the parser-free path."""
-    ctx = _open_query(path, where=where, negate=negate, _count_only=True)
+    """Count matching rows via the multi-threaded engine, filtered or not.
+
+    Real, measured win over a single-threaded scan on wide files, both
+    with and without a WHERE clause (see ROADMAP.md).
+    """
+    p = _path(path)
+    if where is None and not negate:
+        return _call("count_rows_parallel", p)
+    probe = _call("query_open", p, b"{}")
     try:
-        return _call("count", ctx)
+        names = _call("names", probe)
     finally:
-        _call("close", ctx)
+        _call("close", probe)
+    predicates = _parse_where(names, where) if where else []
+    return _call("count_rows_where_parallel", p, _json({"where": predicates, "negate": bool(negate)}))
 
 
 def aggregate(path, column, where=None):

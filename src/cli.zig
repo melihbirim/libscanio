@@ -13,8 +13,9 @@
 //!
 //! Streaming by design, like `Query` itself — rows are written out as
 //! they are found and never collected, so peak memory tracks the read
-//! buffer rather than the result size. `--count` doesn't even split
-//! fields (see Query.count()'s no-WHERE fast path).
+//! buffer rather than the result size. `--count` runs through the
+//! multi-threaded engine (parallelCountRowsWhere()) and never splits a
+//! field with no WHERE clause — same as Python's/Node's count().
 const std = @import("std");
 const scanio = @import("scanio");
 const where_parser = @import("where_parser.zig");
@@ -263,6 +264,28 @@ pub fn main() !u8 {
         &[_]scanio.Predicate{};
     defer if (predicates.len > 0) where_parser.freePredicates(allocator, @constCast(predicates));
 
+    // The multi-threaded engine, same as Python's/Node's count() — never
+    // opens the single-threaded Query at all for this path (matches
+    // those two bindings exactly, not just in spirit: parallelCountRowsWhere()
+    // already handles empty predicates, negate, and stop_after_column
+    // internally). --columns/--limit are accepted by the shared arg
+    // parser but never applied to a count in any binding, this one
+    // included: Python's/Node's count() takes no limit or columns
+    // parameter at all. Real, measured win — see ROADMAP.md.
+    if (args.count_only) {
+        var stdout_buf: [64 * 1024]u8 = undefined;
+        var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+        const out = &stdout_w.interface;
+        const n = scanio.parallelCountRowsWhere(allocator, args.path, ',', predicates, args.negate, 0) catch |e| {
+            try err_out.print("scanio: scan failed: {s}\n", .{@errorName(e)});
+            try err_out.flush();
+            return 1;
+        };
+        try out.print("{d}\n", .{n});
+        try out.flush();
+        return 0;
+    }
+
     const columns = resolveColumns(allocator, owned_header, args.columns) catch |e| {
         try err_out.print("scanio: bad --columns: {s}\n", .{@errorName(e)});
         try err_out.flush();
@@ -297,17 +320,6 @@ pub fn main() !u8 {
     var stdout_buf: [64 * 1024]u8 = undefined;
     var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
     const out = &stdout_w.interface;
-
-    if (args.count_only) {
-        const n = q.count() catch |e| {
-            try err_out.print("scanio: scan failed: {s}\n", .{@errorName(e)});
-            try err_out.flush();
-            return 1;
-        };
-        try out.print("{d}\n", .{n});
-        try out.flush();
-        return 0;
-    }
 
     // Projected output needs the projected names, in the projected order.
     var out_names = owned_header;

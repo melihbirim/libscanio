@@ -199,7 +199,28 @@ fn threadsFor(requested: usize, data_len: usize) usize {
 /// worker structs and pread()ing that fd. Joining the already-spawned
 /// ones first costs nothing on the success path and makes the failure
 /// path merely slow instead of memory-unsafe.
+/// Incremented once per real worker-pool launch — every parallel
+/// primitive in this file funnels through spawnAndJoin(), so this is a
+/// single choke point for asserting "the multi-threaded engine actually
+/// ran" from a test, rather than trusting that a binding calls the right
+/// function by reading its source. Exists because of a real bug: two
+/// complete, already-tested multi-threaded functions
+/// (parallelCountRows(), parallelCountRowsWhere()) sat fully built and
+/// callable but never invoked by any binding — correctness tests never
+/// caught it since the single-threaded fallback gave the same answer,
+/// just slower. See ROADMAP.md.
+///
+/// Atomic, not a plain `usize`: every N-API call runs on its own spawned
+/// OS thread (see node_binding.zig's runOnWorkerStack), so two concurrent
+/// `count()` calls from JS (e.g. `Promise.all([count(a), count(b)])`)
+/// can both reach spawnAndJoin() at the same time — a plain `+= 1` there
+/// is a real data race (UB under Zig's memory model), caught by
+/// inspection, not a test failure, since it only corrupts test
+/// instrumentation, never an actual returned count.
+pub var debug_spawn_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
 fn spawnAndJoin(threads: []std.Thread, comptime WorkFn: anytype, workers: anytype) !void {
+    _ = debug_spawn_count.fetchAdd(1, .monotonic);
     std.debug.assert(threads.len == workers.len);
     var spawned: usize = 0;
     // Registered after the caller's `defer allocator.free(...)` calls, so
@@ -1766,6 +1787,36 @@ test "parallelCountRows matches single-thread count on a real multi-chunk-bounda
     const parallel_count = try parallelCountRows(allocator, path, 8);
     try std.testing.expectEqual(single_count, parallel_count);
     try std.testing.expectEqual(@as(usize, 200_000), parallel_count);
+}
+
+// Regression guard for the exact bug class ROADMAP.md documents:
+// parallelCountRows()/parallelCountRowsWhere() were correct and fully
+// tested but sat uncalled by every binding — the answer was right, just
+// single-threaded, and no test caught it because correctness tests only
+// check the answer. This asserts the worker pool actually launched, not
+// just that the count is right.
+test "dispatch guard: parallelCountRows/parallelCountRowsWhere actually spawn workers" {
+    const allocator = std.testing.allocator;
+    const path = "test_parallel_dispatch.csv";
+
+    var data: std.ArrayList(u8) = .{};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "id,name,amount\n");
+    var i: usize = 0;
+    while (i < 200_000) : (i += 1) {
+        try data.writer(allocator).print("{d},row-{d},{d}\n", .{ i, i, i * 7 });
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data.items });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const before_unfiltered = debug_spawn_count.load(.monotonic);
+    _ = try parallelCountRows(allocator, path, 8);
+    try std.testing.expect(debug_spawn_count.load(.monotonic) > before_unfiltered);
+
+    const before_filtered = debug_spawn_count.load(.monotonic);
+    const predicates = [_]query_mod.Predicate{query_mod.Predicate.init(1, .eq, "row-5")};
+    _ = try parallelCountRowsWhere(allocator, path, ',', &predicates, false, 8);
+    try std.testing.expect(debug_spawn_count.load(.monotonic) > before_filtered);
 }
 
 test "parallelCountRows: NDJSON (line-delimited) matches NdjsonScanner.countRemaining()" {
