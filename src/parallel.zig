@@ -1025,10 +1025,16 @@ pub fn parallelCountRowsWhere(
 
         const workers = try allocator.alloc(JsonArrayFilterWorker, ranges.len);
         defer allocator.free(workers);
-        const threads = try allocator.alloc(std.Thread, ranges.len);
-        defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates, .negate = negate };
-        try spawnAndJoin(threads, jsonArrayFilterWorkerRun, workers);
+        // Same no-thread-below-threshold contract as the CSV/NDJSON
+        // branches below.
+        if (ranges.len <= 1) {
+            jsonArrayFilterWorkerRun(&workers[0]);
+        } else {
+            const threads = try allocator.alloc(std.Thread, ranges.len);
+            defer allocator.free(threads);
+            try spawnAndJoin(threads, jsonArrayFilterWorkerRun, workers);
+        }
 
         var total: usize = 0;
         for (workers) |w| {
@@ -1055,10 +1061,24 @@ pub fn parallelCountRowsWhere(
         const stop_after_column = maxPredicateColumn(predicates);
         const workers = try allocator.alloc(CsvFilterWorker, num_threads);
         defer allocator.free(workers);
-        const threads = try allocator.alloc(std.Thread, num_threads);
-        defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .delimiter = delimiter, .predicates = predicates, .negate = negate, .stop_after_column = stop_after_column };
-        try spawnAndJoin(threads, csvFilterWorkerRun, workers);
+        // Below threadsFor()'s own size threshold, run the single worker
+        // in-process instead of through std.Thread.spawn — no real OS
+        // thread gets created at all for a file this small. Same
+        // no-thread-for-tiny-input contract parallelCountLines() already
+        // has for the unfiltered path; this filtered path never had it,
+        // and a genuine, reproducible Windows-only crash
+        // (STATUS_STACK_BUFFER_OVERRUN) was hit through it on a 3-row
+        // fixture — see ROADMAP.md. Root cause not fully isolated; this
+        // closes the actual gap (spawning a thread when there's nothing
+        // to gain from one) rather than working around the symptom.
+        if (num_threads <= 1) {
+            csvFilterWorkerRun(&workers[0]);
+        } else {
+            const threads = try allocator.alloc(std.Thread, num_threads);
+            defer allocator.free(threads);
+            try spawnAndJoin(threads, csvFilterWorkerRun, workers);
+        }
         for (workers) |w| {
             if (w.err) |e| return e;
             total += w.result;
@@ -1068,10 +1088,15 @@ pub fn parallelCountRowsWhere(
         defer hdr.deinit();
         const workers = try allocator.alloc(NdjsonFilterWorker, num_threads);
         defer allocator.free(workers);
-        const threads = try allocator.alloc(std.Thread, num_threads);
-        defer allocator.free(threads);
         for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r, .header = hdr.header, .header_index = &hdr.index, .predicates = predicates, .negate = negate };
-        try spawnAndJoin(threads, ndjsonFilterWorkerRun, workers);
+        // Same no-thread-below-threshold contract as the CSV branch above.
+        if (num_threads <= 1) {
+            ndjsonFilterWorkerRun(&workers[0]);
+        } else {
+            const threads = try allocator.alloc(std.Thread, num_threads);
+            defer allocator.free(threads);
+            try spawnAndJoin(threads, ndjsonFilterWorkerRun, workers);
+        }
         for (workers) |w| {
             if (w.err) |e| return e;
             total += w.result;

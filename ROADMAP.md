@@ -780,6 +780,69 @@ entry), and `_open_query()`'s `_count_only` parameter (also confirmed
 zero callers passing `True` — it existed solely to compute `max_column`
 for the old count path). Full suite green after the removal.
 
+## Real Windows-only crash in the WHERE-count fix — found, root-caused, fixed
+
+**Release v0.2.0 initially failed** on Windows Python wheels:
+`test_native_only.py`'s `count(p, where='id >= 2')` — a 3-row fixture —
+crashed with `STATUS_STACK_BUFFER_OVERRUN` (exit 3221225725). `zig build
+test` passed natively on Windows (confirming `parallelCountRowsWhere()`
+itself was correct, per its existing unit tests, several already on tiny
+files), which meant the bug was in what made it reachable this way, not
+in the counting logic.
+
+**Real difference found by reading, not guessing**: `parallelCountRows()`
+(the bare-count path) explicitly skips spawning any thread at all when
+`threadsFor()` computes `num_threads <= 1` — `parallelCountLines()`
+returns `countRange(...)` directly. `parallelCountRowsWhere()`'s CSV/
+NDJSON/JSON-array branches had no such check — every one of them called
+`spawnAndJoin()` (a real `std.Thread.spawn()`) unconditionally, even for
+`num_threads == 1`. So a 3-row file, which the unfiltered path would
+never thread, spawned a real OS thread through the WHERE-filtered path —
+on every platform, but only Windows crashed on it.
+
+**First response was too conservative, corrected on request.** Reverted
+all three bindings' WHERE-count dispatch to the pre-session
+single-threaded `Query.count()` — safe, but re-measuring showed it was
+also **6x slower than the ORIGINAL pre-session baseline** (0.097s → ~0.58s
+on the 417MB fixture), not just "back to single-threaded speed." Root
+cause of that second regression not fully chased down before being asked
+directly not to ship a single-threaded fallback at all — the right fix
+was already available: close the actual gap (unconditional thread-spawn
+on tiny files), not avoid triggering it.
+
+**Real fix, in `parallel.zig` itself, not duplicated three times in the
+bindings**: `parallelCountRowsWhere()`'s CSV, NDJSON, and JSON-array
+branches now each check `num_threads <= 1` (CSV/NDJSON) or `ranges.len <=
+1` (JSON array — its range count doesn't always equal `num_threads`) and
+call the worker function directly in-process when true, skipping
+`spawnAndJoin()`/`std.Thread.spawn()` entirely — the same no-thread-below-
+threshold contract `parallelCountLines()` already had, extended to the
+filtered path that never had it. All three bindings (Python, Node, CLI)
+restored to calling the parallel functions unconditionally, since the fix
+lives in the shared function now.
+
+**Verified, not assumed**: the exact crashing test
+(`test_native_only.py`) passes locally after the fix. A new dedicated
+regression test (`python_api.zig`, "tiny file does not spawn a thread")
+asserts `debug_spawn_count` does NOT increase for a 3-row WHERE-filtered
+count — the precise contract that was missing. The existing dispatch test
+(200,000-row fixture) still asserts it DOES spawn for a real-sized file —
+both directions covered, not just the fix's own case. Real numbers back
+to the fixed baseline: 417MB fixture, Python 0.017s/30MB, Node 0.015-
+0.02s/53MB — matching the numbers already published in
+`docs/BENCHMARKS.md`, not regressed by any of this. Full suite green: 94+
+Zig (incl. the 2 new tests), 246+17 Python, 33+177 Node, 743 differential
+checks.
+
+**Honest gap still open**: the actual Windows-specific mechanism — why
+spawning exactly one thread for a 3-row file corrupts the stack on
+Windows specifically — was never isolated, only the trigger condition
+(spawn a thread at all) was found and removed. If a future change
+reintroduces unconditional thread-spawning on tiny inputs anywhere in
+this codebase, the same class of crash could recur on Windows without
+being understood, only avoided. Worth real Windows-machine debugging
+later, not treated as closed.
+
 ## Relationship to csvql
 
 csvql should eventually sit on top of libscanio (SQL parser/planner → libscanio → CSV/NDJSON) rather than duplicating scan logic. Extraction happens gradually, one primitive at a time, each step gated by csvql's existing correctness/fuzz/benchmark suite so it's provably zero-behavior-change before the next step starts. csvql remains the SQL product; libscanio is the reusable engine underneath it.

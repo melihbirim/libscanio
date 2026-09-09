@@ -130,7 +130,10 @@ const CountWhereOptions = struct { where: []const Where = &.{}, negate: bool = f
 /// parallelCountRowsWhere() opens its own per-worker file views too.
 /// Real, measured win over Query.count()'s single-threaded loop: 0.097s
 /// -> 0.015-0.017s on a low-selectivity, early-column WHERE (417MB/1M
-/// rows/51 cols, see ROADMAP.md).
+/// rows/51 cols, see ROADMAP.md). parallelCountRowsWhere() itself now
+/// skips spawning a thread at all below threadsFor()'s size threshold
+/// (fixed after a real Windows-only crash traced to spawning one
+/// unconditionally, even for a 3-row file — see ROADMAP.md).
 export fn py_count_rows_where_parallel(path: [*]const u8, path_len: usize, opts: [*]const u8, opts_len: usize, out: *u64, err: *[256]u8) c_int {
     const parsed = std.json.parseFromSlice(CountWhereOptions, A, opts[0..opts_len], .{ .allocate = .alloc_always }) catch |e| return fail(err, e);
     defer parsed.deinit();
@@ -288,4 +291,20 @@ test "py_count_rows_where_parallel dispatches to the multi-threaded engine, not 
     try std.testing.expectEqual(@as(c_int, 0), py_count_rows_where_parallel(path.ptr, path.len, opts.ptr, opts.len, &out, &err));
     try std.testing.expectEqual(@as(u64, 1), out);
     try std.testing.expect(scan.parallel_debug.debug_spawn_count.load(.monotonic) > before);
+}
+
+// The exact regression guard for the crash this fix closes: a 3-row
+// file (below threadsFor()'s threshold) must NOT spawn a thread at all.
+test "py_count_rows_where_parallel: tiny file does not spawn a thread" {
+    const path = "test_python_api_tiny_where.csv";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "id,amount,label\n1,10,alpha\n2,-2,beta\n3,oops,quoted\n" });
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const opts = "{\"where\":[{\"column\":0,\"op\":3,\"value\":\"2\"}]}";
+    var out: u64 = 0;
+    var err: [256]u8 = undefined;
+    const before = scan.parallel_debug.debug_spawn_count.load(.monotonic);
+    try std.testing.expectEqual(@as(c_int, 0), py_count_rows_where_parallel(path.ptr, path.len, opts.ptr, opts.len, &out, &err));
+    try std.testing.expectEqual(@as(u64, 2), out);
+    try std.testing.expectEqual(before, scan.parallel_debug.debug_spawn_count.load(.monotonic));
 }

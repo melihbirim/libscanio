@@ -204,9 +204,10 @@ const CountResult = struct { count: i64 = 0, err: ?anyerror = null };
 // there's no single-threaded Query/Scanner path left to fall back to
 // here. Real, measured win on a 417MB/1M-row/51-col file: unfiltered
 // 0.05s -> 0.01-0.03s, WHERE-filtered (low selectivity, early column)
-// 0.097s -> 0.015-0.017s (see ROADMAP.md — parallelCountRows() and
-// parallelCountRowsWhere() existed since M9 but neither was ever wired
-// into this function until now).
+// 0.097s -> 0.015-0.017s (see ROADMAP.md). parallelCountRowsWhere() now
+// skips spawning a thread at all below threadsFor()'s size threshold
+// (fixed after a real Windows-only crash traced to spawning one
+// unconditionally, even for a 3-row file — see ROADMAP.md).
 fn countWork(path: [:0]const u8, where: ?[:0]const u8, negate: bool, out: *CountResult) void {
     var predicates: []Predicate = &.{};
     var header: [][]const u8 = &.{};

@@ -268,10 +268,13 @@ pub fn main() !u8 {
     // opens the single-threaded Query at all for this path (matches
     // those two bindings exactly, not just in spirit: parallelCountRowsWhere()
     // already handles empty predicates, negate, and stop_after_column
-    // internally). --columns/--limit are accepted by the shared arg
-    // parser but never applied to a count in any binding, this one
-    // included: Python's/Node's count() takes no limit or columns
-    // parameter at all. Real, measured win — see ROADMAP.md.
+    // internally, and now skips spawning a thread at all below
+    // threadsFor()'s size threshold — fixed after a real Windows-only
+    // crash traced to spawning one unconditionally, even for a 3-row
+    // file — see ROADMAP.md). --columns/--limit are accepted by the
+    // shared arg parser but never applied to a count in any binding,
+    // this one included: Python's/Node's count() takes no limit or
+    // columns parameter at all. Real, measured win — see ROADMAP.md.
     if (args.count_only) {
         var stdout_buf: [64 * 1024]u8 = undefined;
         var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
