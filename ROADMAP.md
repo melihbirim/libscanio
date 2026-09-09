@@ -864,6 +864,48 @@ wherever one wasn't already available. Verified locally (full suite
 green, `count()` speed unaffected: 0.015-0.017s on the 417MB fixture)
 and shipped as the real fix in v0.2.0.
 
+## Columnar-vs-row prototype — measured, not worth pursuing yet
+
+Explored whether exposing the existing `parallelScanColumnar()` (already
+built, already used internally to feed `scan_array()`'s no-projection
+path) as a real columnar API would be a meaningful win. Prototyped in
+pure Zig (`examples/columnar_bench.zig`, not shipped — reverted), no
+Python/C glue, comparing three things on the same WHERE-filtered scan of
+the 417MB taxi fixture:
+
+```
+row-major (1 thread):  0.51-0.57s
+row-major (parallel):  0.10-0.12s
+columnar (parallel):   0.08-0.10s
+```
+
+First read (columnar vs single-threaded row) looked like 7x. Fair
+comparison (both parallel, same engine, same thread count) showed the
+7x was almost entirely the existing threading win, not layout — real
+columnar-over-row gain is **~15-25%**, from one buffer-append per field
+into a column instead of an `OwnedRow` allocation per row. Not
+vectorized compute, not SIMD — still string-parses every field, still
+copies every byte either way.
+
+**Also surfaced real gaps in `parallelScanColumnar()` itself** that would
+need closing before this is a usable API, not just a benchmark:
+no column projection (always materializes every column, even if the
+caller wants 2 of 51 — no `stop_after_column` equivalent), no `limit`,
+`u32` offsets cap a single column's data at 4GB (untested at real scale),
+JSON-array format still falls back to single-threaded, and nothing
+downstream (`topk`, `order_by`, `aggregate`, `validate`) reads columnar
+buffers directly — `ColumnarScanResult` is a dead end today, only fed
+into row-materializing glue.
+
+**Decision: not pursuing further right now.** A ~20% win, real but
+modest, doesn't justify carrying a second code path (row-major and
+columnar) through every future scan feature, especially with the
+projection gap unclosed — the common case (WHERE + a few columns) would
+be *slower* on the columnar path today, not faster, since it can't skip
+unwanted columns yet. Revisit only if a concrete consumer (e.g. Arrow/
+pandas zero-copy interop) makes the API surface worth it on its own,
+not on speed alone.
+
 ## Relationship to csvql
 
 csvql should eventually sit on top of libscanio (SQL parser/planner → libscanio → CSV/NDJSON) rather than duplicating scan logic. Extraction happens gradually, one primitive at a time, each step gated by csvql's existing correctness/fuzz/benchmark suite so it's provably zero-behavior-change before the next step starts. csvql remains the SQL product; libscanio is the reusable engine underneath it.
