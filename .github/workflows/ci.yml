@@ -128,10 +128,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: pip install setuptools wheel
+        run: python3 -m pip install setuptools wheel
+
       - name: Batch API benchmark smoke (gate on correctness)
         shell: bash
         run: |
-          zig build c-lib -Doptimize=ReleaseFast
+          zig build python-extension -Doptimize=ReleaseFast
           PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
           "$PY" bench/batches.py --rows 2000 --reps 1 --json batch-results.json
           "$PY" bench/import_validation.py --rows 2000 --reps 1 --json import-results.json

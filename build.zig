@@ -84,6 +84,12 @@ pub fn build(b: *std.Build) void {
     });
     python_api_mod.addImport("scanio", scanio_mod);
     const python_api_tests = b.addTest(.{ .root_module = python_api_mod });
+    // python_api.zig uses std.heap.c_allocator (the real Python extension's
+    // allocator) — that requires linking libc explicitly on Linux/Windows.
+    // Worked by accident locally (macOS Debug builds always link libc);
+    // failed loudly in CI on Linux and Windows. Real bug, caught by CI
+    // actually running, not by local `zig build test` alone.
+    python_api_tests.linkLibC();
     const run_python_api_tests = b.addRunArtifact(python_api_tests);
     test_step.dependOn(&run_python_api_tests.step);
 
