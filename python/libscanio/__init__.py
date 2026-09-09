@@ -239,6 +239,32 @@ def aggregate(path, column, where=None):
         _call("close", ctx)
 
 
+def group_by(path, group_column, agg_column, where=None):
+    """Group by one column, aggregating another (count/sum/min/max/avg per group).
+
+    v1: one group column, one aggregate column. With no WHERE, uses the
+    multi-threaded CSV engine (parallelGroupBy -- see ROADMAP.md for real
+    numbers against DuckDB/Polars/PyArrow). A WHERE clause routes through
+    the single-threaded path (composes with WHERE already, works on CSV/
+    NDJSON/JSON too, unlike the parallel fast path which is CSV-only).
+    """
+    p = _path(path)
+    probe = _call("query_open", p, b"{}")
+    try:
+        names = _call("names", probe)
+    finally:
+        _call("close", probe)
+    gcol = _resolve_column(names, group_column)
+    acol = _resolve_column(names, agg_column)
+    if where is None:
+        return _call("group_by_parallel", p, gcol, acol)
+    ctx = _open_query(path, where=where)
+    try:
+        return _call("group_by", ctx, gcol, acol)
+    finally:
+        _call("close", ctx)
+
+
 def topk(path, column, k, where=None, descending=True):
     """Top K numeric rows, best first; each dictionary includes its numeric _key."""
     ctx = _open_query(path, where=where)

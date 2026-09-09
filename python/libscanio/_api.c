@@ -12,6 +12,12 @@ extern int py_query_next(void *,size_t,size_t,void *,ApiEmit,char *);
 extern int py_count_rows_parallel(const char *,size_t,uint64_t *,char *);
 extern int py_count_rows_where_parallel(const char *,size_t,const char *,size_t,uint64_t *,char *);
 extern int py_query_aggregate(void *,size_t,ApiAgg *,char *);
+extern void *py_group_by(void *,size_t,size_t,char *);
+extern void *py_group_by_parallel(const char *,size_t,size_t,size_t,char *);
+extern size_t py_group_by_count(void *);
+extern Slice py_group_by_key(void *,size_t);
+extern void py_group_by_agg(void *,size_t,ApiAgg *);
+extern void py_group_by_close(void *);
 extern int py_query_sort(void *,size_t,size_t,int,int,void *,ApiEmit,char *);
 extern void *py_columnar(void *,char *);
 extern void py_columnar_close(void *);
@@ -187,6 +193,59 @@ static PyObject *api_aggregate(PyObject *self,PyObject *args){
     if(min && max && avg)out=Py_BuildValue("{s:K,s:d,s:O,s:O,s:O}","count",(unsigned long long)r.count,"sum",r.sum,"min",min,"max",max,"avg",avg);
     Py_XDECREF(min);Py_XDECREF(max);Py_XDECREF(avg);return out;
 }
+static PyObject *api_agg_dict(ApiAgg r){
+    PyObject *min=r.has_values ? PyFloat_FromDouble(r.min) : Py_NewRef(Py_None);
+    PyObject *max=r.has_values ? PyFloat_FromDouble(r.max) : Py_NewRef(Py_None);
+    PyObject *avg=r.has_values ? PyFloat_FromDouble(r.avg) : Py_NewRef(Py_None);
+    PyObject *out=NULL;
+    if(min && max && avg)out=Py_BuildValue("{s:K,s:d,s:O,s:O,s:O}","count",(unsigned long long)r.count,"sum",r.sum,"min",min,"max",max,"avg",avg);
+    Py_XDECREF(min);Py_XDECREF(max);Py_XDECREF(avg);return out;
+}
+/* Materializes into a dict[str, dict] and closes the native result within
+ * this one call -- unlike columnar (kind==3), nothing needs the native
+ * buffers to survive past this call (no zero-copy handoff), so there's
+ * no second capsule/lifetime to manage from Python. */
+static PyObject *api_group_by(PyObject *self,PyObject *args){
+    (void)self;PyObject *cap;Py_ssize_t gcol,acol;
+    if(!PyArg_ParseTuple(args,"Onn",&cap,&gcol,&acol))return NULL;
+    ApiHandle *h=api_handle(cap,1);if(!h)return NULL;
+    if(gcol<0||acol<0){PyErr_SetString(PyExc_ValueError,"negative column");return NULL;}
+    char err[256]={0};
+    void *g=py_group_by(h->ptr,(size_t)gcol,(size_t)acol,err);
+    if(!g)return api_error(err);
+    size_t n=py_group_by_count(g);
+    PyObject *out=PyDict_New();
+    if(!out){py_group_by_close(g);return NULL;}
+    for(size_t i=0;i<n;i++){
+        Slice key=py_group_by_key(g,i);ApiAgg r;py_group_by_agg(g,i,&r);
+        PyObject *k=text(key),*v=k ? api_agg_dict(r) : NULL;
+        int rc=(k&&v) ? PyDict_SetItem(out,k,v) : -1;
+        Py_XDECREF(k);Py_XDECREF(v);
+        if(rc<0){py_group_by_close(g);Py_DECREF(out);return NULL;}
+    }
+    py_group_by_close(g);
+    return out;
+}
+static PyObject *api_group_by_parallel(PyObject *self,PyObject *args){
+    (void)self;const char *path;Py_ssize_t n_path,gcol,acol;
+    if(!PyArg_ParseTuple(args,"y#nn",&path,&n_path,&gcol,&acol))return NULL;
+    if(gcol<0||acol<0){PyErr_SetString(PyExc_ValueError,"negative column");return NULL;}
+    char err[256]={0};
+    void *g=py_group_by_parallel(path,(size_t)n_path,(size_t)gcol,(size_t)acol,err);
+    if(!g)return api_error(err);
+    size_t n=py_group_by_count(g);
+    PyObject *out=PyDict_New();
+    if(!out){py_group_by_close(g);return NULL;}
+    for(size_t i=0;i<n;i++){
+        Slice key=py_group_by_key(g,i);ApiAgg r;py_group_by_agg(g,i,&r);
+        PyObject *k=text(key),*v=k ? api_agg_dict(r) : NULL;
+        int rc=(k&&v) ? PyDict_SetItem(out,k,v) : -1;
+        Py_XDECREF(k);Py_XDECREF(v);
+        if(rc<0){py_group_by_close(g);Py_DECREF(out);return NULL;}
+    }
+    py_group_by_close(g);
+    return out;
+}
 static PyObject *api_sort(PyObject *self,PyObject *args){
     (void)self;PyObject *cap;Py_ssize_t col,k;int desc,top;
     if(!PyArg_ParseTuple(args,"Onnpp",&cap,&col,&k,&desc,&top))return NULL;
@@ -256,6 +315,8 @@ static PyObject *api_import(PyObject *self,PyObject *args){
     {"count_rows_parallel",api_count_parallel,METH_VARARGS,NULL}, \
     {"count_rows_where_parallel",api_count_where_parallel,METH_VARARGS,NULL}, \
     {"aggregate",api_aggregate,METH_VARARGS,NULL}, \
+    {"group_by",api_group_by,METH_VARARGS,NULL}, \
+    {"group_by_parallel",api_group_by_parallel,METH_VARARGS,NULL}, \
     {"sort",api_sort,METH_VARARGS,NULL}, \
     {"columnar",api_columnar,METH_O,NULL}, \
     {"columnar_rows",api_columnar_rows,METH_VARARGS,NULL}, \

@@ -41,11 +41,12 @@ the doc above.
 ## Status
 
 CSV + NDJSON + JSON arrays; filter/project/limit/count; count/sum/min/max/avg
-aggregates; O(N log K) top-K; single-column ORDER BY; per-column type
-inference (`describe()`); schema validation for imports (`validate()`); a
-C ABI; Python and [Node](node/) bindings; an [MCP server](mcp/). No
-group-by, multi-column ORDER BY, or Rust binding yet. See
-[ROADMAP.md](ROADMAP.md).
+aggregates; single-column GROUP BY (`group_by()`, CSV parallel path — see
+[ROADMAP.md](ROADMAP.md) for real numbers against DuckDB/Polars/PyArrow);
+O(N log K) top-K; single-column ORDER BY; per-column type inference
+(`describe()`); schema validation for imports (`validate()`); a C ABI;
+Python and [Node](node/) bindings; an [MCP server](mcp/). No multi-column
+GROUP BY/ORDER BY, or Rust binding yet.
 
 CSV quoting follows RFC 4180 except quoted fields cannot contain a newline
 (the reader is line-oriented, by design — see [DESIGN.md](docs/DESIGN.md)).
@@ -80,10 +81,13 @@ const rows = libscanio.scanArray("sample.csv", { columns: ["trip_id", "cab_type"
 scanio sample.csv --where "cab_type = yellow" --columns trip_id,cab_type
 scanio sample.csv --where "revenue > 1000 AND cab_type = yellow" --count
 scanio events.ndjson --where "status IN (open, pending)" --format ndjson
+scanio sample.csv --group-by cab_type --agg total_amount
 ```
 
-Deliberately not a query language: one file, flags, no joins, no GROUP BY,
-no SQL. For SQL over CSV, see [csvql](https://github.com/melihbirim/csvql).
+Not a general query language: one file, flags, no joins, no multi-column
+GROUP BY, no SQL. `--group-by`/`--agg` cover the single-column case; for
+anything past that (joins, multi-column GROUP BY, real SQL), see
+[csvql](https://github.com/melihbirim/csvql).
 
 ```zig
 const scanio = @import("scanio");

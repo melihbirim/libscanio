@@ -84,6 +84,13 @@ def aggregate(path: str, column: str, where: Optional[str] = None) -> dict:
 
 
 @server.tool()
+def group_by(path: str, group_column: str, agg_column: str, where: Optional[str] = None) -> dict:
+    """Group by one column, aggregating another (count/sum/min/max/avg
+    per group). With no `where`, uses the multi-threaded CSV engine."""
+    return libscanio.group_by(path, group_column, agg_column, where=where)
+
+
+@server.tool()
 def topk(
     path: str,
     column: str,

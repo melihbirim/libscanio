@@ -335,6 +335,103 @@ fn aggregateWork(path: [:0]const u8, column_name: [:0]const u8, where: ?[:0]cons
     };
 }
 
+// ── groupBy ──────────────────────────────────────────────────────────
+
+const GroupByResult2 = struct { json: []const u8 = "", err: ?anyerror = null };
+
+fn writeGroupByJson(w: *std.io.Writer, groups: anytype) !void {
+    try w.writeByte('{');
+    var it = groups.iterator();
+    var first = true;
+    while (it.next()) |e| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        jsonEscapedString(w, e.key_ptr.*);
+        try w.writeByte(':');
+        const r = e.value_ptr.*;
+        try w.print("{{\"count\":{d},\"sum\":{d},", .{ r.count, r.sum });
+        if (r.min) |m| try w.print("\"min\":{d},", .{m}) else try w.writeAll("\"min\":null,");
+        if (r.max) |m| try w.print("\"max\":{d},", .{m}) else try w.writeAll("\"max\":null,");
+        if (r.avg()) |a| try w.print("\"avg\":{d}}}", .{a}) else try w.writeAll("\"avg\":null}");
+    }
+    try w.writeByte('}');
+}
+
+/// path/group column/agg column always need the header resolved (unlike
+/// countWork, which only needs it when a WHERE is given) -- group_by has
+/// no header-free fast path, so this always probes.
+fn groupByWork(path: [:0]const u8, group_col_name: [:0]const u8, agg_col_name: [:0]const u8, where: ?[:0]const u8, out: *GroupByResult2) void {
+    const header = probeHeader(c_allocator, path) catch |e| {
+        out.err = e;
+        return;
+    };
+    defer freeHeader(c_allocator, header);
+    const group_col = resolveColumn(header, group_col_name) catch |e| {
+        out.err = e;
+        return;
+    };
+    const agg_col = resolveColumn(header, agg_col_name) catch |e| {
+        out.err = e;
+        return;
+    };
+
+    var aw = std.io.Writer.Allocating.init(c_allocator);
+    defer aw.deinit();
+
+    if (where) |w| {
+        const predicates = parseWhereString(c_allocator, header, w) catch |e| {
+            out.err = e;
+            return;
+        };
+        defer if (predicates.len > 0) freePredicates(c_allocator, predicates);
+        var q = Query.open(c_allocator, path, .{ .where = predicates }) catch |e| {
+            out.err = e;
+            return;
+        };
+        defer q.deinit();
+        var result = scan.groupBy(c_allocator, &q, group_col, agg_col) catch |e| {
+            out.err = e;
+            return;
+        };
+        defer result.deinit();
+        writeGroupByJson(&aw.writer, result.groups) catch |e| {
+            out.err = e;
+            return;
+        };
+    } else {
+        var result = scan.parallelGroupBy(c_allocator, path, ',', group_col, agg_col, 0) catch |e| {
+            out.err = e;
+            return;
+        };
+        defer result.deinit();
+        writeGroupByJson(&aw.writer, result.groups) catch |e| {
+            out.err = e;
+            return;
+        };
+    }
+    out.json = aw.toOwnedSlice() catch |e| {
+        out.err = e;
+        return;
+    };
+}
+
+fn napiGroupBy(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
+    const path = getStringArg(env, info, 0, c_allocator) catch return napiFail(env, "groupByJson(path, groupColumn, aggColumn): path required");
+    defer c_allocator.free(path);
+    const group_col = getStringArg(env, info, 1, c_allocator) catch return napiFail(env, "groupByJson(path, groupColumn, aggColumn): groupColumn required");
+    defer c_allocator.free(group_col);
+    const agg_col = getStringArg(env, info, 2, c_allocator) catch return napiFail(env, "groupByJson(path, groupColumn, aggColumn): aggColumn required");
+    defer c_allocator.free(agg_col);
+    const where = getOptionalStringArg(env, info, 3, c_allocator) catch null;
+    defer if (where) |w| c_allocator.free(w);
+
+    var result = GroupByResult2{};
+    runOnWorkerStack(groupByWork, .{ path, group_col, agg_col, where, &result });
+    if (result.err) |e| return failErr(env, e);
+    defer c_allocator.free(result.json);
+    return napiString(env, result.json);
+}
+
 fn napiAggregate(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
     const path = getStringArg(env, info, 0, c_allocator) catch return napiFail(env, "aggregateJson(path, column): path required");
     defer c_allocator.free(path);
@@ -1288,6 +1385,7 @@ export fn napi_register_module_v1(env: napi.napi_env, exports: napi.napi_value) 
         prop("closeValidator", napiCloseValidator),
         prop("countJson", napiCount),
         prop("aggregateJson", napiAggregate),
+        prop("groupByJson", napiGroupBy),
         prop("scanArrayJson", napiScanArray),
         prop("topkJson", napiTopk),
         prop("orderByJson", napiOrderBy),

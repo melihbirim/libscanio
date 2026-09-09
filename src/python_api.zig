@@ -153,6 +153,91 @@ export fn py_query_aggregate(c: *QueryCtx, col: usize, out: *Agg, err: *[256]u8)
     out.* = .{ .count = r.count, .sum = r.sum, .min = r.min orelse 0, .max = r.max orelse 0, .avg = r.avg() orelse 0, .has_values = @intFromBool(r.count > 0) };
     return 0;
 }
+const GroupEntry = struct { key: Slice, agg: Agg };
+/// Owns the underlying GroupByResult (arena + hash map) and a flat
+/// entries array materialized once at build time -- CPython indexes by
+/// position (py_group_by_key/py_group_by_agg), not by iterating a hash
+/// map across the FFI boundary, which Zig's StringHashMap iterator isn't
+/// shaped for anyway (no stable external cursor).
+const PyGroupByResult = struct {
+    result: scan.GroupByResult,
+    entries: []GroupEntry,
+};
+fn buildEntries(result: scan.GroupByResult) ![]GroupEntry {
+    const entries = try A.alloc(GroupEntry, result.groups.count());
+    var it = result.groups.iterator();
+    var i: usize = 0;
+    while (it.next()) |e| : (i += 1) {
+        const r = e.value_ptr.*;
+        entries[i] = .{ .key = view(e.key_ptr.*), .agg = .{ .count = r.count, .sum = r.sum, .min = r.min orelse 0, .max = r.max orelse 0, .avg = r.avg() orelse 0, .has_values = @intFromBool(r.count > 0) } };
+    }
+    return entries;
+}
+/// Single-threaded, composes with WHERE (already applied via QueryCtx.open) --
+/// same-shape counterpart to py_query_aggregate above, per group instead
+/// of over the whole column. Works on CSV/NDJSON/JSON, same as groupBy()
+/// itself (format-agnostic by construction, see its own doc comment).
+export fn py_group_by(c: *QueryCtx, group_col: usize, agg_col: usize, err: *[256]u8) ?*PyGroupByResult {
+    const n = c.q.header().len;
+    if (group_col >= n or agg_col >= n) {
+        _ = fail(err, error.UnknownColumn);
+        return null;
+    }
+    var result = scan.groupBy(A, &c.q, group_col, agg_col) catch |e| {
+        _ = fail(err, e);
+        return null;
+    };
+    errdefer result.deinit();
+    const entries = buildEntries(result) catch |e| {
+        _ = fail(err, e);
+        return null;
+    };
+    const p = A.create(PyGroupByResult) catch |e| {
+        A.free(entries);
+        result.deinit();
+        _ = fail(err, e);
+        return null;
+    };
+    p.* = .{ .result = result, .entries = entries };
+    return p;
+}
+/// Parallel, CSV-only, no WHERE (see parallelGroupBy()'s own doc comment
+/// for why) -- bypasses QueryCtx entirely, same bypass shape
+/// py_count_rows_parallel already uses, since parallelGroupBy() opens
+/// its own per-worker file views.
+export fn py_group_by_parallel(path: [*]const u8, path_len: usize, group_col: usize, agg_col: usize, err: *[256]u8) ?*PyGroupByResult {
+    var result = scan.parallelGroupBy(A, path[0..path_len], ',', group_col, agg_col, 0) catch |e| {
+        _ = fail(err, e);
+        return null;
+    };
+    errdefer result.deinit();
+    const entries = buildEntries(result) catch |e| {
+        _ = fail(err, e);
+        return null;
+    };
+    const p = A.create(PyGroupByResult) catch |e| {
+        A.free(entries);
+        result.deinit();
+        _ = fail(err, e);
+        return null;
+    };
+    p.* = .{ .result = result, .entries = entries };
+    return p;
+}
+export fn py_group_by_count(p: *PyGroupByResult) usize {
+    return p.entries.len;
+}
+export fn py_group_by_key(p: *PyGroupByResult, i: usize) Slice {
+    return p.entries[i].key;
+}
+export fn py_group_by_agg(p: *PyGroupByResult, i: usize, out: *Agg) void {
+    out.* = p.entries[i].agg;
+}
+export fn py_group_by_close(p: *PyGroupByResult) void {
+    A.free(p.entries);
+    p.result.deinit();
+    A.destroy(p);
+}
 export fn py_query_sort(c: *QueryCtx, col: usize, k: usize, desc: c_int, top: c_int, ctx: ?*anyopaque, emit: Emit, err: *[256]u8) c_int {
     if (col >= c.q.header().len) return fail(err, error.UnknownColumn);
     if (top != 0) {

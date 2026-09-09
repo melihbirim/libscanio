@@ -982,6 +982,69 @@ columns are needed, same class of gap `parallelScanColumnar()` already
 has (see its own ROADMAP entry). Real cost on a 51-column file grouping
 by 2; not measured in isolation yet.
 
-## Relationship to csvql## Relationship to csvql
+## GROUP BY wired into Python, Node, CLI, MCP -- real end-to-end numbers, not just Zig-core
+
+Added `group_by()`/`groupBy()`/`--group-by --agg`/`group_by()` MCP tool
+across all four surfaces. Same dual-path shape as `count()`/`aggregate()`
+already use: no WHERE routes through `parallelGroupBy()` (CSV, fast);
+a WHERE routes through the single-threaded `groupBy()` composed over an
+already-open `Query` (works on CSV/NDJSON/JSON, same as the Zig core).
+
+Python: `py_group_by`/`py_group_by_parallel` build a flat entries array
+once (key + AggResult per group), materialized into a `dict[str, dict]`
+by `_api.c`, closed within the same call -- no second capsule/lifetime
+to manage from Python, unlike columnar's buffer-protocol handoff.
+
+Node: `groupByJson` reuses the existing worker-stack + JSON-string
+pattern `aggregateJson` already uses -- builds the JSON on a dedicated
+thread, `JSON.parse()`s on the JS side.
+
+CLI: `--group-by <col> --agg <col>`, composes with `--where`/`--format`,
+refuses to combine with `--count`/`--columns`/`--limit`/`--validate`
+(different output shape, same reasoning `--validate`'s existing conflict
+check already uses). This is a real, deliberate exception to the CLI's
+own stated "not a query language, no GROUP BY" line (see README's old
+wording) -- the line was updated, not quietly ignored: the CLI still
+has no joins or multi-column GROUP BY, and still points to csvql for
+real SQL, but single-column group-by is now in scope. Output rows are
+sorted by group key (hash-map iteration order isn't deterministic, and
+a group-by result set is small enough that sorting it is free -- unlike
+a normal scan, which stays in file order and unsorted for a reason).
+
+MCP: thin wrapper, same shape as every other tool in `server.py`, calls
+Python's `group_by()` directly.
+
+**Real end-to-end numbers, not just the Zig-core ones logged above** --
+same 405MB/1M-row taxi fixture, count/sum/min/max/avg per group:
+
+| | low cardinality (2 groups) | high cardinality (1M groups) |
+|---|---|---|
+| libscanio (Zig core) | 0.075s, ~15MB | 0.20s, ~358MB |
+| libscanio (Python) | 0.073s, 103MB | 1.29s, 788MB |
+| libscanio (Node) | 0.071s, 129MB | 1.35s, 699MB |
+| duckdb | 1.00s, 186MB | 0.79s, 326MB |
+| polars | 0.89s, 923MB | 0.47s, 1005MB |
+| pyarrow | 1.69s, 925MB | 1.41s, 1046MB |
+
+**Honest read, not the story the Zig-only numbers told**: at low
+cardinality, libscanio wins clearly everywhere, 10-20x over DuckDB even
+through Python/Node -- dict/object materialization cost is small when
+there are only 2 groups. At high cardinality, materializing 1M dict/
+object entries in CPython/V8 is real, substantial overhead: Python is
+6.4x slower than the Zig core there (1.29s vs 0.20s), Node 6.7x (1.35s
+vs 0.20s). Once that's counted, libscanio's Python/Node bindings are
+**slower than DuckDB and Polars** at high cardinality (0.79s and 0.47s
+respectively) -- only still beating PyArrow (1.41s). The pure-Zig
+numbers from the entry above are true but were not representative of
+what a real Python/Node caller experiences; logged here in full rather
+than only reporting the number that looked good.
+
+Real next lever, not attempted here: the materialization cost itself,
+not the grouping engine -- e.g. returning a more compact shape than one
+dict-of-dicts per group, or a columnar handoff for the high-cardinality
+case specifically. Not pursued without a concrete consumer asking for
+it, same discipline as the columnar-scan prototype earlier in this file.
+
+## Relationship to csvql
 
 csvql should eventually sit on top of libscanio (SQL parser/planner → libscanio → CSV/NDJSON) rather than duplicating scan logic. Extraction happens gradually, one primitive at a time, each step gated by csvql's existing correctness/fuzz/benchmark suite so it's provably zero-behavior-change before the next step starts. csvql remains the SQL product; libscanio is the reusable engine underneath it.

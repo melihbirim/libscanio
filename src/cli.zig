@@ -31,6 +31,8 @@ const usage =
     \\  --count             print just the number of matching rows
     \\  --not               invert --where: emit the rows it REJECTS
     \\  --format <fmt>      csv (default) or ndjson
+    \\  --group-by <col>    group by this column (requires --agg)
+    \\  --agg <col>         aggregate this column: count/sum/min/max/avg per group
     \\  --help
     \\
     \\Import validation:
@@ -71,6 +73,8 @@ pub const Args = struct {
     /// that failed", which is the negation of the entire AND-list.
     negate: bool = false,
     format: Format = .csv,
+    group_by: ?[]const u8 = null,
+    agg_column: ?[]const u8 = null,
     help: bool = false,
     /// Path to a JSON schema file. Set = run validation instead of a scan.
     validate: ?[]const u8 = null,
@@ -93,6 +97,9 @@ pub const ArgError = error{
     MissingPath,
     ValidateRequired,
     ValidateConflict,
+    GroupByRequiresAgg,
+    AggRequiresGroupBy,
+    GroupByConflict,
 };
 
 pub fn parseArgs(argv: []const []const u8) ArgError!Args {
@@ -127,6 +134,14 @@ pub fn parseArgs(argv: []const []const u8) ArgError!Args {
             } else if (std.mem.eql(u8, argv[i], "ndjson")) {
                 a.format = .ndjson;
             } else return ArgError.UnknownFormat;
+        } else if (std.mem.eql(u8, arg, "--group-by")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            a.group_by = argv[i];
+        } else if (std.mem.eql(u8, arg, "--agg")) {
+            i += 1;
+            if (i >= argv.len) return ArgError.MissingValue;
+            a.agg_column = argv[i];
         } else if (std.mem.eql(u8, arg, "--validate")) {
             i += 1;
             if (i >= argv.len) return ArgError.MissingValue;
@@ -155,6 +170,16 @@ pub fn parseArgs(argv: []const []const u8) ArgError!Args {
     // wrote `--validate s.json --where x = 1` believes the filter ran.
     if (a.validate != null and (a.where != null or a.columns != null or a.limit != null or a.count_only or a.negate)) {
         return ArgError.ValidateConflict;
+    }
+    if (a.group_by != null and a.agg_column == null) return ArgError.GroupByRequiresAgg;
+    if (a.agg_column != null and a.group_by == null) return ArgError.AggRequiresGroupBy;
+    // --group-by has its own output shape (one row per group, not per
+    // input row) -- --columns/--limit/--count don't compose with that,
+    // same reasoning --validate's conflict check above already uses.
+    // --where still applies (filters before grouping) and so does
+    // --format (decides how group rows print).
+    if (a.group_by != null and (a.validate != null or a.columns != null or a.limit != null or a.count_only)) {
+        return ArgError.GroupByConflict;
     }
     return a;
 }
@@ -263,6 +288,85 @@ pub fn main() !u8 {
     else
         &[_]scanio.Predicate{};
     defer if (predicates.len > 0) where_parser.freePredicates(allocator, @constCast(predicates));
+
+    if (args.group_by) |gb_name| {
+        const agg_name = args.agg_column.?; // enforced together by parseArgs
+        const group_col = where_parser.resolveColumn(owned_header, gb_name) catch {
+            try err_out.print("scanio: unknown --group-by column: {s}\n", .{gb_name});
+            try err_out.flush();
+            return 2;
+        };
+        const agg_col = where_parser.resolveColumn(owned_header, agg_name) catch {
+            try err_out.print("scanio: unknown --agg column: {s}\n", .{agg_name});
+            try err_out.flush();
+            return 2;
+        };
+
+        var result: scanio.GroupByResult = if (args.where == null)
+            scanio.parallelGroupBy(allocator, args.path, ',', group_col, agg_col, 0) catch |e| {
+                try err_out.print("scanio: group-by failed: {s}\n", .{@errorName(e)});
+                try err_out.flush();
+                return 1;
+            }
+        else blk: {
+            var q = scanio.Query.open(allocator, args.path, .{ .where = predicates, .negate = args.negate }) catch |e| {
+                try err_out.print("scanio: cannot open {s}: {s}\n", .{ args.path, @errorName(e) });
+                try err_out.flush();
+                return 1;
+            };
+            defer q.deinit();
+            break :blk scanio.groupBy(allocator, &q, group_col, agg_col) catch |e| {
+                try err_out.print("scanio: group-by failed: {s}\n", .{@errorName(e)});
+                try err_out.flush();
+                return 1;
+            };
+        };
+        defer result.deinit();
+
+        // Sorted by key: hash-map iteration order isn't deterministic,
+        // and unlike a normal scan (which streams in file order), a
+        // group-by result set is small (bounded by cardinality) and a
+        // caller scripting against this output wants stable ordering,
+        // not scan order that happens to vary run to run.
+        const keys = try allocator.alloc([]const u8, result.groups.count());
+        defer allocator.free(keys);
+        {
+            var it = result.groups.keyIterator();
+            var i: usize = 0;
+            while (it.next()) |k| : (i += 1) keys[i] = k.*;
+        }
+        std.mem.sort([]const u8, keys, {}, struct {
+            fn lessThan(_: void, a_: []const u8, b_: []const u8) bool {
+                return std.mem.order(u8, a_, b_) == .lt;
+            }
+        }.lessThan);
+
+        var stdout_buf: [64 * 1024]u8 = undefined;
+        var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+        const out = &stdout_w.interface;
+        switch (args.format) {
+            .csv => {
+                try out.print("{s},count,sum,min,max,avg\n", .{gb_name});
+                for (keys) |k| {
+                    const r = result.groups.get(k).?;
+                    try csv.writeField(out, k, ',');
+                    try out.print(",{d},{d},{d},{d},{d}\n", .{ r.count, r.sum, r.min orelse 0, r.max orelse 0, r.avg() orelse 0 });
+                }
+            },
+            .ndjson => {
+                for (keys) |k| {
+                    const r = result.groups.get(k).?;
+                    try out.writeByte('{');
+                    try std.json.Stringify.value(gb_name, .{}, out);
+                    try out.writeByte(':');
+                    try std.json.Stringify.value(k, .{}, out);
+                    try out.print(",\"count\":{d},\"sum\":{d},\"min\":{d},\"max\":{d},\"avg\":{d}}}\n", .{ r.count, r.sum, r.min orelse 0, r.max orelse 0, r.avg() orelse 0 });
+                }
+            },
+        }
+        try out.flush();
+        return 0;
+    }
 
     // The multi-threaded engine, same as Python's/Node's count() — never
     // opens the single-threaded Query at all for this path (matches
@@ -529,4 +633,23 @@ test "parseArgs: --not inverts the where clause" {
     // --validate has its own --valid/--invalid; --not there would be a
     // second, silently-ignored way to say the same thing.
     try testing.expectError(ArgError.ValidateConflict, parseArgs(&.{ "d.csv", "--validate", "s.json", "--not" }));
+}
+
+test "parseArgs: --group-by requires --agg and vice versa" {
+    const a = try parseArgs(&.{ "d.csv", "--group-by", "city", "--agg", "amount" });
+    try testing.expectEqualStrings("city", a.group_by.?);
+    try testing.expectEqualStrings("amount", a.agg_column.?);
+    try testing.expectError(ArgError.GroupByRequiresAgg, parseArgs(&.{ "d.csv", "--group-by", "city" }));
+    try testing.expectError(ArgError.AggRequiresGroupBy, parseArgs(&.{ "d.csv", "--agg", "amount" }));
+}
+
+test "parseArgs: --group-by refuses flags it cannot honour" {
+    try testing.expectError(ArgError.GroupByConflict, parseArgs(&.{ "d.csv", "--group-by", "city", "--agg", "amount", "--count" }));
+    try testing.expectError(ArgError.GroupByConflict, parseArgs(&.{ "d.csv", "--group-by", "city", "--agg", "amount", "--columns", "a,b" }));
+    try testing.expectError(ArgError.GroupByConflict, parseArgs(&.{ "d.csv", "--group-by", "city", "--agg", "amount", "--limit", "5" }));
+    try testing.expectError(ArgError.GroupByConflict, parseArgs(&.{ "d.csv", "--group-by", "city", "--agg", "amount", "--validate", "s.json" }));
+    // --where and --format still compose.
+    const a = try parseArgs(&.{ "d.csv", "--group-by", "city", "--agg", "amount", "--where", "amount > 0", "--format", "ndjson" });
+    try testing.expectEqualStrings("amount > 0", a.where.?);
+    try testing.expectEqual(Format.ndjson, a.format);
 }

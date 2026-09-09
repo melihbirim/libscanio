@@ -103,6 +103,18 @@ function aggregate(filePath, column, where = null) {
 }
 
 /**
+ * Group by one column, aggregating another (count/sum/min/max/avg per
+ * group). v1: one group column, one aggregate column. With no `where`,
+ * uses the multi-threaded CSV engine; a `where` clause routes through
+ * the single-threaded path (composes with WHERE, works on CSV/NDJSON/
+ * JSON too, unlike the parallel fast path which is CSV-only). See
+ * ROADMAP.md for real numbers against DuckDB/Polars/PyArrow.
+ */
+function groupBy(filePath, groupColumn, aggColumn, where = null) {
+  return JSON.parse(call(addon().groupByJson, filePath, groupColumn, aggColumn, where));
+}
+
+/**
  * Streaming by default — nothing is materialized until iterated.
  * `columns`: project to these column names, in order. `where`: "col OP
  * val [AND col OP val ...]" or "col IN (a, b, c)". `limit`: stop after
@@ -418,4 +430,4 @@ function validateToFiles(filePath, schema, acceptedPath, rejectedPath) {
   return JSON.parse(call(addon().validateToFiles, filePath, JSON.stringify(schema), acceptedPath, rejectedPath));
 }
 
-module.exports = { validateToFiles, scanBatches, validateBatches, scan, scanArray, schema, count, aggregate, topk, orderBy, profile, describe, validate, validateIter, inferSchema, ScanError };
+module.exports = { validateToFiles, scanBatches, validateBatches, scan, scanArray, schema, count, aggregate, groupBy, topk, orderBy, profile, describe, validate, validateIter, inferSchema, ScanError };
