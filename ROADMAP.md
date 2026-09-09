@@ -843,6 +843,27 @@ this codebase, the same class of crash could recur on Windows without
 being understood, only avoided. Worth real Windows-machine debugging
 later, not treated as closed.
 
+**Correction: the thread-spawn theory above was wrong.** The tiny-file
+guard was a real improvement but didn't fix the crash — release re-run
+hit the identical `STATUS_STACK_BUFFER_OVERRUN` again. Checkpoint-
+instrumented `test_native_only.py` and ran it on real Windows CI
+(`gh workflow run packages.yml`), which showed the crash was in the
+*bare* `s.count(p) == 3` call, not the WHERE-filtered one — the script
+had exactly one `print()` at its very end, so "no output" had been
+consistent with a crash anywhere in it the whole time.
+
+**Actual root cause**: six functions in `parallel.zig` (`countRange`,
+`walkJsonArrayObjectCloses`, `countJsonArrayObjects`,
+`forEachJsonObjectInRange`, `forEachLineInRange`, `buildNdjsonHeader`)
+declared `var buf: [WORKER_CHUNK_SIZE]u8 = undefined;` — a 1MB buffer on
+the stack. Windows' default thread stack is far smaller than macOS/
+Linux's; this overflowed it regardless of threading. Fixed by heap-
+allocating each buffer (`allocator.alloc(u8, WORKER_CHUNK_SIZE)` +
+`defer allocator.free(buf)`), threading an `allocator` param through
+wherever one wasn't already available. Verified locally (full suite
+green, `count()` speed unaffected: 0.015-0.017s on the 417MB fixture)
+and shipped as the real fix in v0.2.0.
+
 ## Relationship to csvql
 
 csvql should eventually sit on top of libscanio (SQL parser/planner → libscanio → CSV/NDJSON) rather than duplicating scan logic. Extraction happens gradually, one primitive at a time, each step gated by csvql's existing correctness/fuzz/benchmark suite so it's provably zero-behavior-change before the next step starts. csvql remains the SQL product; libscanio is the reusable engine underneath it.

@@ -118,6 +118,7 @@ fn splitRangesFrom(allocator: Allocator, file: std.fs.File, data_start: u64, fil
 const WORKER_CHUNK_SIZE = 1024 * 1024;
 
 const CountWorker = struct {
+    allocator: Allocator,
     file: std.fs.File,
     range: Range,
     result: usize = 0,
@@ -125,7 +126,7 @@ const CountWorker = struct {
 };
 
 fn countWorkerRun(w: *CountWorker) void {
-    w.result = countRange(w.file, w.range) catch |e| {
+    w.result = countRange(w.allocator, w.file, w.range) catch |e| {
         w.err = e;
         return;
     };
@@ -137,8 +138,15 @@ fn countWorkerRun(w: *CountWorker) void {
 /// earlier range's end was aligned to just-past-a-newline by
 /// splitRanges(), but checked unconditionally here since it costs
 /// nothing and doesn't rely on that invariant holding).
-fn countRange(file: std.fs.File, range: Range) !usize {
-    var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
+fn countRange(allocator: Allocator, file: std.fs.File, range: Range) !usize {
+    // Heap, not a stack array: WORKER_CHUNK_SIZE is 1MB, and this runs
+    // both on spawned worker threads (default stack size, not the huge
+    // ~8MB main-thread stack Unix gives you) and directly on the calling
+    // thread for tiny files. A 1MB stack buffer overflowed Windows'
+    // default thread stack — a real, reproduced crash (see ROADMAP.md),
+    // not a hypothetical one.
+    const buf = try allocator.alloc(u8, WORKER_CHUNK_SIZE);
+    defer allocator.free(buf);
     var pos = range.start;
     var n: usize = 0;
     var last_byte: ?u8 = null;
@@ -246,7 +254,7 @@ fn parallelCountLines(allocator: Allocator, path: []const u8, num_threads_in: us
     const num_threads = threadsFor(requested, file_size);
 
     if (num_threads <= 1) {
-        return countRange(file, .{ .start = 0, .end = file_size });
+        return countRange(allocator, file, .{ .start = 0, .end = file_size });
     }
 
     const ranges = try splitRanges(allocator, file, file_size, num_threads);
@@ -257,7 +265,7 @@ fn parallelCountLines(allocator: Allocator, path: []const u8, num_threads_in: us
     const threads = try allocator.alloc(std.Thread, num_threads);
     defer allocator.free(threads);
 
-    for (ranges, 0..) |r, i| workers[i] = .{ .file = file, .range = r };
+    for (ranges, 0..) |r, i| workers[i] = .{ .allocator = allocator, .file = file, .range = r };
     try spawnAndJoin(threads, countWorkerRun, workers);
 
     var total: usize = 0;
@@ -313,13 +321,16 @@ fn sniffFormat(file: std.fs.File, file_size: u64) !SniffedFormat {
 /// timeout on the real fixture. Both attempts logged in ROADMAP.md as a
 /// deliberate negative result, not silently dropped.
 fn walkJsonArrayObjectCloses(
+    allocator: Allocator,
     file: std.fs.File,
     file_size: u64,
     comptime Ctx: type,
     ctx: *Ctx,
     comptime onClose: fn (*Ctx, u64) anyerror!void,
 ) !void {
-    var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
+    // Heap, not a stack array — see countRange()'s doc comment for why.
+    const buf = try allocator.alloc(u8, WORKER_CHUNK_SIZE);
+    defer allocator.free(buf);
     var pos: u64 = 0;
     var started = false;
     var depth: usize = 0;
@@ -381,7 +392,7 @@ fn walkJsonArrayObjectCloses(
 /// scans or field extraction (the actually-expensive part per this
 /// session's NDJSON work), where per-object work dwarfs the boundary
 /// walk — that's exactly what findJsonArrayRanges() below is for.
-fn countJsonArrayObjects(file: std.fs.File, file_size: u64) !usize {
+fn countJsonArrayObjects(allocator: Allocator, file: std.fs.File, file_size: u64) !usize {
     const CountCtx = struct { count: usize = 0 };
     const onClose = struct {
         fn f(c: *CountCtx, _: u64) !void {
@@ -389,7 +400,7 @@ fn countJsonArrayObjects(file: std.fs.File, file_size: u64) !usize {
         }
     }.f;
     var ctx = CountCtx{};
-    try walkJsonArrayObjectCloses(file, file_size, CountCtx, &ctx, onClose);
+    try walkJsonArrayObjectCloses(allocator, file, file_size, CountCtx, &ctx, onClose);
     return ctx.count;
 }
 
@@ -432,7 +443,7 @@ fn findJsonArrayRanges(allocator: Allocator, file: std.fs.File, file_size: u64, 
     const approx_chunk = file_size / num_threads;
     var ctx = RangeCtx{ .allocator = allocator, .next_target = approx_chunk, .approx_chunk = approx_chunk, .num_threads = num_threads };
     errdefer ctx.ranges.deinit(allocator);
-    try walkJsonArrayObjectCloses(file, file_size, RangeCtx, &ctx, onClose);
+    try walkJsonArrayObjectCloses(allocator, file, file_size, RangeCtx, &ctx, onClose);
     try ctx.ranges.append(allocator, .{ .start = ctx.range_start, .end = file_size });
     return ctx.ranges.toOwnedSlice(allocator);
 }
@@ -452,7 +463,9 @@ fn forEachJsonObjectInRange(
     ctx: *Ctx,
     comptime body: fn (*Ctx, []const u8) anyerror!void,
 ) !void {
-    var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
+    // Heap, not a stack array — see countRange()'s doc comment for why.
+    const buf = try allocator.alloc(u8, WORKER_CHUNK_SIZE);
+    defer allocator.free(buf);
     var buf_len: usize = 0;
     var buf_pos: usize = 0;
     var file_pos: u64 = range.start;
@@ -683,7 +696,7 @@ pub fn parallelCountRows(allocator: Allocator, path: []const u8, num_threads: us
     if (file_size == 0) return ParallelError.EmptyFile;
 
     if (try sniffFormat(file, file_size) == .json_array) {
-        return countJsonArrayObjects(file, file_size);
+        return countJsonArrayObjects(allocator, file, file_size);
     }
 
     const has_header = query_mod.inferFormat(path) == .csv;
@@ -713,7 +726,9 @@ fn forEachLineInRange(
     ctx: *Ctx,
     comptime body: fn (*Ctx, []const u8) anyerror!void,
 ) !void {
-    var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
+    // Heap, not a stack array — see countRange()'s doc comment for why.
+    const buf = try allocator.alloc(u8, WORKER_CHUNK_SIZE);
+    defer allocator.free(buf);
     var pos = range.start;
     var buf_len: usize = 0;
     var buf_pos: usize = 0;
@@ -948,7 +963,9 @@ fn buildNdjsonHeader(allocator: Allocator, file: std.fs.File, file_size: u64) !N
     errdefer arena.deinit();
     const aa = arena.allocator();
 
-    var buf: [WORKER_CHUNK_SIZE]u8 = undefined;
+    // Heap, not a stack array — see countRange()'s doc comment for why.
+    const buf = try allocator.alloc(u8, WORKER_CHUNK_SIZE);
+    defer allocator.free(buf);
     const to_read: usize = @intCast(@min(@as(u64, buf.len), file_size));
     const n = try file.pread(buf[0..to_read], 0);
     const nl = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n;
