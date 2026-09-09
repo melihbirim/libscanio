@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "libscanio"
-version = "0.2.0"
+version = "0.2.1"
 description = "Scan huge CSV files without loading them into memory — a tiny, fast streaming scan engine"
 readme = "README.md"
 license = { text = "Apache-2.0" }

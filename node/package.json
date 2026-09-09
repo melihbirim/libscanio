@@ -1,6 +1,6 @@
 {
   "name": "libscanio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Scan huge CSV/NDJSON/JSON files without loading them into memory",
   "main": "index.js",
   "files": [

@@ -6,7 +6,7 @@ a native Zig engine through Node's N-API.
 ## Install
 
 ```sh
-npm install libscanio@0.2.0
+npm install libscanio@0.2.1
 ```
 
 Requires Node.js 18 or newer. The package includes native binaries for Linux
